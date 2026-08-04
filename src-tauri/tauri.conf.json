@@ -1,0 +1,64 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "VSParallel",
+  "version": "0.1.0",
+  "identifier": "app.vsparallel.desktop",
+  "build": {
+    "frontendDist": [
+      "../ui/index.html",
+      "../ui/styles.css",
+      "../ui/app.js",
+      "../ui/theme-init.js",
+      "../ui/vsparallel-icon.png"
+    ]
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "VSParallel",
+        "width": 680,
+        "height": 560,
+        "minWidth": 520,
+        "minHeight": 360,
+        "center": true,
+        "resizable": true,
+        "decorations": false,
+        "fullscreen": false,
+        "visible": true,
+        "backgroundColor": "#111114"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; base-uri 'none'; object-src 'none'; frame-src 'none'; form-action 'none'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["deb", "appimage"],
+    "icon": [
+      "icons/128x128.png",
+      "icons/icon.png",
+      "icons/16x16.png",
+      "icons/24x24.png",
+      "icons/32x32.png",
+      "icons/48x48.png",
+      "icons/64x64.png",
+      "icons/256x256.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "publisher": "VSParallel contributors",
+    "copyright": "Copyright © 2026 VSParallel contributors",
+    "category": "DeveloperTool",
+    "license": "MIT",
+    "licenseFile": "../LICENSE",
+    "resources": {
+      "../LICENSE": "LICENSE",
+      "../PRIVACY.md": "PRIVACY.md"
+    },
+    "shortDescription": "VS Code workspace and AI activity overview",
+    "longDescription": "A privacy-preserving local workspace switcher for multiple VS Code windows."
+  }
+}

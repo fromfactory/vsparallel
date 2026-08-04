@@ -1,0 +1,34 @@
+{
+  "name": "vsparallel-companion",
+  "displayName": "VSParallel Companion",
+  "description": "Reports minimal workspace and agent-extension presence metadata to the local VSParallel desktop app.",
+  "version": "0.2.0",
+  "publisher": "vsparallel",
+  "license": "MIT",
+  "private": true,
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "extensionKind": [
+    "ui"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./extension.js",
+  "icon": "icon.png",
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": true
+    },
+    "virtualWorkspaces": {
+      "supported": true
+    }
+  },
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  }
+}

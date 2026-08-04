@@ -1,0 +1,34 @@
+/target/
+/dist/
+/src-tauri/gen/schemas/
+/node_modules/
+*.vsix
+__pycache__/
+*.pyc
+*.log
+*.orig
+*.rej
+.DS_Store
+Thumbs.db
+
+# Local tool and editor state
+/.agents/
+/.codex/
+/.claude/
+/.idea/
+/.vscode/
+/.npmrc
+/.cargo/credentials
+/.cargo/credentials.toml
+
+# Local environment and signing secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.mobileprovision

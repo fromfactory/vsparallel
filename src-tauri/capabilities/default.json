@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Core permissions for the VSParallel main window",
+  "windows": ["main"],
+  "permissions": ["core:window:allow-start-dragging"]
+}

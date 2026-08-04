@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=VSParallel
+Comment=Monitor and switch between VS Code workspaces
+Exec=@BINDIR@/vsparallel
+Icon=app.vsparallel
+StartupWMClass=Vsparallel
+Terminal=false
+Categories=Development;Utility;
+StartupNotify=true

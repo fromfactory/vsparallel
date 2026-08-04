@@ -1,0 +1,43 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'/ABSOLUTE/PATH/TO/vsparallel' codex-hook",
+            "commandWindows": "\"C:\\Program Files\\VSParallel\\vsparallel.exe\" codex-hook",
+            "timeout": 2,
+            "statusMessage": "VSParallel: recording coarse local activity"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'/ABSOLUTE/PATH/TO/vsparallel' codex-hook",
+            "commandWindows": "\"C:\\Program Files\\VSParallel\\vsparallel.exe\" codex-hook",
+            "timeout": 2,
+            "statusMessage": "VSParallel: recording coarse local activity"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'/ABSOLUTE/PATH/TO/vsparallel' codex-hook",
+            "commandWindows": "\"C:\\Program Files\\VSParallel\\vsparallel.exe\" codex-hook",
+            "timeout": 2,
+            "statusMessage": "VSParallel: recording coarse local activity"
+          }
+        ]
+      }
+    ]
+  }
+}
