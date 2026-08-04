@@ -1,0 +1,218 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  TAURI_CLI_VERSION: "2.11.4"
+
+jobs:
+  validate:
+    name: Validate release
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Verify tag and application versions
+        shell: bash
+        run: |
+          config_version=$(python3 -c 'import json; print(json.load(open("src-tauri/tauri.conf.json", encoding="utf-8"))["version"])')
+          cargo_version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' src-tauri/Cargo.toml)
+
+          if [[ "$GITHUB_REF_NAME" != "v$config_version" ]]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match Tauri version $config_version"
+            exit 1
+          fi
+          if [[ "$cargo_version" != "$config_version" ]]; then
+            echo "::error::src-tauri/Cargo.toml ($cargo_version) and tauri.conf.json ($config_version) disagree"
+            exit 1
+          fi
+
+      - name: Install Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            xdg-utils
+
+      - name: Run repository checks
+        run: ./scripts/check.sh
+
+      - name: Package VS Code companion
+        run: python3 companion/package_vsix.py
+
+      - name: Stage companion package
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-companion
+          path: dist/*.vsix
+          if-no-files-found: error
+          overwrite: true
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Ubuntu Linux x86-64
+            os: ubuntu-22.04
+            artifact: linux-x86_64
+          - name: macOS universal
+            os: macos-latest
+            artifact: macos-universal
+          - name: Windows x86-64
+            os: windows-latest
+            artifact: windows-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add macOS Rust targets
+        if: runner.os == 'macOS'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            xdg-utils
+
+      - name: Install pinned Tauri CLI
+        shell: bash
+        run: cargo install tauri-cli --version "$TAURI_CLI_VERSION" --locked
+
+      - name: Build release packages
+        if: runner.os != 'macOS'
+        shell: bash
+        run: ./scripts/build-bundles.sh
+
+      - name: Build universal macOS packages
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          # Ad-hoc signing is sufficient for the initial, unnotarized builds.
+          APPLE_SIGNING_IDENTITY: "-"
+        run: ./scripts/build-bundles.sh --target universal-apple-darwin
+
+      - name: Collect Linux packages
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          mkdir -p dist/release
+          cp target/release/bundle/deb/*.deb dist/release/
+          cp target/release/bundle/appimage/*.AppImage dist/release/
+
+      - name: Collect macOS package
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          mkdir -p dist/release
+          cp target/universal-apple-darwin/release/bundle/dmg/*.dmg dist/release/
+
+      - name: Collect Windows package
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist/release
+          cp target/release/bundle/nsis/*-setup.exe dist/release/
+
+      - name: Stage release packages
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.artifact }}
+          path: dist/release/*
+          if-no-files-found: error
+          overwrite: true
+
+  publish:
+    name: Publish GitHub Release
+    needs:
+      - validate
+      - build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download release packages
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify release packages
+        shell: bash
+        run: |
+          for pattern in '*.deb' '*.AppImage' '*.dmg' '*-setup.exe' '*.vsix'; do
+            if ! compgen -G "release-assets/$pattern" > /dev/null; then
+              echo "::error::Missing release asset matching $pattern"
+              exit 1
+            fi
+          done
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if release_is_draft=$(gh release view "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json isDraft \
+            --jq .isDraft 2> /dev/null); then
+            if [[ "$release_is_draft" == "false" ]]; then
+              echo "Release $GITHUB_REF_NAME is already published; leaving it unchanged."
+              exit 0
+            fi
+            if [[ "$release_is_draft" != "true" ]]; then
+              echo "::error::Unexpected draft state: $release_is_draft"
+              exit 1
+            fi
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --draft \
+              --verify-tag \
+              --title "VSParallel $GITHUB_REF_NAME" \
+              --generate-notes \
+              --notes "These initial packages are not production code signed or notarized. macOS Gatekeeper and Windows SmartScreen warnings are expected; see docs/releases.md for details."
+          fi
+
+          gh release upload "$GITHUB_REF_NAME" release-assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
+          gh release edit "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false

@@ -23,13 +23,17 @@ working directory, and discard all unselected fields. See
 - VS Code's `code` command-line interface
 - The platform WebView and runtime libraries required by Tauri 2
 
-| Platform | Release formats |
+| Platform | GitHub Release downloads |
 | --- | --- |
-| Linux | Debian package and AppImage |
-| macOS 12.3+ | Application bundle and DMG |
-| Windows | NSIS installer |
+| Ubuntu Linux | x86-64 Debian package and AppImage |
+| macOS 12.3+ | Universal DMG for Apple silicon and Intel |
+| Windows | x86-64 NSIS installer |
 
-Build and sign macOS and Windows packages on native runners.
+Build macOS and Windows packages on native runners. Production signing and
+notarization are not configured yet.
+
+See the [release and download guide](docs/releases.md) for the tag-based release
+process, exact files to download, and current signing warnings.
 
 On Ubuntu and other GNOME-based desktops, the shell must provide an
 AppIndicator or StatusNotifier host for the tray icon to appear.
@@ -187,7 +191,12 @@ cargo install tauri-cli --version 2.11.4 --locked
 
 The wrapper uses the locked dependency graph, removes incompatible Snap GUI
 environment settings, and remaps local checkout and home paths out of compiled
-panic locations. Build and sign macOS and Windows packages on native runners.
+panic locations. Build macOS and Windows packages on native runners; production
+signing and notarization are not configured yet.
+
+Pushing a matching version tag such as `v0.1.0` runs the same wrapper on Ubuntu,
+macOS, and Windows and publishes the resulting packages with the companion VSIX.
+See [Releases](docs/releases.md) for the complete procedure.
 
 To build only the release executable:
 
