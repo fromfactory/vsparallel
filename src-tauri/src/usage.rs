@@ -1,11 +1,13 @@
 //! Privacy-conscious usage-limit collection for Codex and Claude Code.
 //!
 //! Codex exposes live limits through its documented app-server protocol. Claude
-//! Code supplies equivalent values to status-line commands, so this module keeps
-//! a compact global cache containing only those limits. In particular, Claude's
-//! session identifier, working directory, transcript path, and prompt are never
-//! represented by the deserialization or persistence types below.
+//! Code exposes equivalent values through the control channel used by its Agent
+//! SDK; a compact status-line cache remains as a compatibility fallback. In
+//! particular, Claude's session identifier, working directory, transcript path,
+//! and prompt are never represented by the deserialization or persistence types
+//! below.
 
+use crate::companion_integration::{CodeCliRunner, ProcessCodeCliRunner};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::env;
@@ -14,10 +16,11 @@ use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::Builder as TempFileBuilder;
+use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -26,6 +29,7 @@ use std::os::windows::{ffi::OsStrExt, fs::MetadataExt};
 
 pub const CLAUDE_STATUSLINE_ARGUMENT: &str = "claude-usage";
 
+const CLAUDE_EXTENSION_ID: &str = "anthropic.claude-code";
 const USAGE_SCHEMA_VERSION: u32 = 1;
 const CLAUDE_RECORD_SCHEMA_VERSION: u32 = 1;
 const CLAUDE_RECORD_DIRECTORY: &str = "usage";
@@ -33,10 +37,26 @@ const CLAUDE_RECORD_FILENAME: &str = "claude.json";
 const CODEX_PROTOCOL_TIMEOUT: Duration = Duration::from_secs(6);
 const CODEX_OUTPUT_LIMIT: usize = 256 * 1024;
 const CODEX_LINE_LIMIT: usize = 128 * 1024;
+const CLAUDE_PROTOCOL_TIMEOUT: Duration = Duration::from_secs(12);
+const CLAUDE_OUTPUT_LIMIT: usize = 512 * 1024;
+const CLAUDE_LINE_LIMIT: usize = 256 * 1024;
+const VSCODE_EXTENSION_REGISTRY_LIMIT: u64 = 4 * 1024 * 1024;
+const PROVIDER_GRACEFUL_EXIT_TIMEOUT: Duration = Duration::from_millis(250);
+const PROVIDER_READER_JOIN_TIMEOUT: Duration = Duration::from_millis(250);
+const PROVIDER_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const CLAUDE_INPUT_LIMIT: usize = 256 * 1024;
 const CLAUDE_RECORD_LIMIT: u64 = 16 * 1024;
 const CLAUDE_STALE_AFTER_MS: i64 = 15 * 60 * 1_000;
+const CLAUDE_EXTENSION_RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
 const MAX_FUTURE_SKEW_MS: i64 = 5 * 60 * 1_000;
+
+static CLAUDE_EXTENSION_CACHE: OnceLock<Mutex<ClaudeExtensionCache>> = OnceLock::new();
+
+#[derive(Debug, Default)]
+struct ClaudeExtensionCache {
+    executable: Option<PathBuf>,
+    checked_at: Option<Instant>,
+}
 
 #[cfg(unix)]
 unsafe extern "C" {
@@ -80,7 +100,8 @@ pub struct ProviderUsageView {
 }
 
 /// Usage data is intentionally separate from the frequently-polled workspace
-/// snapshot because collecting Codex limits starts a network-capable subprocess.
+/// snapshot because collecting live limits starts network-capable provider
+/// subprocesses.
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageSnapshot {
@@ -91,16 +112,29 @@ pub struct UsageSnapshot {
 }
 
 /// Injectable boundary around the Codex app-server conversation.
-pub trait CodexUsageRunner {
+pub trait CodexUsageRunner: Sync {
     fn read_rate_limits(&self, executable: &OsStr) -> Result<Value, String>;
 }
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ProcessCodexUsageRunner;
 
+/// Injectable boundary around Claude Code's SDK control conversation.
+pub trait ClaudeUsageRunner: Sync {
+    fn read_rate_limits(&self, executable: &OsStr) -> Result<Value, String>;
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ProcessClaudeUsageRunner;
+
 /// Resolve the Codex executable without splitting or interpreting shell syntax.
 pub fn codex_command() -> OsString {
     codex_command_from(env::var_os("VSPARALLEL_CODEX_COMMAND"))
+}
+
+/// Resolve the Claude Code executable without splitting or interpreting shell syntax.
+pub fn claude_command() -> OsString {
+    claude_command_from(env::var_os("VSPARALLEL_CLAUDE_COMMAND"))
 }
 
 /// Collect a fresh snapshot using the current clock and environment.
@@ -114,33 +148,54 @@ pub fn get_usage_snapshot() -> UsageSnapshot {
 
 /// Collect a fresh snapshot at an injected timestamp.
 pub fn build_usage_snapshot(now_ms: i64) -> UsageSnapshot {
-    let command = codex_command();
+    let codex_command = codex_command();
+    let claude_command = claude_command();
     let state_root = crate::state::state_dir_from_environment().ok();
     build_usage_snapshot_with(
         &ProcessCodexUsageRunner,
-        command.as_os_str(),
+        codex_command.as_os_str(),
+        &ProcessClaudeUsageRunner,
+        claude_command.as_os_str(),
         state_root.as_deref(),
         now_ms,
     )
 }
 
 /// Testable snapshot builder with injected process and state boundaries.
-pub fn build_usage_snapshot_with<R: CodexUsageRunner + ?Sized>(
-    runner: &R,
-    executable: &OsStr,
+pub fn build_usage_snapshot_with<
+    CodexRunner: CodexUsageRunner + ?Sized,
+    ClaudeRunner: ClaudeUsageRunner + ?Sized,
+>(
+    codex_runner: &CodexRunner,
+    codex_executable: &OsStr,
+    claude_runner: &ClaudeRunner,
+    claude_executable: &OsStr,
     state_root: Option<&Path>,
     now_ms: i64,
 ) -> UsageSnapshot {
-    let codex = runner
-        .read_rate_limits(executable)
-        .ok()
+    let (codex_result, claude_result) = thread::scope(|scope| {
+        let codex = scope.spawn(|| codex_runner.read_rate_limits(codex_executable));
+        let claude = scope.spawn(|| claude_runner.read_rate_limits(claude_executable));
+        (
+            codex.join().ok().and_then(Result::ok),
+            claude.join().ok().and_then(Result::ok),
+        )
+    });
+    let codex = codex_result
         .and_then(|result| codex_provider_view(&result, now_ms))
         .unwrap_or_else(|| {
             unavailable_provider("Install or sign in to Codex to view usage limits.")
         });
-    let claude = state_root
-        .map(|root| load_claude_usage(root, now_ms))
-        .unwrap_or_else(|| unavailable_provider("No capture yet. Check Setup & diagnostics."));
+    let claude = claude_result
+        .and_then(|result| claude_provider_view(&result, now_ms))
+        .or_else(|| {
+            state_root
+                .map(|root| load_claude_usage(root, now_ms))
+                .filter(|view| view.remaining_percent.is_some())
+        })
+        .unwrap_or_else(|| {
+            unavailable_provider("Update or sign in to Claude Code, then refresh usage.")
+        });
 
     UsageSnapshot {
         schema_version: USAGE_SCHEMA_VERSION,
@@ -158,6 +213,215 @@ impl CodexUsageRunner for ProcessCodexUsageRunner {
             Value::Object(Default::default()),
         )
     }
+}
+
+impl ClaudeUsageRunner for ProcessClaudeUsageRunner {
+    fn read_rate_limits(&self, executable: &OsStr) -> Result<Value, String> {
+        if executable == OsStr::new("claude") {
+            if let Some(bundled) = cached_claude_extension_executable(false) {
+                match claude_control_usage_request(bundled.as_os_str()) {
+                    Ok(result) => return Ok(result),
+                    Err(bundled_error) => {
+                        return claude_control_usage_request(executable).or(Err(bundled_error));
+                    }
+                }
+            }
+            let path_result = claude_control_usage_request(executable);
+            if path_result.is_ok() {
+                return path_result;
+            }
+            if let Some(bundled) = cached_claude_extension_executable(true) {
+                return claude_control_usage_request(bundled.as_os_str()).or(path_result);
+            }
+            return path_result;
+        }
+        claude_control_usage_request(executable)
+    }
+}
+
+fn cached_claude_extension_executable(allow_lookup: bool) -> Option<PathBuf> {
+    let cache = CLAUDE_EXTENSION_CACHE.get_or_init(|| Mutex::new(ClaudeExtensionCache::default()));
+    let now = Instant::now();
+    {
+        let mut cache = cache.lock().ok()?;
+        if cache
+            .executable
+            .as_ref()
+            .is_some_and(|executable| executable.is_file())
+        {
+            return cache.executable.clone();
+        }
+        cache.executable = None;
+        if !allow_lookup
+            || cache
+                .checked_at
+                .is_some_and(|checked| now.duration_since(checked) < CLAUDE_EXTENSION_RETRY_AFTER)
+        {
+            return None;
+        }
+        cache.checked_at = Some(now);
+    }
+    let executable = locate_claude_extension_executable();
+    if let Ok(mut cache) = cache.lock() {
+        cache.executable = executable.clone();
+    }
+    executable
+}
+
+fn locate_claude_extension_executable() -> Option<PathBuf> {
+    locate_claude_extension_with_cli().or_else(locate_claude_extension_from_registry)
+}
+
+fn locate_claude_extension_with_cli() -> Option<PathBuf> {
+    let code_command = crate::opener::code_command();
+    let arguments = [
+        OsString::from("--locate-extension"),
+        OsString::from(CLAUDE_EXTENSION_ID),
+    ];
+    let output = ProcessCodeCliRunner
+        .run(OsStr::new(&code_command), &arguments)
+        .ok()?;
+    if !output.success {
+        return None;
+    }
+    claude_extension_executable_from_output(&output.stdout)
+}
+
+#[derive(Debug, Deserialize)]
+struct VsCodeExtensionRegistryEntry {
+    identifier: VsCodeExtensionIdentifier,
+    #[serde(rename = "relativeLocation")]
+    relative_location: Option<String>,
+    #[serde(default)]
+    metadata: VsCodeExtensionMetadata,
+}
+
+#[derive(Debug, Deserialize)]
+struct VsCodeExtensionIdentifier {
+    id: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct VsCodeExtensionMetadata {
+    #[serde(default, rename = "installedTimestamp")]
+    installed_timestamp: u64,
+}
+
+/// VS Code's launcher can be missing from PATH or unusable in a confined
+/// package even while its extensions are available. Its local registry is a
+/// bounded second source for the exact installed extension path.
+fn locate_claude_extension_from_registry() -> Option<PathBuf> {
+    let home = platform_home_directory()?;
+    vscode_extension_directories(&home)
+        .into_iter()
+        .filter_map(|directory| claude_extension_from_registry(&directory))
+        .max_by_key(|(installed_at, _)| *installed_at)
+        .map(|(_, executable)| executable)
+}
+
+fn platform_home_directory() -> Option<PathBuf> {
+    #[cfg(target_os = "windows")]
+    let home = env::var_os("USERPROFILE").or_else(|| {
+        let drive = env::var_os("HOMEDRIVE")?;
+        let path = env::var_os("HOMEPATH")?;
+        Some(PathBuf::from(drive).join(path).into_os_string())
+    });
+    #[cfg(not(target_os = "windows"))]
+    let home = env::var_os("HOME");
+    home.filter(|value| !value.is_empty()).map(PathBuf::from)
+}
+
+fn vscode_extension_directories(home: &Path) -> [PathBuf; 3] {
+    [
+        home.join(".vscode").join("extensions"),
+        home.join(".vscode-insiders").join("extensions"),
+        home.join(".vscode-oss").join("extensions"),
+    ]
+}
+
+fn claude_extension_from_registry(extensions: &Path) -> Option<(u64, PathBuf)> {
+    let registry = extensions.join("extensions.json");
+    let metadata = fs::metadata(&registry).ok()?;
+    if !metadata.is_file() || metadata.len() > VSCODE_EXTENSION_REGISTRY_LIMIT {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    File::open(registry)
+        .ok()?
+        .take(VSCODE_EXTENSION_REGISTRY_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > VSCODE_EXTENSION_REGISTRY_LIMIT {
+        return None;
+    }
+    let entries: Vec<VsCodeExtensionRegistryEntry> = serde_json::from_slice(&bytes).ok()?;
+    entries
+        .into_iter()
+        .filter(|entry| {
+            entry
+                .identifier
+                .id
+                .eq_ignore_ascii_case(CLAUDE_EXTENSION_ID)
+        })
+        .filter_map(|entry| {
+            let relative = PathBuf::from(entry.relative_location?);
+            let mut components = relative.components();
+            let root = match (components.next(), components.next()) {
+                (Some(std::path::Component::Normal(name)), None) => extensions.join(name),
+                _ => return None,
+            };
+            claude_extension_binary(&root)
+                .map(|executable| (entry.metadata.installed_timestamp, executable))
+        })
+        .max_by_key(|(installed_at, _)| *installed_at)
+}
+
+fn claude_extension_executable_from_output(output: &[u8]) -> Option<PathBuf> {
+    let root = PathBuf::from(std::str::from_utf8(output).ok()?.trim());
+    if root.as_os_str().is_empty() {
+        return None;
+    }
+    claude_extension_binary(&root)
+}
+
+fn claude_extension_binary(root: &Path) -> Option<PathBuf> {
+    let resources = root.join("resources");
+    let binary_name = if cfg!(windows) {
+        "claude.exe"
+    } else {
+        "claude"
+    };
+    let platform = if cfg!(target_os = "windows") {
+        "win32"
+    } else if cfg!(target_os = "macos") {
+        "darwin"
+    } else {
+        std::env::consts::OS
+    };
+    let architecture = match std::env::consts::ARCH {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        architecture => architecture,
+    };
+    let platform_architecture = if cfg!(all(target_os = "linux", target_env = "musl")) {
+        format!("{platform}-{architecture}-musl")
+    } else {
+        format!("{platform}-{architecture}")
+    };
+    let mut candidates = vec![resources
+        .join("native-binaries")
+        .join(platform_architecture)
+        .join(binary_name)];
+    if cfg!(all(target_os = "windows", target_arch = "aarch64")) {
+        candidates.push(
+            resources
+                .join("native-binaries")
+                .join("win32-x64")
+                .join(binary_name),
+        );
+    }
+    candidates.push(resources.join("native-binary").join(binary_name));
+    candidates.into_iter().find(|candidate| candidate.is_file())
 }
 
 /// Send one initialized request to the installed Codex app-server.
@@ -210,7 +474,9 @@ pub(crate) fn codex_app_server_request(
     };
 
     let (line_sender, line_receiver) = mpsc::channel();
-    let stdout_reader = thread::spawn(move || pump_protocol_lines(stdout, line_sender));
+    let stdout_reader = thread::spawn(move || {
+        pump_protocol_lines(stdout, line_sender, CODEX_LINE_LIMIT, CODEX_OUTPUT_LIMIT)
+    });
     let stderr_reader = thread::spawn(move || drain_capped(stderr, CODEX_OUTPUT_LIMIT).map(|_| ()));
     let deadline = Instant::now() + CODEX_PROTOCOL_TIMEOUT;
 
@@ -243,10 +509,227 @@ pub(crate) fn codex_app_server_request(
     })();
 
     drop(stdin);
-    let _ = terminate_and_reap(&mut child);
-    let _ = stdout_reader.join();
-    let _ = stderr_reader.join();
+    let _ = finish_provider_process(&mut child);
+    join_provider_reader(stdout_reader);
+    join_provider_reader(stderr_reader);
     protocol_result
+}
+
+/// Ask the installed Claude Code process for the subscription usage view used
+/// by its Agent SDK. This control method is intentionally isolated here because
+/// its upstream name marks it as an evolving compatibility interface.
+fn claude_control_usage_request(executable: &OsStr) -> Result<Value, String> {
+    // Claude's current full-usage getter also scans its configured project
+    // history for attribution summaries. Point only that history/config root at
+    // an empty ephemeral directory while leaving credential storage under the
+    // provider's own original secure-storage root.
+    let isolated_config = TempFileBuilder::new()
+        .prefix("vsparallel-claude-usage.")
+        .tempdir()
+        .map_err(|_| "could not isolate the Claude Code usage query".to_string())?;
+    set_private_directory_permissions(isolated_config.path());
+    let secure_storage_config = claude_secure_storage_config_from(
+        env::var_os("CLAUDE_SECURESTORAGE_CONFIG_DIR"),
+        env::var_os("CLAUDE_CONFIG_DIR"),
+    );
+    let mut command = Command::new(executable);
+    command
+        .args([
+            "--print",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--input-format",
+            "stream-json",
+            "--tools",
+            "",
+            "--permission-mode",
+            "dontAsk",
+            "--no-session-persistence",
+            "--safe-mode",
+            "--prompt-suggestions",
+            "false",
+        ])
+        .env("CLAUDE_CODE_ENTRYPOINT", "sdk-ts")
+        .env("CLAUDE_CONFIG_DIR", isolated_config.path())
+        .env("CLAUDE_SECURESTORAGE_CONFIG_DIR", secure_storage_config)
+        .env_remove("CLAUDECODE")
+        .env_remove("CLAUDE_CODE_CHILD_SESSION")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+
+    let mut child = command
+        .spawn()
+        .map_err(|_| "could not start Claude Code".to_string())?;
+    let mut stdin = match child.stdin.take() {
+        Some(stdin) => stdin,
+        None => {
+            let _ = terminate_and_reap(&mut child);
+            return Err("Claude Code input was unavailable".to_string());
+        }
+    };
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            drop(stdin);
+            let _ = terminate_and_reap(&mut child);
+            return Err("Claude Code output was unavailable".to_string());
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            drop(stdin);
+            drop(stdout);
+            let _ = terminate_and_reap(&mut child);
+            return Err("Claude Code diagnostics were unavailable".to_string());
+        }
+    };
+
+    let (line_sender, line_receiver) = mpsc::channel();
+    let stdout_reader = thread::spawn(move || {
+        pump_protocol_lines(stdout, line_sender, CLAUDE_LINE_LIMIT, CLAUDE_OUTPUT_LIMIT)
+    });
+    let stderr_reader =
+        thread::spawn(move || drain_capped(stderr, CLAUDE_OUTPUT_LIMIT).map(|_| ()));
+    let deadline = Instant::now() + CLAUDE_PROTOCOL_TIMEOUT;
+
+    let protocol_result = (|| {
+        send_claude_control_request(&mut stdin, "vsparallel-initialize", "initialize")?;
+        let _ =
+            wait_for_claude_control_response(&line_receiver, "vsparallel-initialize", deadline)?;
+        send_claude_control_request(&mut stdin, "vsparallel-usage", "get_usage")?;
+        wait_for_claude_control_response(&line_receiver, "vsparallel-usage", deadline)
+    })();
+
+    drop(stdin);
+    let _ = finish_provider_process(&mut child);
+    join_provider_reader(stdout_reader);
+    join_provider_reader(stderr_reader);
+    protocol_result
+}
+
+fn claude_secure_storage_config_from(
+    secure_storage: Option<OsString>,
+    claude_config: Option<OsString>,
+) -> OsString {
+    secure_storage.or(claude_config).unwrap_or_default()
+}
+
+fn send_claude_control_request(
+    writer: &mut impl Write,
+    request_id: &str,
+    subtype: &str,
+) -> Result<(), String> {
+    serde_json::to_writer(
+        &mut *writer,
+        &json!({
+            "request_id": request_id,
+            "type": "control_request",
+            "request": {"subtype": subtype}
+        }),
+    )
+    .map_err(|_| "could not encode a Claude Code control request".to_string())?;
+    writer
+        .write_all(b"\n")
+        .and_then(|_| writer.flush())
+        .map_err(|_| "could not send a Claude Code control request".to_string())
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeControlMessage {
+    #[serde(rename = "type")]
+    message_type: String,
+    #[serde(default)]
+    response: Option<ClaudeControlResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeControlResponse {
+    subtype: String,
+    request_id: String,
+    #[serde(default)]
+    response: Option<ClaudeControlResult>,
+}
+
+/// Deliberately omits account, session, behavior-attribution, spend, and
+/// auxiliary limit fields returned by some Claude Code versions. Serde skips
+/// those fields without representing them in the result that leaves the
+/// protocol reader.
+#[derive(Debug, Default, Deserialize)]
+struct ClaudeControlResult {
+    #[serde(default)]
+    rate_limits: Option<ClaudeControlRateLimits>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct ClaudeControlRateLimits {
+    #[serde(default)]
+    five_hour: Option<ClaudeControlWindow>,
+    #[serde(default)]
+    seven_day: Option<ClaudeControlWindow>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ClaudeControlWindow {
+    #[serde(default)]
+    utilization: Option<f64>,
+    #[serde(default)]
+    resets_at: Option<ClaudeControlReset>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+enum ClaudeControlReset {
+    Seconds(i64),
+    Timestamp(String),
+}
+
+fn wait_for_claude_control_response(
+    receiver: &mpsc::Receiver<Result<Vec<u8>, String>>,
+    expected_request_id: &str,
+    deadline: Instant,
+) -> Result<Value, String> {
+    loop {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| "Claude Code usage request timed out".to_string())?;
+        let line = receiver
+            .recv_timeout(remaining)
+            .map_err(|error| match error {
+                mpsc::RecvTimeoutError::Timeout => {
+                    "Claude Code usage request timed out".to_string()
+                }
+                mpsc::RecvTimeoutError::Disconnected => {
+                    "Claude Code stopped before responding".to_string()
+                }
+            })??;
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        let message: ClaudeControlMessage = serde_json::from_slice(&line)
+            .map_err(|_| "Claude Code returned malformed output".to_string())?;
+        if message.message_type != "control_response" {
+            continue;
+        }
+        let response = match message.response {
+            Some(response) if response.request_id == expected_request_id => response,
+            _ => continue,
+        };
+        if response.subtype != "success" {
+            return Err("Claude Code rejected the usage request".to_string());
+        }
+        let result = response
+            .response
+            .ok_or_else(|| "Claude Code usage response had no result".to_string())?;
+        return Ok(json!({"rate_limits": result.rate_limits}));
+    }
 }
 
 fn send_rpc(writer: &mut impl Write, message: &Value) -> Result<(), String> {
@@ -296,16 +779,13 @@ fn wait_for_rpc_response(
 fn pump_protocol_lines(
     stdout: impl Read,
     sender: mpsc::Sender<Result<Vec<u8>, String>>,
+    line_limit: usize,
+    total_limit: usize,
 ) -> io::Result<()> {
     let mut reader = BufReader::new(stdout);
     let mut total = 0;
     loop {
-        match read_protocol_line(
-            &mut reader,
-            &mut total,
-            CODEX_LINE_LIMIT,
-            CODEX_OUTPUT_LIMIT,
-        ) {
+        match read_protocol_line(&mut reader, &mut total, line_limit, total_limit) {
             Ok(Some(line)) => {
                 if sender.send(Ok(line)).is_err() {
                     return Ok(());
@@ -345,7 +825,7 @@ fn read_protocol_line<R: BufRead>(
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Codex app-server output exceeded its safety limit",
+                "provider process output exceeded its safety limit",
             ));
         }
         let has_newline = available[consumed - 1] == b'\n';
@@ -372,7 +852,7 @@ fn drain_capped(mut reader: impl Read, limit: usize) -> io::Result<usize> {
     }
     Err(io::Error::new(
         io::ErrorKind::InvalidData,
-        "Codex diagnostic output exceeded its safety limit",
+        "provider diagnostic output exceeded its safety limit",
     ))
 }
 
@@ -420,6 +900,56 @@ fn codex_window_view(value: &Value, fallback_label: &str) -> Option<UsageWindowV
         used_percent,
         resets_at_ms,
     ))
+}
+
+fn claude_provider_view(result: &Value, now_ms: i64) -> Option<ProviderUsageView> {
+    let limits = result.get("rate_limits")?;
+    let mut windows = Vec::with_capacity(2);
+    if let Some(window) = limits
+        .get("five_hour")
+        .and_then(|window| claude_live_window_view(window, 300, "5-hour limit", now_ms))
+    {
+        windows.push(window);
+    }
+    if let Some(window) = limits
+        .get("seven_day")
+        .and_then(|window| claude_live_window_view(window, 10_080, "7-day limit", now_ms))
+    {
+        windows.push(window);
+    }
+    provider_from_windows(
+        windows,
+        now_ms,
+        "Live usage limits from Claude Code.",
+        "available",
+    )
+}
+
+fn claude_live_window_view(
+    value: &Value,
+    duration_minutes: i64,
+    label: &str,
+    now_ms: i64,
+) -> Option<UsageWindowView> {
+    let used_percent = finite_number(value.get("utilization")?)?;
+    let resets_at_ms = value.get("resets_at").and_then(claude_reset_to_millis);
+    if resets_at_ms.is_some_and(|reset| reset <= now_ms) {
+        return None;
+    }
+    Some(usage_window(
+        label.to_string(),
+        Some(duration_minutes),
+        used_percent,
+        resets_at_ms,
+    ))
+}
+
+fn claude_reset_to_millis(value: &Value) -> Option<i64> {
+    if let Some(seconds) = value.as_i64() {
+        return seconds_to_millis(seconds);
+    }
+    let timestamp = OffsetDateTime::parse(value.as_str()?, &Rfc3339).ok()?;
+    seconds_to_millis(timestamp.unix_timestamp())?.checked_add(i64::from(timestamp.millisecond()))
 }
 
 fn duration_label(duration_minutes: Option<i64>, fallback: &str) -> String {
@@ -492,6 +1022,12 @@ fn codex_command_from(value: Option<OsString>) -> OsString {
     value
         .filter(|command| !command.is_empty())
         .unwrap_or_else(|| OsString::from("codex"))
+}
+
+fn claude_command_from(value: Option<OsString>) -> OsString {
+    value
+        .filter(|command| !command.is_empty())
+        .unwrap_or_else(|| OsString::from("claude"))
 }
 
 /// Fail-open entry point for the Claude Code status-line command.
@@ -825,6 +1361,29 @@ fn terminate_and_reap(child: &mut Child) -> io::Result<()> {
     child.wait().map(|_| ())
 }
 
+fn finish_provider_process(child: &mut Child) -> io::Result<()> {
+    let deadline = Instant::now() + PROVIDER_GRACEFUL_EXIT_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(PROVIDER_EXIT_POLL_INTERVAL);
+            }
+            Ok(None) | Err(_) => return terminate_and_reap(child),
+        }
+    }
+}
+
+fn join_provider_reader<T>(reader: thread::JoinHandle<T>) {
+    let deadline = Instant::now() + PROVIDER_READER_JOIN_TIMEOUT;
+    while !reader.is_finished() && Instant::now() < deadline {
+        thread::sleep(PROVIDER_EXIT_POLL_INTERVAL);
+    }
+    if reader.is_finished() {
+        let _ = reader.join();
+    }
+}
+
 #[cfg(unix)]
 fn terminate_child(child: &mut Child) -> io::Result<()> {
     const SIGKILL: i32 = 9;
@@ -852,6 +1411,15 @@ mod tests {
     struct FakeRunner(Result<Value, String>);
 
     impl CodexUsageRunner for FakeRunner {
+        fn read_rate_limits(&self, _executable: &OsStr) -> Result<Value, String> {
+            self.0.clone()
+        }
+    }
+
+    #[derive(Clone)]
+    struct FakeClaudeRunner(Result<Value, String>);
+
+    impl ClaudeUsageRunner for FakeClaudeRunner {
         fn read_rate_limits(&self, _executable: &OsStr) -> Result<Value, String> {
             self.0.clone()
         }
@@ -918,11 +1486,106 @@ mod tests {
     }
 
     #[test]
+    fn claude_live_limits_report_percentages_and_rfc3339_resets() {
+        let result = json!({
+            "subscription_type": "pro",
+            "rate_limits_available": true,
+            "rate_limits": {
+                "five_hour": {
+                    "utilization": 23.5,
+                    "resets_at": "1970-01-01T00:00:02.345Z"
+                },
+                "seven_day": {
+                    "utilization": 75,
+                    "resets_at": 1_800_100_000
+                },
+                "seven_day_sonnet": {
+                    "utilization": 99
+                }
+            }
+        });
+
+        let view = claude_provider_view(&result, 1_000).unwrap();
+
+        assert_eq!(view.state, "available");
+        assert_eq!(view.remaining_percent, Some(25.0));
+        assert_eq!(view.windows.len(), 2);
+        assert_eq!(view.windows[0].label, "5-hour limit");
+        assert_eq!(view.windows[0].remaining_percent, 76.5);
+        assert_eq!(view.windows[0].resets_at_ms, Some(2_345));
+        assert_eq!(view.windows[1].label, "7-day limit");
+        assert_eq!(view.windows[1].resets_at_ms, Some(1_800_100_000_000));
+        assert_eq!(
+            claude_reset_to_millis(&json!("2026-08-05T15:19:59.920164+00:00")),
+            Some(1_785_943_199_920)
+        );
+    }
+
+    #[test]
+    fn claude_live_limits_omit_expired_windows() {
+        let result = json!({
+            "rate_limits": {
+                "five_hour": {"utilization": 90, "resets_at": "1970-01-01T00:00:02Z"},
+                "seven_day": {"utilization": 40, "resets_at": "2030-01-01T00:00:00Z"}
+            }
+        });
+
+        let view = claude_provider_view(&result, 3_000).unwrap();
+
+        assert_eq!(view.windows.len(), 1);
+        assert_eq!(view.windows[0].label, "7-day limit");
+        assert_eq!(view.remaining_percent, Some(60.0));
+    }
+
+    #[test]
+    fn snapshot_prefers_live_claude_and_falls_back_to_statusline_cache() {
+        let temp = TempDir::new().unwrap();
+        let input = br#"{
+            "rate_limits": {
+                "five_hour": {"used_percentage": 40, "resets_at": 1800000000}
+            }
+        }"#;
+        claude_input(temp.path(), input, 1_000);
+        let live = json!({
+            "rate_limits": {
+                "five_hour": {"utilization": 20, "resets_at": "2030-01-01T00:00:00Z"}
+            }
+        });
+
+        let fresh = build_usage_snapshot_with(
+            &FakeRunner(Err("signed out".to_string())),
+            OsStr::new("fake-codex"),
+            &FakeClaudeRunner(Ok(live)),
+            OsStr::new("fake-claude"),
+            Some(temp.path()),
+            2_000,
+        );
+        assert_eq!(fresh.claude.remaining_percent, Some(80.0));
+        assert_eq!(fresh.claude.detail, "Live usage limits from Claude Code.");
+
+        let fallback = build_usage_snapshot_with(
+            &FakeRunner(Err("signed out".to_string())),
+            OsStr::new("fake-codex"),
+            &FakeClaudeRunner(Err("unsupported".to_string())),
+            OsStr::new("fake-claude"),
+            Some(temp.path()),
+            2_000,
+        );
+        assert_eq!(fallback.claude.remaining_percent, Some(60.0));
+        assert_eq!(
+            fallback.claude.detail,
+            "Usage limits captured by Claude Code."
+        );
+    }
+
+    #[test]
     fn snapshot_runner_failures_are_unavailable_not_errors() {
         let temp = TempDir::new().unwrap();
         let snapshot = build_usage_snapshot_with(
             &FakeRunner(Err("signed out".to_string())),
             OsStr::new("fake-codex"),
+            &FakeClaudeRunner(Err("signed out".to_string())),
+            OsStr::new("fake-claude"),
             Some(temp.path()),
             42_000,
         );
@@ -941,6 +1604,104 @@ mod tests {
         );
         assert_eq!(codex_command_from(Some(OsString::new())), "codex");
         assert_eq!(codex_command_from(None), "codex");
+        assert_eq!(
+            claude_command_from(Some(OsString::from("/opt/Claude Preview/claude"))),
+            OsString::from("/opt/Claude Preview/claude")
+        );
+        assert_eq!(claude_command_from(Some(OsString::new())), "claude");
+        assert_eq!(claude_command_from(None), "claude");
+        assert_eq!(
+            claude_secure_storage_config_from(
+                Some(OsString::from("/secure")),
+                Some(OsString::from("/config")),
+            ),
+            OsString::from("/secure")
+        );
+        assert_eq!(
+            claude_secure_storage_config_from(None, Some(OsString::from("/config"))),
+            OsString::from("/config")
+        );
+        assert_eq!(
+            claude_secure_storage_config_from(None, None),
+            OsString::new()
+        );
+    }
+
+    #[test]
+    fn claude_extension_location_resolves_its_bundled_binary() {
+        let temp = TempDir::new().unwrap();
+        let binary_name = if cfg!(windows) {
+            "claude.exe"
+        } else {
+            "claude"
+        };
+        let binary = temp
+            .path()
+            .join("resources")
+            .join("native-binary")
+            .join(binary_name);
+        fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        fs::write(&binary, b"test binary").unwrap();
+        let output = format!("{}\n", temp.path().display());
+
+        assert_eq!(
+            claude_extension_executable_from_output(output.as_bytes()),
+            Some(binary)
+        );
+        assert_eq!(claude_extension_executable_from_output(b"\n"), None);
+        assert_eq!(
+            claude_extension_executable_from_output(b"/missing/extension\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn claude_extension_registry_fallback_is_bounded_to_a_child_directory() {
+        let temp = TempDir::new().unwrap();
+        let extensions = temp.path().join(".vscode").join("extensions");
+        let valid_relative = "anthropic.claude-code-2.1.222-test";
+        let binary_name = if cfg!(windows) {
+            "claude.exe"
+        } else {
+            "claude"
+        };
+        let binary = extensions
+            .join(valid_relative)
+            .join("resources")
+            .join("native-binary")
+            .join(binary_name);
+        fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        fs::write(&binary, b"test binary").unwrap();
+        fs::write(
+            extensions.join("extensions.json"),
+            serde_json::to_vec(&json!([
+                {
+                    "identifier": {"id": "anthropic.claude-code"},
+                    "relativeLocation": valid_relative,
+                    "metadata": {"installedTimestamp": 100}
+                },
+                {
+                    "identifier": {"id": "anthropic.claude-code"},
+                    "relativeLocation": "../outside",
+                    "metadata": {"installedTimestamp": 200}
+                }
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            claude_extension_from_registry(&extensions),
+            Some((100, binary))
+        );
+        assert_eq!(
+            vscode_extension_directories(temp.path()),
+            [
+                temp.path().join(".vscode").join("extensions"),
+                temp.path().join(".vscode-insiders").join("extensions"),
+                temp.path().join(".vscode-oss").join("extensions"),
+            ]
+        );
     }
 
     #[test]
@@ -1109,6 +1870,67 @@ mod tests {
         let mut reader = Cursor::new(b"too-long\n");
         let mut total = 0;
         assert!(read_protocol_line(&mut reader, &mut total, 4, 100).is_err());
+    }
+
+    #[test]
+    fn claude_control_parser_ignores_unrelated_messages() {
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(Ok(br#"{"type":"system","subtype":"init"}"#.to_vec()))
+            .unwrap();
+        sender
+            .send(Ok(
+                br#"{"type":"control_response","response":{"subtype":"success","request_id":"other","response":{}}}"#
+                    .to_vec(),
+            ))
+            .unwrap();
+        sender
+            .send(Ok(
+                br#"{"type":"control_response","response":{"subtype":"success","request_id":"usage","response":{"rate_limits":{"five_hour":{"utilization":12,"private":"private-window"},"spend":{"amount":99,"currency":"private-currency"},"extra_usage":{"private":"private-extra"}},"session":{"email":"private@example.test"},"behaviors":{"week":{"skills":["private-skill"]}}}}}"#
+                    .to_vec(),
+            ))
+            .unwrap();
+
+        let result = wait_for_claude_control_response(
+            &receiver,
+            "usage",
+            Instant::now() + Duration::from_secs(1),
+        )
+        .unwrap();
+
+        assert_eq!(
+            result
+                .pointer("/rate_limits/five_hour/utilization")
+                .and_then(Value::as_f64),
+            Some(12.0)
+        );
+        let retained = result.to_string();
+        assert!(!retained.contains("private@example.test"));
+        assert!(!retained.contains("private-skill"));
+        assert!(!retained.contains("private-window"));
+        assert!(!retained.contains("private-currency"));
+        assert!(!retained.contains("private-extra"));
+        assert_eq!(result.as_object().unwrap().len(), 1);
+        assert_eq!(result["rate_limits"].as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn claude_control_parser_rejects_error_responses() {
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(Ok(
+                br#"{"type":"control_response","response":{"subtype":"error","request_id":"usage","error":"unsupported"}}"#
+                    .to_vec(),
+            ))
+            .unwrap();
+
+        let result = wait_for_claude_control_response(
+            &receiver,
+            "usage",
+            Instant::now() + Duration::from_secs(1),
+        );
+
+        assert!(result.is_err());
     }
 
     #[test]

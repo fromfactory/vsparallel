@@ -4012,6 +4012,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-single-instance",
  "tempfile",
+ "time",
  "windows",
 ]
 

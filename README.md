@@ -10,19 +10,19 @@ attention, and access active workspaces directly from the native system tray—a
 without interrupting your flow.
 
 VSParallel has no account system, telemetry, analytics, or advertising. Its
-workspace and Claude Code monitoring remain local. VSParallel asks the user's
-installed Codex `app-server` for local hook-review status and, when signed in,
-live rate-limit percentages and reset times. That Codex subprocess may contact
-the Codex service using its own existing sign-in. VSParallel does not read or
-store the credential.
+workspace and provider monitoring remain local. VSParallel asks the user's
+installed Codex `app-server` and signed-in Claude CLI for live rate-limit
+percentages and reset times. Each provider subprocess owns its authentication
+and any network connection. VSParallel does not read or store either
+credential, and it does not persist the live usage responses.
 
 VSParallel does not extract, log, retain, or transmit prompts, responses,
 source code, terminal contents, transcripts, or Git data. Optional lifecycle
 hooks receive documented provider event payloads, extract only the event name,
-session ID, and working directory, and discard all unselected fields. Claude
-Code usage capture similarly extracts only rate-limit percentages and reset
-times from local status-line input. See [PRIVACY.md](PRIVACY.md) for the complete
-local-data and cleanup policy.
+session ID, and working directory, and discard all unselected fields. Live
+provider usage handling and Claude Code's local status-line fallback similarly
+retain only rate-limit percentages and reset times. See
+[PRIVACY.md](PRIVACY.md) for the complete local-data and cleanup policy.
 
 ## Requirements and platform support
 
@@ -78,11 +78,24 @@ hooks add coarse **Activity detected**, **Turn finished**, and
 The global usage cards refresh every 60 seconds and when **Refresh** is selected.
 Codex usage is available when the `codex` executable is installed, supports
 `app-server`, and is signed in. It does not depend on the Codex lifecycle hooks.
-Claude Code usage is captured locally through a VSParallel-managed `statusLine`
-command installed with the Claude integration. If the user already has a custom
-Claude Code status line, VSParallel preserves it and reports Claude usage as
-unavailable instead of replacing it. Claude Code must supply rate-limit data at
-least once before a percentage can appear.
+Claude Code usage is available when a signed-in `claude` executable—on `PATH`
+or bundled with the installed Claude VS Code extension—supports the CLI/SDK
+control-channel usage getter. This is an evolving Claude CLI compatibility
+interface, not a documented stable standalone command. VSParallel actively asks
+it for the five-hour and seven-day windows, so usage works for graphical VS Code
+Claude sessions that do not run `statusLine`. Lifecycle hooks and status-line
+installation are not required for the active query. The managed `statusLine`
+cache remains a local fallback for terminal Claude and older versions. If the
+user already has a custom status line, VSParallel preserves it; only that
+cache's managed refresh is unavailable, and any existing record may remain
+visible as stale.
+
+Claude's current full-usage getter also calculates local attribution summaries.
+VSParallel prevents it from seeing real session history by running the query
+with a new empty, private configuration directory and no session persistence,
+while Claude keeps control of its existing secure authentication. The parser
+keeps only rate-limit windows and discards account, session, attribution, and
+other response fields.
 
 Use a workspace card to ask VS Code to open or activate its exact target.
 VSParallel then stays available as a compact always-on-top panel: choose another
@@ -111,10 +124,11 @@ preserved, writes are atomic, and a one-time backup is created before the first
 change.
 
 When no `statusLine` is configured, the Claude Code integration also installs a
-privacy-minimal usage capture command with a 60-second refresh interval. An
-existing custom `statusLine` is unrelated user configuration and is left
-unchanged; lifecycle monitoring can still work, but Claude usage capture remains
-unavailable.
+privacy-minimal fallback usage capture command with a 60-second refresh
+interval. An existing custom `statusLine` is unrelated user configuration and
+is left unchanged. Lifecycle monitoring and the active Claude usage query can
+still work; only VSParallel's managed refresh of the status-line fallback is
+disabled.
 
 To use VS Code Insiders or another installation, set
 `VSPARALLEL_CODE_COMMAND` to its absolute executable path before launching
@@ -124,26 +138,32 @@ Codex usage looks for `codex` on `PATH` by default. If the signed-in executable
 is elsewhere, set `VSPARALLEL_CODEX_COMMAND` to its absolute path before
 launching VSParallel.
 
+Claude Code usage can use either `claude` on `PATH` or the executable bundled
+with the installed Claude VS Code extension, trying the other source if the
+first query fails. To select another signed-in executable, set
+`VSPARALLEL_CLAUDE_COMMAND` to its absolute path before launching VSParallel.
+
 ## How it works
 
 ```text
 VS Code companion ─ workspace/focus/extension heartbeat ─┐
 Codex hooks ───────────── coarse lifecycle marker ────────┼─ local state ─┐
 Claude Code hooks ─────── coarse lifecycle marker ────────┤               │
-Claude Code statusLine ── usage percentages/reset times ──┘               ├─ Rust core ─ Tauri UI
-Codex app-server ───── hook trust + live usage percentages/reset times ────┘      │
-                                                                                  └─ native tray
+Claude Code statusLine ── fallback usage cache ───────────┘               │
+Claude CLI control ────── live usage percentages/reset times ─────────────┤─ Rust core ─ Tauri UI
+Codex app-server ──────── hook trust + live usage percentages/reset times ┘             └─ native tray
 ```
 
 The desktop application uses Tauri 2, a Rust backend, and a framework-free
 HTML/CSS/TypeScript UI compiled to static JavaScript. The dependency-free
 companion extension writes local workspace heartbeats. Optional provider hooks
-write only coarse lifecycle records. The Claude Code status-line command writes a separate global
+write only coarse lifecycle records. Claude and Codex limits are fetched live
+through their provider-owned processes and are not written to the state
+directory. The Claude Code status-line fallback writes a separate global
 `usage/claude.json` record containing only captured percentages, reset times,
-and a capture timestamp. Codex limits are fetched live through Codex
-`app-server` and are not written to the state directory. The Rust backend
-validates these records and serves UI-safe snapshots to the main window; the
-workspace snapshot also feeds the native tray menu.
+and a capture timestamp. The Rust backend validates these records and serves
+UI-safe snapshots to the main window; the workspace snapshot also feeds the
+native tray menu.
 
 Lifecycle state is hook-derived rather than an internal provider progress feed.
 Records are associated with workspaces by local path, and exact native-window
@@ -164,15 +184,15 @@ VSParallel stores only the metadata required for the workspace overview:
 - coarse lifecycle state, a one-way hash of the provider session identifier,
   working directory, and timestamp when optional hooks are enabled; and
 - Claude Code five-hour and weekly usage percentages, their optional reset
-  times, and the local capture timestamp when managed status-line capture is
-  available.
+  times, and the local capture timestamp only when the managed status-line
+  fallback cache is available.
 
-Codex usage is held only in memory while VSParallel is running. VSParallel does
-not write Codex usage or Codex account details to the state directory. The
-provider cards show the lowest remaining percentage among the available windows
-so the compact summary does not overstate capacity. A recent, unexpired value
-may remain visible with a **Stale** badge for up to 15 minutes if a refresh
-temporarily fails.
+Live Codex and Claude usage is held only in memory while VSParallel is running.
+VSParallel does not write live usage or provider account details to the state
+directory. The provider cards show the lowest remaining percentage among the
+available windows so the compact summary does not overstate capacity. A recent,
+unexpired value may remain visible with a **Stale** badge for up to 15 minutes
+if a refresh temporarily fails.
 
 | Platform | Default state directory |
 | --- | --- |
@@ -238,6 +258,13 @@ To use a Codex executable that is not the `codex` found on `PATH`:
 
 ```bash
 VSPARALLEL_CODEX_COMMAND=/absolute/path/to/codex ./scripts/run-dev.sh
+```
+
+To force a Claude executable instead of the `claude` found on `PATH` or the
+binary bundled with the Claude VS Code extension:
+
+```bash
+VSPARALLEL_CLAUDE_COMMAND=/absolute/path/to/claude ./scripts/run-dev.sh
 ```
 
 ### Test

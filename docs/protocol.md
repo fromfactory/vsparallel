@@ -114,9 +114,11 @@ Both adapters map only documented lifecycle events:
 Each adapter hashes the provider session ID and does not retain the raw session
 ID or turn ID.
 
-## Claude Code usage record (schema version 1)
+## Claude Code status-line fallback record (schema version 1)
 
-Claude Code usage is provider-global rather than workspace- or session-specific.
+The optional on-disk Claude Code usage cache is provider-global rather than
+workspace- or session-specific. It is a fallback for terminal Claude sessions
+and older CLI versions when the live query described below is unavailable.
 When the Claude integration owns the user's `statusLine` setting, Claude Code
 runs VSParallel's local capture command every 60 seconds and supplies its
 documented status-line JSON on standard input. VSParallel extracts only the
@@ -146,11 +148,51 @@ remaining value as the provider's compact summary.
 
 Records older than 15 minutes are presented as stale. Individual windows that
 have passed their reset times are omitted; when no unexpired window remains,
-Claude usage is unavailable until a fresh value is captured. Missing,
-oversized, malformed, future-dated, wrong-version, symlinked, or otherwise
-unusable records are ignored. If the user already has a custom Claude Code
+the fallback cannot supply usage until a fresh value is captured. Missing,
+oversized, malformed, more than five minutes future-dated, wrong-version,
+symlinked, or otherwise unusable records are ignored. If the user already has
+a custom Claude Code
 `statusLine`, VSParallel does not replace or wrap it, so this file is not
-refreshed and Claude usage is reported as unavailable or stale.
+refreshed. The live query remains independent and can still supply current
+Claude usage.
+
+## Live Claude Code usage (not persisted)
+
+Every 60 seconds, and on an explicit refresh, VSParallel starts the installed
+Claude executable and asks the signed-in account for its five-hour and
+seven-day usage through the CLI/SDK control channel. This usage getter is an
+evolving Claude CLI compatibility interface, not a documented stable standalone
+command.
+
+Claude Code's current full-usage getter also attempts to compute behavior,
+agent, skill, plugin, and MCP attribution from its configured recent session
+history. VSParallel launches the subprocess with `CLAUDE_CONFIG_DIR` pointing
+to a new empty, owner-private temporary directory and disables session
+persistence, so that calculation cannot enumerate the user's real transcripts.
+The provider's original secure-storage root is passed separately so Claude can
+use its own existing sign-in without VSParallel reading a credential. The
+temporary directory is removed after the query.
+
+For each valid window, VSParallel keeps only the percentage used, the derived
+percentage remaining, and the optional reset time. The compact card uses the
+lowest remaining percentage so it cannot overstate available capacity. The
+Claude subprocess owns authentication and any provider connection. A narrow
+response type admits only `rate_limits`; account, session, behavior-attribution,
+and other fields are discarded. VSParallel never reads Claude credentials or
+writes the live response to the state directory. It may retain a recent,
+unexpired last-known value in memory for up to 15 minutes and marks it as stale.
+
+If the executable is absent, signed out, times out, exposes an incompatible
+control interface, or returns no valid windows, VSParallel falls back to the
+managed status-line record above when that record is usable. Native graphical
+Claude sessions in VS Code do not run `statusLine`; the active query is what
+makes usage available for those sessions. `VSPARALLEL_CLAUDE_COMMAND` can
+select a different executable; otherwise VSParallel can use either `claude`
+from `PATH` or the executable bundled with the installed Claude VS Code
+extension, trying the other source if the first query fails. It locates the
+bundled source through the VS Code launcher or, when the launcher is
+unavailable, a bounded read of the local extension registry for the exact
+Anthropic extension entry.
 
 ## Codex hook review status (not persisted)
 
@@ -193,6 +235,7 @@ state. The lifecycle adapters receive richer documented hook payloads but
 create new five-field objects and discard the input before writing. The Claude
 status-line adapter likewise creates the minimal usage record shown above and
 does not represent or persist the accompanying session ID, working directory,
-model, cost, repository data, or transcript path. Codex usage remains in memory
-only, and VSParallel never reads or stores provider credentials.
+model, cost, repository data, or transcript path. Live Codex and Claude usage
+remains in memory only, and VSParallel never reads or stores provider
+credentials. Only the minimal Claude status-line fallback record is persisted.
 Automated Rust and JavaScript tests assert these boundaries.

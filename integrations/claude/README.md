@@ -6,6 +6,30 @@ application. Use **Setup & diagnostics** in the app. The integration is
 optional, and production users do not run a script or manually edit settings
 from this directory.
 
+Every 60 seconds, and when **Refresh** is selected, VSParallel actively asks the
+installed signed-in Claude CLI for its five-hour and seven-day usage through the
+CLI/SDK control channel. This usage getter is an evolving Claude CLI
+compatibility interface, not a documented stable standalone command. The Claude
+process owns authentication and any provider connection; VSParallel never reads
+its credentials and never persists the live response. It retains only the
+percentages and optional reset times needed for the card, with a recent value
+kept in memory for up to 15 minutes when a refresh temporarily fails.
+
+Claude's current full-usage getter also calculates attribution from its
+configured recent session history. VSParallel gives the subprocess a new empty,
+owner-private temporary configuration directory and disables session
+persistence, preventing access to real transcripts while Claude continues to
+own authentication through its original secure-storage root. The response
+parser discards account, session, attribution, and every field except the rate
+limits, and the temporary directory is removed after the query.
+
+The active usage query is independent of lifecycle hooks and `statusLine`.
+This matters for native graphical Claude sessions in VS Code, which do not run
+the terminal status line. VSParallel can use either `claude` from `PATH` or the
+executable bundled with the installed Claude VS Code extension, trying the
+other source if the first query fails. `VSPARALLEL_CLAUDE_COMMAND` can select a
+different signed-in executable.
+
 The app merges its owned handlers into the `hooks` object in the user's Claude
 `settings.json` and preserves unrelated settings and handlers. It maps only
 documented events:
@@ -25,23 +49,26 @@ directory: `schemaVersion`, a SHA-256 `sessionKey`, `cwd`, `state`, and
 session or turn IDs are discarded.
 
 When the top-level `statusLine` setting is absent, setup also installs a
-VSParallel-owned command that Claude Code runs every 60 seconds. The command
-extracts only `rate_limits.five_hour` and `rate_limits.seven_day` percentage and
-reset values from Claude Code's local status-line input. It atomically writes a
-single privacy-minimal `usage/claude.json` record under the shared state root.
-That record contains `schemaVersion`, `capturedAtMs`, and whichever `fiveHour`
-or `sevenDay` windows Claude supplied; each window contains only `usedPercent`
-and optional `resetsAtMs`.
+VSParallel-owned fallback command that Claude Code runs every 60 seconds. It is
+useful for terminal Claude and older CLI versions when the active query is
+unavailable. The command extracts only `rate_limits.five_hour` and
+`rate_limits.seven_day` percentage and reset values from Claude Code's local
+status-line input. It atomically writes a single privacy-minimal
+`usage/claude.json` record under the shared state root. That record contains
+`schemaVersion`, `capturedAtMs`, and whichever `fiveHour` or `sevenDay` windows
+Claude supplied; each window contains only `usedPercent` and optional
+`resetsAtMs`.
 
-Claude Code can omit rate limits, including before the first relevant API
-response. Until a valid window has been captured, VSParallel shows Claude usage
-as unavailable. Captured values are provider-global, not associated with a
-workspace or raw session identifier.
+Claude Code can omit rate limits from status-line input, including before the
+first relevant API response. Until a valid window has been captured, that
+fallback is unavailable. Captured values are provider-global, not associated
+with a workspace or raw session identifier.
 
 Claude Code supports one `statusLine` command. If a custom status line already
-exists, VSParallel preserves it exactly and reports usage capture as
-unavailable instead of replacing or wrapping the command. Lifecycle hooks are
-installed and repaired independently. Uninstall removes only a VSParallel-owned
+exists, VSParallel preserves it exactly instead of replacing or wrapping the
+command. Only VSParallel's managed refresh of the fallback cache is disabled;
+an existing record may remain visible as stale, and the active CLI query and
+lifecycle hooks remain independent. Uninstall removes only a VSParallel-owned
 status line and never removes a custom one.
 
 Although Claude Code supplies richer status-line data, VSParallel does not

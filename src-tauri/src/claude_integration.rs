@@ -755,17 +755,21 @@ fn status_from_states(
     };
     match usage_state {
         UsageCaptureState::Current => {
-            message.push_str(" Claude Code usage-limit monitoring is installed.");
+            message.push_str(
+                " The terminal usage fallback is installed; live usage is checked separately.",
+            );
         }
         UsageCaptureState::Stale => {
-            message.push_str(" Claude Code usage-limit monitoring needs repair.");
+            message.push_str(" The terminal usage fallback needs repair.");
         }
         UsageCaptureState::Missing => {
-            message.push_str(" Claude Code usage-limit monitoring is not installed.");
+            message.push_str(
+                " The terminal usage fallback is not installed; live CLI usage does not require it.",
+            );
         }
         UsageCaptureState::Conflict => {
             message.push_str(
-                " An existing custom Claude Code status line was kept, so VSParallel cannot capture usage limits.",
+                " An existing custom Claude Code status line was kept. Live CLI usage may still be available; terminal fallback capture is disabled.",
             );
         }
     }
@@ -1519,6 +1523,10 @@ mod tests {
         assert!(installed.changed);
         assert!(installed.status.installed);
         assert_eq!(installed.status.usage_capture_state, "conflict");
+        assert!(installed
+            .status
+            .message
+            .contains("Live CLI usage may still be available"));
         assert_eq!(parse_config(&home)["statusLine"], custom);
 
         let second = install_claude_integration(&home, &executable).unwrap();
