@@ -9,6 +9,8 @@ Switch between projects instantly, return to the workspace that needs your
 attention, and access active workspaces directly from the native system tray—all
 without interrupting your flow.
 
+![VSParallel showing workspace activity and Codex and Claude Code usage at a glance](assets/demo.gif)
+
 VSParallel has no account system, telemetry, analytics, or advertising. Its
 workspace and provider monitoring remain local. VSParallel asks the user's
 installed Codex `app-server` and signed-in Claude CLI for live rate-limit
