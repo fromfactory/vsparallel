@@ -5,6 +5,11 @@ REPOSITORY_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 INSTALL_PREFIX=${VSPARALLEL_INSTALL_PREFIX:-"${HOME}/.local"}
 
 cd "$REPOSITORY_DIR"
+if ! command -v npm >/dev/null 2>&1; then
+  printf '%s\n' 'npm is required to compile the TypeScript UI.' >&2
+  exit 1
+fi
+npm run build:ui
 cargo build --release --locked --bin vsparallel
 install -d \
   "$INSTALL_PREFIX/bin" \

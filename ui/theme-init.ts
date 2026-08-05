@@ -1,13 +1,19 @@
 (function () {
   "use strict";
 
+  type ThemePreference = "system" | "light" | "dark";
+
   const storageKey = "vsparallel.appearance";
-  const supportedPreferences = new Set(["system", "light", "dark"]);
-  let preference = "system";
+  const supportedPreferences: ReadonlySet<string> = new Set(["system", "light", "dark"]);
+  let preference: ThemePreference = "system";
+
+  function isThemePreference(value: unknown): value is ThemePreference {
+    return typeof value === "string" && supportedPreferences.has(value);
+  }
 
   try {
     const storedPreference = window.localStorage.getItem(storageKey);
-    if (supportedPreferences.has(storedPreference)) {
+    if (isThemePreference(storedPreference)) {
       preference = storedPreference;
     }
   } catch (_error) {

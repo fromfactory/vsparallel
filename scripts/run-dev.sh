@@ -4,6 +4,12 @@ set -eu
 REPOSITORY_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$REPOSITORY_DIR"
 
+if ! command -v npm >/dev/null 2>&1; then
+  printf '%s\n' 'npm is required to compile the TypeScript UI.' >&2
+  exit 1
+fi
+npm run build:ui
+
 # The VS Code Snap exports GTK/GDK/GIO lookup paths for the libraries bundled
 # inside the Snap. A host-built Tauri binary must use the host modules instead.
 if [ -n "${XDG_DATA_DIRS_VSCODE_SNAP_ORIG-}" ]; then

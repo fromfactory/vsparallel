@@ -131,10 +131,10 @@ Codex app-server ───────── live usage percentages/reset times 
                                                                                   └─ native tray
 ```
 
-The desktop application uses Tauri 2, a Rust backend, and static
-HTML/CSS/JavaScript. The dependency-free companion extension writes local
-workspace heartbeats. Optional provider hooks write only coarse lifecycle
-records. The Claude Code status-line command writes a separate global
+The desktop application uses Tauri 2, a Rust backend, and a framework-free
+HTML/CSS/TypeScript UI compiled to static JavaScript. The dependency-free
+companion extension writes local workspace heartbeats. Optional provider hooks
+write only coarse lifecycle records. The Claude Code status-line command writes a separate global
 `usage/claude.json` record containing only captured percentages, reset times,
 and a capture timestamp. Codex limits are fetched live through Codex
 `app-server` and are not written to the state directory. The Rust backend
@@ -195,26 +195,32 @@ instructions.
 ### Prerequisites
 
 - Rust stable with Cargo
+- Node.js 24 with npm
 - VS Code 1.85 or newer with `code` available
 - The [Tauri 2 platform prerequisites](https://v2.tauri.app/start/prerequisites/)
 
 Python 3 is optional and used by the standalone developer VSIX packager and icon
-generator. Regenerating icon assets additionally requires Pillow. Node package
-managers are not required.
+generator. Regenerating icon assets additionally requires Pillow.
+
+The UI source lives in `ui/*.ts`. `npm run build:ui` emits ignored runtime files
+under `ui/generated/`; edit the TypeScript sources rather than those artifacts.
 
 ### Run locally
 
 From the repository root:
 
 ```bash
+npm ci
 ./scripts/run-dev.sh
 ```
 
-The script removes VS Code Snap-specific GTK/GIO environment settings before
-Cargo starts. VSParallel repeats that cleanup at application startup, so the
-equivalent direct command is also safe from a VS Code Snap integrated terminal:
+The script compiles the TypeScript UI and removes VS Code Snap-specific GTK/GIO
+environment settings before Cargo starts. VSParallel repeats that environment
+cleanup at application startup. The equivalent direct commands are also safe
+from a VS Code Snap integrated terminal:
 
 ```bash
+npm run build:ui
 cargo run --locked --bin vsparallel
 ```
 
@@ -238,15 +244,16 @@ Run the complete repository check:
 ./scripts/check.sh
 ```
 
-This checks Rust formatting, runs Clippy with warnings denied, executes the Rust
-test suite, and runs the JavaScript interface and companion tests when a
-Node-compatible runner is available.
+This compiles and strictly type-checks the TypeScript UI, runs its interface
+tests, checks Rust formatting, runs Clippy with warnings denied, executes the
+Rust test suite, and runs the JavaScript companion tests.
 
 ### Build release packages
 
 Install the pinned Tauri CLI and use the release wrapper:
 
 ```bash
+npm ci
 cargo install tauri-cli --version 2.11.4 --locked
 ./scripts/build-bundles.sh
 ```
@@ -263,6 +270,7 @@ See [Releases](docs/releases.md) for the complete procedure.
 To build only the release executable:
 
 ```bash
+npm run build:ui
 cargo build --release --locked --bin vsparallel
 ```
 

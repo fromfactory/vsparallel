@@ -1,0 +1,15 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM", "DOM.Iterable"],
+    "module": "ES2022",
+    "moduleDetection": "legacy",
+    "types": [],
+    "strict": true,
+    "noEmitOnError": true,
+    "forceConsistentCasingInFileNames": true,
+    "rootDir": "ui",
+    "outDir": "ui/generated"
+  },
+  "include": ["ui/app.ts", "ui/theme-init.ts"]
+}

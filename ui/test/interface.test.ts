@@ -1,30 +1,37 @@
 "use strict";
 
-const assert = require("node:assert/strict");
-const fs = require("node:fs");
-const path = require("node:path");
-const test = require("node:test");
-const vm = require("node:vm");
+import assert = require("node:assert/strict");
+import fs = require("node:fs");
+import path = require("node:path");
+import { test } from "node:test";
+import vm = require("node:vm");
 
-const repository = path.resolve(__dirname, "../..");
+const repository = path.resolve(process.cwd());
 
-function read(relativePath) {
+function read(relativePath: string): string {
   return fs.readFileSync(path.join(repository, relativePath), "utf8");
 }
 
-function readBuffer(relativePath) {
+function readBuffer(relativePath: string): Buffer {
   return fs.readFileSync(path.join(repository, relativePath));
 }
 
-function appFunction(source, name) {
+function appFunction(source: string, name: string): string {
   const match = source.match(
-    new RegExp(`^  function ${name}\\([^\\n]*\\) \\{[\\s\\S]*?^  \\}`, "m"),
+    new RegExp(
+      `^(?<indent>[ \\t]+)function ${name}\\([^\\n]*\\) \\{[\\s\\S]*?^\\k<indent>\\}`,
+      "m",
+    ),
   );
   assert.ok(match, `${name} should be independently testable`);
   return match[0];
 }
 
-function pngMetadata(relativePath) {
+function pngMetadata(relativePath: string): {
+  width: number;
+  height: number;
+  colorType: number;
+} {
   const png = readBuffer(relativePath);
   assert.deepEqual(
     png.subarray(0, 8),
@@ -39,22 +46,30 @@ function pngMetadata(relativePath) {
   };
 }
 
-function sliceBetween(source, startPattern, endPattern, description) {
+function sliceBetween(
+  source: string,
+  startPattern: RegExp,
+  endPattern: RegExp,
+  description: string,
+): string {
   const startMatch = source.match(startPattern);
   assert.ok(startMatch, `${description} should have a start marker`);
   const start = startMatch.index;
+  assert.ok(start !== undefined, `${description} start marker should have an index`);
   const remainder = source.slice(start + startMatch[0].length);
   const endMatch = remainder.match(endPattern);
   assert.ok(endMatch, `${description} should have an end marker`);
-  return source.slice(start, start + startMatch[0].length + endMatch.index);
+  const end = endMatch.index;
+  assert.ok(end !== undefined, `${description} end marker should have an index`);
+  return source.slice(start, start + startMatch[0].length + end);
 }
 
-function attribute(tag, name) {
+function attribute(tag: string, name: string): string | null {
   const match = tag.match(new RegExp(`\\b${name}\\s*=\\s*(["'])(.*?)\\1`, "i"));
   return match?.[2] ?? null;
 }
 
-function cssBlocksMatching(css, pattern) {
+function cssBlocksMatching(css: string, pattern: RegExp): string {
   return Array.from(css.matchAll(/([^{}]+)\{([^{}]*)\}/g))
     .filter((match) => pattern.test(match[1]))
     .map((match) => match[0])
@@ -88,7 +103,7 @@ test("the main chrome omits redundant labels while retaining an accessible works
 test("global Codex and Claude usage meters emphasize remaining capacity", () => {
   const html = read("ui/index.html");
   const css = read("ui/styles.css");
-  const javascript = read("ui/app.js");
+  const javascript = read("ui/generated/app.js");
   const overview = html.match(
     /<section\b(?=[^>]*class="[^"]*\busage-overview\b[^"]*")[^>]*>[\s\S]*?<\/section>/i,
   )?.[0];
@@ -129,13 +144,15 @@ test("global Codex and Claude usage meters emphasize remaining capacity", () => 
   assert.match(javascript, /USAGE_REFRESH_INTERVAL_MS\s*=\s*60_000/);
 
   const asFiniteNumber = javascript.match(
-    /function asFiniteNumber\(value, fallback = null\) \{[\s\S]*?^  \}/m,
+    /^([ \t]+)function asFiniteNumber\(value, fallback = null\) \{[\s\S]*?^\1\}/m,
   )?.[0];
   const asPercentage = javascript.match(
-    /function asPercentage\(value\) \{[\s\S]*?^  \}/m,
+    /^([ \t]+)function asPercentage\(value\) \{[\s\S]*?^\1\}/m,
   )?.[0];
   assert.ok(asFiniteNumber && asPercentage, "percentage normalization should be independently testable");
-  const context = {};
+  const context = {} as {
+    asPercentage(value: unknown): number | null;
+  };
   vm.runInNewContext(`${asFiniteNumber}\n${asPercentage}`, context);
   assert.equal(context.asPercentage(null), null);
   assert.equal(context.asPercentage("42"), null);
@@ -145,9 +162,10 @@ test("global Codex and Claude usage meters emphasize remaining capacity", () => 
 });
 
 test("usage normalization selects the limiting window and bounds last-known fallback", () => {
-  const javascript = read("ui/app.js");
+  const javascript = read("ui/generated/app.js");
   const functions = [
     "isObject",
+    "isUnknownArray",
     "asString",
     "asFiniteNumber",
     "asTimestamp",
@@ -158,7 +176,22 @@ test("usage normalization selects the limiting window and bounds last-known fall
     "normalizeUsageProvider",
     "usageProviderWithFallback",
   ].map((name) => appFunction(javascript, name)).join("\n");
-  const context = {};
+  interface UsageProvider {
+    detail: string;
+    remainingPercent: number | null;
+    resetsAtMs: number | null;
+    state: string;
+    windowLabel: string | null;
+    windows: unknown[];
+  }
+  const context = {} as {
+    normalizeUsageProvider(value: unknown, providerName: string): UsageProvider;
+    usageProviderWithFallback(
+      current: UsageProvider,
+      previous: UsageProvider,
+      nowMs: number,
+    ): UsageProvider;
+  };
   vm.runInNewContext(
     `const MAX_JAVASCRIPT_TIMESTAMP_MS = 8_640_000_000_000_000;
      const USAGE_LAST_KNOWN_MAX_AGE_MS = 15 * 60_000;
@@ -233,7 +266,7 @@ test("the primary palette is VS Code blue in dark and light themes", () => {
 });
 
 test("provider names stay complete and the status panel owns most row width", () => {
-  const javascript = read("ui/app.js");
+  const javascript = read("ui/generated/app.js");
   const css = read("ui/styles.css");
   assert.match(
     javascript,
@@ -411,7 +444,7 @@ test("setup and diagnostics uses the compact neutral visual language of the main
 });
 
 test("workspace rows use a transparent native full-card action without visible Open text", () => {
-  const javascript = read("ui/app.js");
+  const javascript = read("ui/generated/app.js");
   const css = read("ui/styles.css");
   const createRow = sliceBetween(
     javascript,
@@ -449,18 +482,20 @@ test("workspace rows use a transparent native full-card action without visible O
 
 test("appearance offers persisted System, Light, and Dark choices", () => {
   const html = read("ui/index.html");
-  const javascript = `${read("ui/theme-init.js")}\n${read("ui/app.js")}`;
+  const javascript = `${read("ui/generated/theme-init.js")}\n${read("ui/generated/app.js")}`;
   const css = read("ui/styles.css");
   const inputs = Array.from(html.matchAll(/<input\b[^>]*>/gi), (match) => match[0]);
   const radios = inputs.filter((input) => attribute(input, "type")?.toLowerCase() === "radio");
   const appearanceRadios = radios.filter((input) =>
-    ["system", "light", "dark"].includes(attribute(input, "value")?.toLowerCase()),
+    ["system", "light", "dark"].includes(attribute(input, "value")?.toLowerCase() ?? ""),
   );
 
-  assert.deepEqual(
-    new Set(appearanceRadios.map((input) => attribute(input, "value").toLowerCase())),
-    new Set(["system", "light", "dark"]),
-  );
+  const appearanceValues = appearanceRadios.map((input) => {
+    const value = attribute(input, "value");
+    assert.ok(value, "each appearance choice should have a value");
+    return value.toLowerCase();
+  });
+  assert.deepEqual(new Set(appearanceValues), new Set(["system", "light", "dark"]));
   assert.equal(
     new Set(appearanceRadios.map((input) => attribute(input, "name"))).size,
     1,
@@ -473,6 +508,7 @@ test("appearance offers persisted System, Light, and Dark choices", () => {
   const system = appearanceRadios.find(
     (input) => attribute(input, "value")?.toLowerCase() === "system",
   );
+  assert.ok(system, "the System appearance choice should exist");
   assert.match(system, /\schecked(?:\s|=|\/?>)/i);
 
   const themeScript = html.search(/<script\b[^>]*src=["']theme-init\.js["'][^>]*>/i);
@@ -491,7 +527,7 @@ test("appearance offers persisted System, Light, and Dark choices", () => {
 
 test("workspace launching exposes live glass feedback", () => {
   const html = read("ui/index.html");
-  const javascript = read("ui/app.js");
+  const javascript = read("ui/generated/app.js");
   const css = read("ui/styles.css");
   const tags = Array.from(html.matchAll(/<[^!/][^>]*>/g), (match) => match[0]);
   const launchTags = tags.filter((tag) =>

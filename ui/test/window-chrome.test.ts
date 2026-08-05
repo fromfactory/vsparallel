@@ -1,24 +1,81 @@
 "use strict";
 
-const assert = require("node:assert/strict");
-const fs = require("node:fs");
-const path = require("node:path");
-const test = require("node:test");
-const vm = require("node:vm");
+import assert = require("node:assert/strict");
+import fs = require("node:fs");
+import path = require("node:path");
+import test = require("node:test");
+import vm = require("node:vm");
 
-const repository = path.resolve(__dirname, "../..");
+interface WindowConfiguration {
+  decorations: boolean;
+  resizable: boolean;
+  transparent: boolean;
+  theme?: string;
+  titleBarStyle?: string;
+  hiddenTitle?: boolean;
+  width: number;
+  height: number;
+  minWidth: number;
+  minHeight: number;
+}
 
-function read(relativePath) {
+interface MainTauriConfiguration {
+  app: {
+    windows: WindowConfiguration[];
+    macOSPrivateApi: boolean;
+    security: {
+      csp: string;
+    };
+  };
+  build: {
+    beforeBuildCommand: string;
+    beforeDevCommand: {
+      script: string;
+      wait: boolean;
+    };
+    frontendDist: string[];
+    devUrl?: string;
+  };
+  bundle: {
+    resources: Record<string, string>;
+  };
+}
+
+interface MacOSTauriConfiguration {
+  app: {
+    windows: WindowConfiguration[];
+  };
+}
+
+interface CapabilityConfiguration {
+  permissions: string[];
+}
+
+interface WindowChromeVmContext {
+  state: {
+    windowChromeRequestId: number;
+  };
+  advanceWindowChromeRequestId?: () => number;
+  isCurrentWindowChromeRequest?: (requestId: number) => boolean;
+}
+
+const repository = path.resolve(process.cwd());
+
+function read(relativePath: string): string {
   return fs.readFileSync(path.join(repository, relativePath), "utf8");
 }
 
-function readJson(relativePath) {
-  return JSON.parse(read(relativePath));
+function readJson<T>(relativePath: string): T {
+  return JSON.parse(read(relativePath)) as T;
 }
 
 test("desktop platforms use custom chrome while macOS retains native chrome", () => {
-  const desktop = readJson("src-tauri/tauri.conf.json").app.windows[0];
-  const macos = readJson("src-tauri/tauri.macos.conf.json").app.windows[0];
+  const desktop = readJson<MainTauriConfiguration>("src-tauri/tauri.conf.json").app.windows[0];
+  const macos = readJson<MacOSTauriConfiguration>(
+    "src-tauri/tauri.macos.conf.json",
+  ).app.windows[0];
+  assert.ok(desktop, "the desktop window configuration should exist");
+  assert.ok(macos, "the macOS window configuration should exist");
 
   assert.equal(desktop.decorations, false);
   assert.equal(desktop.resizable, true);
@@ -33,7 +90,10 @@ test("desktop platforms use custom chrome while macOS retains native chrome", ()
     [macos.width, macos.height, macos.minWidth, macos.minHeight],
     [desktop.width, desktop.height, desktop.minWidth, desktop.minHeight],
   );
-  assert.equal(readJson("src-tauri/tauri.conf.json").app.macOSPrivateApi, true);
+  assert.equal(
+    readJson<MainTauriConfiguration>("src-tauri/tauri.conf.json").app.macOSPrivateApi,
+    true,
+  );
   const cargo = read("src-tauri/Cargo.toml");
   assert.match(cargo, /"macos-private-api"/);
   assert.match(cargo, /objc2-app-kit/);
@@ -42,19 +102,26 @@ test("desktop platforms use custom chrome while macOS retains native chrome", ()
 });
 
 test("the capability grants only the supported drag operation to the frontend", () => {
-  const capability = readJson("src-tauri/capabilities/default.json");
+  const capability = readJson<CapabilityConfiguration>(
+    "src-tauri/capabilities/default.json",
+  );
   assert.deepEqual(capability.permissions, ["core:window:allow-start-dragging"]);
 });
 
 test("the production frontend contains only explicit runtime assets", () => {
-  const config = readJson("src-tauri/tauri.conf.json");
+  const config = readJson<MainTauriConfiguration>("src-tauri/tauri.conf.json");
   assert.deepEqual(config.build.frontendDist, [
     "../ui/index.html",
     "../ui/styles.css",
-    "../ui/app.js",
-    "../ui/theme-init.js",
+    "../ui/generated/app.js",
+    "../ui/generated/theme-init.js",
     "../ui/vsparallel-icon.png",
   ]);
+  assert.equal(config.build.beforeBuildCommand, "npm run build:ui");
+  assert.deepEqual(config.build.beforeDevCommand, {
+    script: "npm run build:ui",
+    wait: true,
+  });
   assert.equal(config.build.devUrl, undefined);
   assert.match(config.app.security.csp, /base-uri 'none'/);
   assert.match(config.app.security.csp, /object-src 'none'/);
@@ -107,7 +174,7 @@ test("floating panel controls are universal, accessible, and initially hidden", 
 });
 
 test("window behavior updates maximize accessibility through the native bridge", () => {
-  const javascript = read("ui/app.js");
+  const javascript = read("ui/generated/app.js");
   assert.match(javascript, /invoke\("get_window_chrome_state"/);
   assert.match(javascript, /invoke\("toggle_window_maximize"/);
   assert.match(javascript, /invoke\("close_window"/);
@@ -118,7 +185,7 @@ test("window behavior updates maximize accessibility through the native bridge",
 });
 
 test("workspace launches enter a rendered, draggable floating mode that can be restored", () => {
-  const javascript = read("ui/app.js");
+  const javascript = read("ui/generated/app.js");
   assert.match(javascript, /floating:\s*raw\.floating === true/);
   assert.match(
     javascript,
@@ -144,27 +211,36 @@ test("workspace launches enter a rendered, draggable floating mode that can be r
 });
 
 test("chrome request ordering rejects responses superseded by a newer command", () => {
-  const javascript = read("ui/app.js");
+  const javascript = read("ui/generated/app.js");
   const advance = javascript.match(
-    /function advanceWindowChromeRequestId\(\) \{[\s\S]*?^  \}/m,
+    /^([ \t]+)function advanceWindowChromeRequestId\(\) \{[\s\S]*?^\1\}/m,
   )?.[0];
   const isCurrent = javascript.match(
-    /function isCurrentWindowChromeRequest\(requestId\) \{[\s\S]*?^  \}/m,
+    /^([ \t]+)function isCurrentWindowChromeRequest\(requestId\) \{[\s\S]*?^\1\}/m,
   )?.[0];
-  assert.ok(advance && isCurrent, "the latest-response gate should remain independently testable");
+  assert.ok(
+    advance !== undefined && isCurrent !== undefined,
+    "the latest-response gate should remain independently testable",
+  );
 
-  const context = { state: { windowChromeRequestId: 0 } };
+  const context: WindowChromeVmContext = { state: { windowChromeRequestId: 0 } };
   vm.runInNewContext(`${advance}\n${isCurrent}`, context);
-  const preLaunchRefresh = context.advanceWindowChromeRequestId();
-  assert.equal(context.isCurrentWindowChromeRequest(preLaunchRefresh), true);
+  const advanceWindowChromeRequestId = context.advanceWindowChromeRequestId;
+  const isCurrentWindowChromeRequest = context.isCurrentWindowChromeRequest;
+  assert.ok(
+    advanceWindowChromeRequestId !== undefined && isCurrentWindowChromeRequest !== undefined,
+    "the request-ordering helpers should be installed in the VM context",
+  );
+  const preLaunchRefresh = advanceWindowChromeRequestId();
+  assert.equal(isCurrentWindowChromeRequest(preLaunchRefresh), true);
 
-  const floatingCommit = context.advanceWindowChromeRequestId();
-  assert.equal(context.isCurrentWindowChromeRequest(preLaunchRefresh), false);
-  assert.equal(context.isCurrentWindowChromeRequest(floatingCommit), true);
+  const floatingCommit = advanceWindowChromeRequestId();
+  assert.equal(isCurrentWindowChromeRequest(preLaunchRefresh), false);
+  assert.equal(isCurrentWindowChromeRequest(floatingCommit), true);
 
-  const newerRefresh = context.advanceWindowChromeRequestId();
-  assert.equal(context.isCurrentWindowChromeRequest(floatingCommit), false);
-  assert.equal(context.isCurrentWindowChromeRequest(newerRefresh), true);
+  const newerRefresh = advanceWindowChromeRequestId();
+  assert.equal(isCurrentWindowChromeRequest(floatingCommit), false);
+  assert.equal(isCurrentWindowChromeRequest(newerRefresh), true);
 });
 
 test("native panel recovery follows delayed desktop activation without taking editor focus", () => {

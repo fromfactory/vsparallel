@@ -1,97 +1,279 @@
 (function () {
   "use strict";
 
+  type JsonObject = Record<string, unknown>;
+  type ThemePreference = "system" | "light" | "dark";
+  type ColorTheme = Exclude<ThemePreference, "system">;
+  type IntegrationKind = "companion" | "codex" | "claude";
+  type IntegrationActionKind = IntegrationKind | "all";
+  type IntegrationOperation = "install" | "uninstall";
+  type IntegrationVisualState = "missing" | "ready" | "warning" | "error";
+  type ActivityKind = "activity" | "finished" | "failure" | "unknown";
+  type UsageKind = "codex" | "claude";
+  type UsageState = "available" | "stale" | "unavailable";
+  type NoticeKind = "error" | "warning";
+  type IntegrationMessageKind = "neutral" | "error" | "success";
+  type TauriCommand =
+    | "close_window"
+    | "get_diagnostics"
+    | "get_integration_status"
+    | "get_snapshot"
+    | "get_usage"
+    | "get_window_chrome_state"
+    | "hide_window"
+    | "install_claude_hooks"
+    | "install_codex_hooks"
+    | "install_companion"
+    | "open_workspace"
+    | "restore_full_window"
+    | "set_window_chrome_theme"
+    | "toggle_window_maximize"
+    | "uninstall_claude_hooks"
+    | "uninstall_codex_hooks"
+    | "uninstall_companion";
+
+  interface ActivityView {
+    kind: ActivityKind;
+    mark: string;
+    label: string;
+    changedAtMs: number | null;
+    detail: string;
+    extensionDetectionAvailable: boolean | null;
+    extensionInstalled: boolean | null;
+    extensionActive: boolean | null;
+  }
+
+  interface Workspace {
+    instanceId: string;
+    name: string;
+    path: string;
+    openable: boolean;
+    active: boolean;
+    focused: boolean;
+    lastSeenAtMs: number | null;
+    codex: ActivityView;
+    claude: ActivityView;
+  }
+
+  interface Snapshot {
+    schemaVersion: number;
+    generatedAtMs: number;
+    malformedRecords: number;
+    workspaces: Workspace[];
+  }
+
+  interface UsageWindow {
+    label: string;
+    durationMinutes: number | null;
+    usedPercent: number;
+    remainingPercent: number;
+    resetsAtMs: number | null;
+  }
+
+  interface UsageProvider {
+    providerName: string;
+    state: UsageState;
+    remainingPercent: number | null;
+    windowLabel: string;
+    resetsAtMs: number | null;
+    updatedAtMs: number | null;
+    detail: string;
+    windows: UsageWindow[];
+  }
+
+  interface UsageSnapshot {
+    schemaVersion: number;
+    generatedAtMs: number;
+    codex: UsageProvider;
+    claude: UsageProvider;
+  }
+
+  interface IntegrationComponent {
+    kind: IntegrationKind;
+    optional: boolean;
+    token: string;
+    visualState: IntegrationVisualState;
+    installed: boolean;
+    actionLabel: string;
+    label: string;
+    detail: string;
+    installedVersion: string;
+    targetVersion: string;
+    configPath: string;
+  }
+
+  interface IntegrationStatus {
+    schemaVersion: number;
+    companion: IntegrationComponent;
+    codex: IntegrationComponent;
+    claude: IntegrationComponent;
+    requiresRestart: boolean;
+  }
+
+  interface IntegrationAction {
+    kind: IntegrationActionKind;
+    operation: IntegrationOperation;
+  }
+
+  interface IntegrationElements {
+    card: HTMLElement;
+    status: HTMLSpanElement;
+    detail: HTMLParagraphElement;
+    meta: HTMLParagraphElement;
+    installButton: HTMLButtonElement;
+    uninstallButton: HTMLButtonElement;
+  }
+
+  interface WindowChromeState {
+    schemaVersion: 1;
+    platform: string;
+    customControls: boolean;
+    maximized: boolean;
+    fullscreen: boolean;
+    focused: boolean;
+    floating: boolean;
+  }
+
+  interface AppState {
+    refreshPending: boolean;
+    usagePending: boolean;
+    diagnosticsPending: boolean;
+    diagnosticsLoaded: boolean;
+    diagnosticsUnavailable: boolean;
+    diagnosticWarningCount: number;
+    setupRefreshPending: boolean;
+    setupRefreshPromise: Promise<[void, void]> | null;
+    integrationPending: boolean;
+    integrationLoaded: boolean;
+    integrationStatus: IntegrationStatus | null;
+    integrationAction: IntegrationAction | null;
+    pendingUninstall: IntegrationKind | null;
+    openingInstanceId: string | null;
+    lastGoodSnapshot: Snapshot | null;
+    lastUsage: UsageSnapshot | null;
+    lastUsageAttemptAtMs: number | null;
+    windowChrome: WindowChromeState | null;
+    windowChromeRequestId: number;
+    windowChromeRefreshTimer: number | null;
+    themePreference: ThemePreference;
+  }
+
+  interface TauriWindow extends Window {
+    __TAURI__?: {
+      core?: {
+        invoke?: (command: string, args?: JsonObject) => Promise<unknown>;
+      };
+    };
+  }
+
+  function requiredElement<T extends Element>(selector: string): T {
+    const element = document.querySelector<T>(selector);
+    if (!element) {
+      throw new Error(`The UI is missing its required ${selector} element.`);
+    }
+    return element;
+  }
+
+  function requiredDescendant<T extends Element>(parent: ParentNode, selector: string): T {
+    const element = parent.querySelector<T>(selector);
+    if (!element) {
+      throw new Error(`The UI is missing its required ${selector} descendant.`);
+    }
+    return element;
+  }
+
   const SCHEMA_VERSION = 1;
   const REFRESH_INTERVAL_MS = 3_000;
   const USAGE_REFRESH_INTERVAL_MS = 60_000;
   const USAGE_LAST_KNOWN_MAX_AGE_MS = 15 * 60_000;
   const LAUNCH_TRANSITION_MIN_MS = 750;
   const THEME_STORAGE_KEY = "vsparallel.appearance";
-  const THEME_PREFERENCES = new Set(["system", "light", "dark"]);
+  const THEME_PREFERENCES: ReadonlySet<string> = new Set(["system", "light", "dark"]);
+  const INTEGRATION_KINDS = ["companion", "codex", "claude"] as const;
   const MAX_JAVASCRIPT_TIMESTAMP_MS = 8_640_000_000_000_000;
-  const tauriInvoke = window.__TAURI__?.core?.invoke;
+  const tauriInvoke = (window as TauriWindow).__TAURI__?.core?.invoke;
   const lightThemeQuery = window.matchMedia("(prefers-color-scheme: light)");
 
   const elements = {
-    connectionBar: document.querySelector("#connectionBar"),
-    connectionText: document.querySelector("#connectionText"),
-    updatedAt: document.querySelector("#updatedAt"),
-    refreshButton: document.querySelector("#refreshButton"),
-    restoreFullButton: document.querySelector("#restoreFullButton"),
-    hidePanelButton: document.querySelector("#hidePanelButton"),
-    hideButton: document.querySelector("#hideButton"),
-    appTitlebar: document.querySelector("#appTitlebar"),
-    titlebarDragRegion: document.querySelector("#titlebarDragRegion"),
-    windowControls: document.querySelector("#windowControls"),
-    maximizeButton: document.querySelector("#maximizeButton"),
-    closeButton: document.querySelector("#closeButton"),
-    workspaceCount: document.querySelector("#workspaceCount"),
-    usageOverview: document.querySelector("#usageOverview"),
-    usageStatus: document.querySelector("#usageStatus"),
-    codexUsage: document.querySelector("#codexUsage"),
-    codexUsageValue: document.querySelector("#codexUsageValue"),
-    codexUsageState: document.querySelector("#codexUsageState"),
-    codexUsageMeter: document.querySelector("#codexUsageMeter"),
-    codexUsageDetail: document.querySelector("#codexUsageDetail"),
-    claudeUsage: document.querySelector("#claudeUsage"),
-    claudeUsageValue: document.querySelector("#claudeUsageValue"),
-    claudeUsageState: document.querySelector("#claudeUsageState"),
-    claudeUsageMeter: document.querySelector("#claudeUsageMeter"),
-    claudeUsageDetail: document.querySelector("#claudeUsageDetail"),
-    workspaceList: document.querySelector("#workspaceList"),
-    errorBanner: document.querySelector("#errorBanner"),
-    errorText: document.querySelector("#errorText"),
-    emptyState: document.querySelector("#emptyState"),
-    emptyRefreshButton: document.querySelector("#emptyRefreshButton"),
-    launchOverlay: document.querySelector("#launchOverlay"),
-    launchStatus: document.querySelector("#launchStatus"),
-    settingsButton: document.querySelector("#settingsButton"),
-    settingsDialog: document.querySelector("#settingsDialog"),
-    settingsCloseButton: document.querySelector("#settingsCloseButton"),
-    diagnosticsSummary: document.querySelector("#diagnosticsSummary"),
-    diagnosticsList: document.querySelector("#diagnosticsList"),
-    diagnosticsStatus: document.querySelector("#diagnosticsStatus"),
-    diagnosticsRefreshButton: document.querySelector("#diagnosticsRefreshButton"),
-    setupAllButton: document.querySelector("#setupAllButton"),
-    integrationList: document.querySelector("#integrationList"),
-    integrationMessage: document.querySelector("#integrationMessage"),
-    companionCard: document.querySelector("#companionCard"),
-    companionStatus: document.querySelector("#companionStatus"),
-    companionDetail: document.querySelector("#companionDetail"),
-    companionMeta: document.querySelector("#companionMeta"),
-    companionInstallButton: document.querySelector("#companionInstallButton"),
-    companionUninstallButton: document.querySelector("#companionUninstallButton"),
-    codexCard: document.querySelector("#codexCard"),
-    codexStatus: document.querySelector("#codexStatus"),
-    codexDetail: document.querySelector("#codexDetail"),
-    codexMeta: document.querySelector("#codexMeta"),
-    codexInstallButton: document.querySelector("#codexInstallButton"),
-    codexUninstallButton: document.querySelector("#codexUninstallButton"),
-    codexTrustGuidance: document.querySelector("#codexTrustGuidance"),
-    claudeCard: document.querySelector("#claudeCard"),
-    claudeStatus: document.querySelector("#claudeStatus"),
-    claudeDetail: document.querySelector("#claudeDetail"),
-    claudeMeta: document.querySelector("#claudeMeta"),
-    claudeInstallButton: document.querySelector("#claudeInstallButton"),
-    claudeUninstallButton: document.querySelector("#claudeUninstallButton"),
-    restartNotice: document.querySelector("#restartNotice"),
-    uninstallDialog: document.querySelector("#uninstallDialog"),
-    uninstallTitle: document.querySelector("#uninstallTitle"),
-    uninstallDescription: document.querySelector("#uninstallDescription"),
-    uninstallCancelButton: document.querySelector("#uninstallCancelButton"),
-    uninstallConfirmButton: document.querySelector("#uninstallConfirmButton"),
+    connectionBar: requiredElement<HTMLDivElement>("#connectionBar"),
+    connectionText: requiredElement<HTMLSpanElement>("#connectionText"),
+    updatedAt: requiredElement<HTMLTimeElement>("#updatedAt"),
+    refreshButton: requiredElement<HTMLButtonElement>("#refreshButton"),
+    restoreFullButton: requiredElement<HTMLButtonElement>("#restoreFullButton"),
+    hidePanelButton: requiredElement<HTMLButtonElement>("#hidePanelButton"),
+    hideButton: requiredElement<HTMLButtonElement>("#hideButton"),
+    appTitlebar: requiredElement<HTMLElement>("#appTitlebar"),
+    titlebarDragRegion: requiredElement<HTMLDivElement>("#titlebarDragRegion"),
+    windowControls: requiredElement<HTMLDivElement>("#windowControls"),
+    maximizeButton: requiredElement<HTMLButtonElement>("#maximizeButton"),
+    closeButton: requiredElement<HTMLButtonElement>("#closeButton"),
+    workspaceCount: requiredElement<HTMLSpanElement>("#workspaceCount"),
+    usageOverview: requiredElement<HTMLElement>("#usageOverview"),
+    usageStatus: requiredElement<HTMLParagraphElement>("#usageStatus"),
+    codexUsage: requiredElement<HTMLElement>("#codexUsage"),
+    codexUsageValue: requiredElement<HTMLElement>("#codexUsageValue"),
+    codexUsageState: requiredElement<HTMLSpanElement>("#codexUsageState"),
+    codexUsageMeter: requiredElement<HTMLDivElement>("#codexUsageMeter"),
+    codexUsageDetail: requiredElement<HTMLSpanElement>("#codexUsageDetail"),
+    claudeUsage: requiredElement<HTMLElement>("#claudeUsage"),
+    claudeUsageValue: requiredElement<HTMLElement>("#claudeUsageValue"),
+    claudeUsageState: requiredElement<HTMLSpanElement>("#claudeUsageState"),
+    claudeUsageMeter: requiredElement<HTMLDivElement>("#claudeUsageMeter"),
+    claudeUsageDetail: requiredElement<HTMLSpanElement>("#claudeUsageDetail"),
+    workspaceList: requiredElement<HTMLUListElement>("#workspaceList"),
+    errorBanner: requiredElement<HTMLDivElement>("#errorBanner"),
+    errorText: requiredElement<HTMLSpanElement>("#errorText"),
+    emptyState: requiredElement<HTMLDivElement>("#emptyState"),
+    emptyRefreshButton: requiredElement<HTMLButtonElement>("#emptyRefreshButton"),
+    launchOverlay: requiredElement<HTMLDivElement>("#launchOverlay"),
+    launchStatus: requiredElement<HTMLSpanElement>("#launchStatus"),
+    settingsButton: requiredElement<HTMLButtonElement>("#settingsButton"),
+    settingsDialog: requiredElement<HTMLDialogElement>("#settingsDialog"),
+    settingsCloseButton: requiredElement<HTMLButtonElement>("#settingsCloseButton"),
+    diagnosticsSummary: requiredElement<HTMLSpanElement>("#diagnosticsSummary"),
+    diagnosticsList: requiredElement<HTMLDListElement>("#diagnosticsList"),
+    diagnosticsStatus: requiredElement<HTMLParagraphElement>("#diagnosticsStatus"),
+    diagnosticsRefreshButton: requiredElement<HTMLButtonElement>("#diagnosticsRefreshButton"),
+    setupAllButton: requiredElement<HTMLButtonElement>("#setupAllButton"),
+    integrationList: requiredElement<HTMLDivElement>("#integrationList"),
+    integrationMessage: requiredElement<HTMLParagraphElement>("#integrationMessage"),
+    companionCard: requiredElement<HTMLElement>("#companionCard"),
+    companionStatus: requiredElement<HTMLSpanElement>("#companionStatus"),
+    companionDetail: requiredElement<HTMLParagraphElement>("#companionDetail"),
+    companionMeta: requiredElement<HTMLParagraphElement>("#companionMeta"),
+    companionInstallButton: requiredElement<HTMLButtonElement>("#companionInstallButton"),
+    companionUninstallButton: requiredElement<HTMLButtonElement>("#companionUninstallButton"),
+    codexCard: requiredElement<HTMLElement>("#codexCard"),
+    codexStatus: requiredElement<HTMLSpanElement>("#codexStatus"),
+    codexDetail: requiredElement<HTMLParagraphElement>("#codexDetail"),
+    codexMeta: requiredElement<HTMLParagraphElement>("#codexMeta"),
+    codexInstallButton: requiredElement<HTMLButtonElement>("#codexInstallButton"),
+    codexUninstallButton: requiredElement<HTMLButtonElement>("#codexUninstallButton"),
+    codexTrustGuidance: requiredElement<HTMLDivElement>("#codexTrustGuidance"),
+    claudeCard: requiredElement<HTMLElement>("#claudeCard"),
+    claudeStatus: requiredElement<HTMLSpanElement>("#claudeStatus"),
+    claudeDetail: requiredElement<HTMLParagraphElement>("#claudeDetail"),
+    claudeMeta: requiredElement<HTMLParagraphElement>("#claudeMeta"),
+    claudeInstallButton: requiredElement<HTMLButtonElement>("#claudeInstallButton"),
+    claudeUninstallButton: requiredElement<HTMLButtonElement>("#claudeUninstallButton"),
+    restartNotice: requiredElement<HTMLDivElement>("#restartNotice"),
+    uninstallDialog: requiredElement<HTMLDialogElement>("#uninstallDialog"),
+    uninstallTitle: requiredElement<HTMLHeadingElement>("#uninstallTitle"),
+    uninstallDescription: requiredElement<HTMLParagraphElement>("#uninstallDescription"),
+    uninstallCancelButton: requiredElement<HTMLButtonElement>("#uninstallCancelButton"),
+    uninstallConfirmButton: requiredElement<HTMLButtonElement>("#uninstallConfirmButton"),
     appearanceInputs: Array.from(
-      document.querySelectorAll('input[name="appearance"]'),
+      document.querySelectorAll<HTMLInputElement>('input[name="appearance"]'),
     ),
   };
 
-  const initialThemePreference = THEME_PREFERENCES.has(
+  const initialThemePreference: ThemePreference = isThemePreference(
     document.documentElement.dataset.themePreference,
   )
     ? document.documentElement.dataset.themePreference
     : "system";
 
-  const state = {
+  const state: AppState = {
     refreshPending: false,
     usagePending: false,
     diagnosticsPending: false,
@@ -115,54 +297,62 @@
     themePreference: initialThemePreference,
   };
 
-  const dialogReturnFocus = new WeakMap();
+  const dialogReturnFocus = new WeakMap<HTMLDialogElement, HTMLElement>();
 
-  function isObject(value) {
+  function isObject(value: unknown): value is JsonObject {
     return value !== null && typeof value === "object" && !Array.isArray(value);
   }
 
-  function asString(value, fallback = "") {
+  function isUnknownArray(value: unknown): value is unknown[] {
+    return Array.isArray(value);
+  }
+
+  function isThemePreference(value: unknown): value is ThemePreference {
+    return typeof value === "string" && THEME_PREFERENCES.has(value);
+  }
+
+  function asString(value: unknown, fallback = ""): string {
     return typeof value === "string" && value.trim() ? value.trim() : fallback;
   }
 
-  function asFiniteNumber(value, fallback = null) {
+  function asFiniteNumber(value: unknown, fallback: number | null = null): number | null {
     return typeof value === "number" && Number.isFinite(value) ? value : fallback;
   }
 
-  function asNonNegativeInteger(value) {
-    const number = asFiniteNumber(value, 0);
+  function asNonNegativeInteger(value: unknown): number {
+    const number = asFiniteNumber(value) ?? 0;
     return Math.max(0, Math.trunc(number));
   }
 
-  function asTimestamp(value, fallback = null) {
+  function asTimestamp(value: unknown, fallback: number | null = null): number | null {
     const number = asFiniteNumber(value);
     return number !== null && number >= 0 && number <= MAX_JAVASCRIPT_TIMESTAMP_MS
       ? number
       : fallback;
   }
 
-  function asPercentage(value) {
+  function asPercentage(value: unknown): number | null {
     const number = asFiniteNumber(value);
     return number === null ? null : Math.min(100, Math.max(0, number));
   }
 
-  function asNullableBoolean(value) {
+  function asNullableBoolean(value: unknown): boolean | null {
     return typeof value === "boolean" ? value : null;
   }
 
-  function parseBridgeValue(value) {
+  function parseBridgeValue(value: unknown): unknown {
     if (typeof value !== "string") {
       return value;
     }
 
     try {
-      return JSON.parse(value);
+      return JSON.parse(value) as unknown;
     } catch (_error) {
       return value;
     }
   }
 
-  async function invoke(command, args) {
+  async function invoke(command: TauriCommand, args: JsonObject): Promise<unknown> {
     if (typeof tauriInvoke === "function") {
       return parseBridgeValue(await tauriInvoke(command, args));
     }
@@ -170,13 +360,16 @@
     throw new Error("The Tauri bridge is unavailable. Run VSParallel as a desktop app.");
   }
 
-  function normalizeStateToken(value) {
+  function normalizeStateToken(value: unknown): string {
     return asString(value, "unknown")
       .toLowerCase()
       .replace(/[\s-]+/g, "_");
   }
 
-  function normalizeIntegrationComponent(rawValue, kind) {
+  function normalizeIntegrationComponent(
+    rawValue: unknown,
+    kind: IntegrationKind,
+  ): IntegrationComponent {
     const raw = isObject(rawValue) ? rawValue : {};
     const token = normalizeStateToken(raw.state);
     const missingStates = new Set(["missing", "not_installed", "absent", "unconfigured"]);
@@ -198,7 +391,7 @@
     ]);
     const errorStates = new Set(["error", "failed", "unavailable", "unsupported"]);
     const installedVersion = asString(raw.installedVersion);
-    let visualState = "warning";
+    let visualState: IntegrationVisualState = "warning";
 
     if (missingStates.has(token)) {
       visualState = "missing";
@@ -253,7 +446,7 @@
     };
   }
 
-  function normalizeIntegrationStatus(rawValue) {
+  function normalizeIntegrationStatus(rawValue: unknown): IntegrationStatus {
     const raw = parseBridgeValue(rawValue);
     if (!isObject(raw)) {
       throw new Error("VSParallel returned invalid integration status.");
@@ -271,7 +464,7 @@
     };
   }
 
-  function describeActivityState(token) {
+  function describeActivityState(token: string): Pick<ActivityView, "kind" | "mark" | "label"> {
     if (token === "activity_detected") {
       return {
         kind: "activity",
@@ -303,7 +496,7 @@
     };
   }
 
-  function normalizeActivityView(rawValue) {
+  function normalizeActivityView(rawValue: unknown): ActivityView {
     const raw = isObject(rawValue) ? rawValue : {};
     return {
       ...describeActivityState(normalizeStateToken(raw.state)),
@@ -315,7 +508,7 @@
     };
   }
 
-  function normalizeWorkspace(raw, index) {
+  function normalizeWorkspace(raw: unknown, index: number): Workspace {
     if (!isObject(raw)) {
       throw new Error(`Workspace record ${index + 1} is not an object.`);
     }
@@ -337,20 +530,20 @@
     };
   }
 
-  function normalizeSnapshot(rawValue) {
+  function normalizeSnapshot(rawValue: unknown): Snapshot {
     const raw = parseBridgeValue(rawValue);
     if (!isObject(raw)) {
       throw new Error("The local monitor returned an invalid snapshot.");
     }
 
-    if (!Array.isArray(raw.workspaces)) {
+    if (!isUnknownArray(raw.workspaces)) {
       throw new Error("The local monitor snapshot is missing its workspace list.");
     }
     if (raw.schemaVersion !== SCHEMA_VERSION) {
       throw new Error("The local monitor returned an unsupported snapshot version.");
     }
 
-    const workspaces = [];
+    const workspaces: Workspace[] = [];
     let malformedRecords = 0;
 
     raw.workspaces.forEach((record, index) => {
@@ -369,20 +562,23 @@
 
     return {
       schemaVersion: raw.schemaVersion,
-      generatedAtMs: asTimestamp(raw.generatedAtMs, Date.now()),
+      generatedAtMs: asTimestamp(raw.generatedAtMs) ?? Date.now(),
       malformedRecords,
       workspaces,
     };
   }
 
-  function usageWindowLabel(durationMinutes, fallback = "Usage limit") {
+  function usageWindowLabel(
+    durationMinutes: number | null,
+    fallback = "Usage limit",
+  ): string {
     if (durationMinutes === 300) {
       return "5-hour limit";
     }
     if (durationMinutes === 10_080) {
       return "7-day limit";
     }
-    if (Number.isFinite(durationMinutes) && durationMinutes > 0) {
+    if (durationMinutes !== null && Number.isFinite(durationMinutes) && durationMinutes > 0) {
       if (durationMinutes % 1_440 === 0) {
         const days = durationMinutes / 1_440;
         return `${days}-day limit`;
@@ -396,7 +592,7 @@
     return fallback;
   }
 
-  function normalizeUsageWindow(rawValue) {
+  function normalizeUsageWindow(rawValue: unknown): UsageWindow | null {
     const raw = isObject(rawValue) ? rawValue : {};
     const usedPercent = asPercentage(raw.usedPercent);
     const suppliedRemaining = asPercentage(raw.remainingPercent);
@@ -421,12 +617,14 @@
     };
   }
 
-  function normalizeUsageProvider(rawValue, providerName) {
+  function normalizeUsageProvider(rawValue: unknown, providerName: string): UsageProvider {
     const raw = isObject(rawValue) ? rawValue : {};
-    const windows = Array.isArray(raw.windows)
-      ? raw.windows.map(normalizeUsageWindow).filter(Boolean)
+    const windows = isUnknownArray(raw.windows)
+      ? raw.windows
+          .map(normalizeUsageWindow)
+          .filter((window): window is UsageWindow => window !== null)
       : [];
-    const limitingWindow = windows.reduce(
+    const limitingWindow = windows.reduce<UsageWindow | null>(
       (current, candidate) => !current || candidate.remainingPercent < current.remainingPercent
         ? candidate
         : current,
@@ -448,14 +646,17 @@
         raw.summaryWindowLabel ?? raw.windowLabel,
         limitingWindow?.label || "Usage limit",
       ),
-      resetsAtMs: asTimestamp(raw.summaryResetsAtMs ?? raw.resetsAtMs, limitingWindow?.resetsAtMs),
+      resetsAtMs: asTimestamp(
+        raw.summaryResetsAtMs ?? raw.resetsAtMs,
+        limitingWindow?.resetsAtMs ?? null,
+      ),
       updatedAtMs: asTimestamp(raw.updatedAtMs ?? raw.capturedAtMs),
       detail: asString(raw.detail),
       windows,
     };
   }
 
-  function normalizeUsageSnapshot(rawValue) {
+  function normalizeUsageSnapshot(rawValue: unknown): UsageSnapshot {
     const raw = parseBridgeValue(rawValue);
     if (!isObject(raw) || raw.schemaVersion !== SCHEMA_VERSION) {
       throw new Error("The local monitor returned unsupported usage data.");
@@ -463,18 +664,22 @@
 
     return {
       schemaVersion: raw.schemaVersion,
-      generatedAtMs: asTimestamp(raw.generatedAtMs, Date.now()),
+      generatedAtMs: asTimestamp(raw.generatedAtMs) ?? Date.now(),
       codex: normalizeUsageProvider(raw.codex, "Codex"),
       claude: normalizeUsageProvider(raw.claude, "Claude"),
     };
   }
 
-  function usageProviderWithFallback(current, previous, nowMs) {
+  function usageProviderWithFallback(
+    current: UsageProvider,
+    previous: UsageProvider | null,
+    nowMs: number,
+  ): UsageProvider {
     if (!previous || current.remainingPercent !== null || previous.remainingPercent === null) {
       return current;
     }
 
-    if (!Number.isFinite(previous.updatedAtMs)) {
+    if (previous.updatedAtMs === null || !Number.isFinite(previous.updatedAtMs)) {
       return current;
     }
     const ageMs = nowMs - previous.updatedAtMs;
@@ -483,13 +688,13 @@
     }
 
     const windows = previous.windows.filter(
-      (window) => !Number.isFinite(window.resetsAtMs) || window.resetsAtMs > nowMs,
+      (window) => window.resetsAtMs === null || window.resetsAtMs > nowMs,
     );
     if (previous.windows.length && !windows.length) {
       return current;
     }
 
-    const limitingWindow = windows.reduce(
+    const limitingWindow = windows.reduce<UsageWindow | null>(
       (selected, candidate) => !selected
           || candidate.remainingPercent < selected.remainingPercent
         ? candidate
@@ -507,7 +712,11 @@
     };
   }
 
-  function resolveUsageSnapshot(current, previous, nowMs = Date.now()) {
+  function resolveUsageSnapshot(
+    current: UsageSnapshot,
+    previous: UsageSnapshot | null,
+    nowMs = Date.now(),
+  ): UsageSnapshot {
     if (!previous) {
       return current;
     }
@@ -518,7 +727,7 @@
     };
   }
 
-  function unavailableUsageSnapshot(detail) {
+  function unavailableUsageSnapshot(detail: string): UsageSnapshot {
     const unavailable = normalizeUsageProvider({ detail }, "Provider");
     return {
       schemaVersion: SCHEMA_VERSION,
@@ -528,7 +737,7 @@
     };
   }
 
-  function deriveName(path) {
+  function deriveName(path: string): string {
     if (!path) {
       return "";
     }
@@ -536,7 +745,7 @@
     return segments.at(-1) || "";
   }
 
-  function formatShortPath(path) {
+  function formatShortPath(path: string): string {
     if (!path || path.length <= 54) {
       return path || "Path unavailable";
     }
@@ -548,15 +757,15 @@
     return drive ? `${drive}${separator}…${separator}${tail}` : `…${separator}${tail}`;
   }
 
-  function formatRelativeTime(timestamp) {
-    if (!Number.isFinite(timestamp)) {
+  function formatRelativeTime(timestamp: number | null): string {
+    if (timestamp === null || !Number.isFinite(timestamp)) {
       return "Update time unknown";
     }
 
     const deltaSeconds = Math.round((timestamp - Date.now()) / 1_000);
     const absoluteSeconds = Math.abs(deltaSeconds);
-    let value;
-    let unit;
+    let value: number;
+    let unit: Intl.RelativeTimeFormatUnit;
 
     if (absoluteSeconds < 10) {
       return "Updated just now";
@@ -579,8 +788,8 @@
     return `Updated ${relative}`;
   }
 
-  function formatAbsoluteTime(timestamp) {
-    if (!Number.isFinite(timestamp)) {
+  function formatAbsoluteTime(timestamp: number | null): string {
+    if (timestamp === null || !Number.isFinite(timestamp)) {
       return "";
     }
     return new Intl.DateTimeFormat(undefined, {
@@ -592,8 +801,8 @@
     }).format(new Date(timestamp));
   }
 
-  function formatResetTime(timestamp) {
-    if (!Number.isFinite(timestamp)) {
+  function formatResetTime(timestamp: number | null): string {
+    if (timestamp === null || !Number.isFinite(timestamp)) {
       return "reset time unavailable";
     }
     const includeWeekday = timestamp - Date.now() > 24 * 60 * 60 * 1_000;
@@ -604,7 +813,11 @@
     }).format(new Date(timestamp))}`;
   }
 
-  function createElement(tag, className, text) {
+  function createElement<K extends keyof HTMLElementTagNameMap>(
+    tag: K,
+    className: string,
+    text?: string,
+  ): HTMLElementTagNameMap[K] {
     const element = document.createElement(tag);
     if (className) {
       element.className = className;
@@ -615,14 +828,23 @@
     return element;
   }
 
-  function aggregateActivity(workspace) {
-    const priority = { activity: 4, failure: 3, finished: 2, unknown: 1 };
+  function aggregateActivity(workspace: Workspace): ActivityView {
+    const priority: Record<ActivityKind, number> = {
+      activity: 4,
+      failure: 3,
+      finished: 2,
+      unknown: 1,
+    };
     return [workspace.codex, workspace.claude].reduce((current, candidate) =>
       priority[candidate.kind] > priority[current.kind] ? candidate : current,
     );
   }
 
-  function describeExtensionPresence(activity) {
+  function describeExtensionPresence(activity: ActivityView): {
+    state: string;
+    label: string;
+    title: string;
+  } {
     if (activity.extensionDetectionAvailable === false) {
       return {
         state: "unknown",
@@ -674,7 +896,11 @@
     };
   }
 
-  function createProviderState(providerName, activity, accessibleProviderName = providerName) {
+  function createProviderState(
+    providerName: string,
+    activity: ActivityView,
+    accessibleProviderName = providerName,
+  ): HTMLDivElement {
     const provider = createElement("div", "provider-state");
     provider.dataset.state = activity.kind;
 
@@ -690,11 +916,11 @@
       label.title = activity.detail;
     }
 
-    const relativeTime = Number.isFinite(activity.changedAtMs)
+    const relativeTime = activity.changedAtMs !== null && Number.isFinite(activity.changedAtMs)
       ? formatRelativeTime(activity.changedAtMs).replace("Updated ", "")
       : "Time unknown";
     const changedAt = createElement("time", "provider-time", relativeTime);
-    if (Number.isFinite(activity.changedAtMs)) {
+    if (activity.changedAtMs !== null && Number.isFinite(activity.changedAtMs)) {
       changedAt.dateTime = new Date(activity.changedAtMs).toISOString();
       changedAt.title = `Lifecycle marker: ${formatAbsoluteTime(activity.changedAtMs)}`;
     }
@@ -713,7 +939,7 @@
     return provider;
   }
 
-  function createWorkspaceRow(workspace) {
+  function createWorkspaceRow(workspace: Workspace): HTMLLIElement {
     const row = createElement("li", "workspace-row");
     const opening = state.openingInstanceId === workspace.instanceId;
     const openable = workspace.openable;
@@ -780,9 +1006,11 @@
     return row;
   }
 
-  function renderSnapshot(snapshot) {
-    const focusedOpenButton = document.activeElement?.closest?.(".open-button");
-    const focusedInstanceId = elements.workspaceList.contains(focusedOpenButton)
+  function renderSnapshot(snapshot: Snapshot): void {
+    const focusedOpenButton = document.activeElement
+      ?.closest<HTMLButtonElement>(".open-button") ?? null;
+    const focusedInstanceId = focusedOpenButton
+      && elements.workspaceList.contains(focusedOpenButton)
       ? focusedOpenButton.dataset.instanceId
       : "";
     const fragment = document.createDocumentFragment();
@@ -793,7 +1021,9 @@
     elements.workspaceList.replaceChildren(fragment);
     if (focusedInstanceId) {
       const replacement = Array.from(
-        elements.workspaceList.querySelectorAll(".open-button:not(:disabled)"),
+        elements.workspaceList.querySelectorAll<HTMLButtonElement>(
+          ".open-button:not(:disabled)",
+        ),
       ).find((button) => button.dataset.instanceId === focusedInstanceId);
       replacement?.focus({ preventScroll: true });
     }
@@ -823,7 +1053,7 @@
     }
   }
 
-  function usageElements(kind) {
+  function usageElements(kind: UsageKind) {
     return kind === "codex"
       ? {
           card: elements.codexUsage,
@@ -841,7 +1071,7 @@
         };
   }
 
-  function usageLevel(remainingPercent) {
+  function usageLevel(remainingPercent: number): "critical" | "warning" | "normal" {
     if (remainingPercent <= 10) {
       return "critical";
     }
@@ -851,9 +1081,10 @@
     return "normal";
   }
 
-  function renderUsageProvider(kind, provider) {
+  function renderUsageProvider(kind: UsageKind, provider: UsageProvider): string {
     const target = usageElements(kind);
-    const available = provider.remainingPercent !== null;
+    const remainingPercent = provider.remainingPercent;
+    const available = remainingPercent !== null;
     const stale = available && provider.state === "stale";
     target.card.dataset.state = available ? (stale ? "stale" : "available") : "unavailable";
     target.stateLabel.hidden = !stale;
@@ -876,17 +1107,17 @@
         : `${provider.providerName} usage unavailable`;
     }
 
-    const roundedRemaining = Math.round(provider.remainingPercent);
+    const roundedRemaining = Math.round(remainingPercent);
     const resetLabel = formatResetTime(provider.resetsAtMs);
-    const updateLabel = Number.isFinite(provider.updatedAtMs)
+    const updateLabel = provider.updatedAtMs !== null && Number.isFinite(provider.updatedAtMs)
       ? formatRelativeTime(provider.updatedAtMs).toLowerCase()
       : "";
     const detailParts = [provider.windowLabel, resetLabel];
     if (stale) {
       detailParts.push("last known value");
     }
-    target.card.dataset.level = usageLevel(provider.remainingPercent);
-    target.card.style.setProperty("--usage-remaining", provider.remainingPercent.toFixed(2));
+    target.card.dataset.level = usageLevel(remainingPercent);
+    target.card.style.setProperty("--usage-remaining", remainingPercent.toFixed(2));
     target.value.textContent = `${roundedRemaining}% left`;
     target.detail.textContent = detailParts.join(" · ");
     target.meter.removeAttribute("aria-hidden");
@@ -894,7 +1125,7 @@
     target.meter.setAttribute("aria-label", `${provider.providerName} usage remaining`);
     target.meter.setAttribute("aria-valuemin", "0");
     target.meter.setAttribute("aria-valuemax", "100");
-    target.meter.setAttribute("aria-valuenow", provider.remainingPercent.toFixed(1));
+    target.meter.setAttribute("aria-valuenow", remainingPercent.toFixed(1));
     target.meter.setAttribute(
       "aria-valuetext",
       [
@@ -918,7 +1149,7 @@
     return `${provider.providerName} ${roundedRemaining}% remaining${stale ? " (last known)" : ""}`;
   }
 
-  function renderUsageSnapshot(snapshot) {
+  function renderUsageSnapshot(snapshot: UsageSnapshot): void {
     const summaries = [
       renderUsageProvider("codex", snapshot.codex),
       renderUsageProvider("claude", snapshot.claude),
@@ -929,21 +1160,21 @@
     }
   }
 
-  function showNotice(message, kind = "error") {
+  function showNotice(message: string, kind: NoticeKind = "error"): void {
     elements.errorText.textContent = message;
     elements.errorBanner.hidden = false;
     elements.errorBanner.classList.toggle("notice--error", kind === "error");
     elements.errorBanner.classList.toggle("notice--warning", kind === "warning");
   }
 
-  function clearNotice() {
+  function clearNotice(): void {
     elements.errorBanner.hidden = true;
     elements.errorText.textContent = "";
     elements.errorBanner.classList.add("notice--error");
     elements.errorBanner.classList.remove("notice--warning");
   }
 
-  function updateRefreshControl() {
+  function updateRefreshControl(): void {
     const pending = state.refreshPending || state.usagePending;
     elements.refreshButton.disabled = pending;
     elements.refreshButton.setAttribute("aria-busy", String(pending));
@@ -954,7 +1185,7 @@
     );
   }
 
-  function readableError(error, fallback) {
+  function readableError(error: unknown, fallback: string): string {
     if (error instanceof Error && error.message) {
       return error.message;
     }
@@ -964,11 +1195,11 @@
     return fallback;
   }
 
-  function isDialogOpen(dialog) {
+  function isDialogOpen(dialog: HTMLDialogElement): boolean {
     return Boolean(dialog?.open || dialog?.hasAttribute("open"));
   }
 
-  function restoreDialogFocus(dialog) {
+  function restoreDialogFocus(dialog: HTMLDialogElement): void {
     const returnTarget = dialogReturnFocus.get(dialog);
     dialogReturnFocus.delete(dialog);
     if (returnTarget?.isConnected && typeof returnTarget.focus === "function") {
@@ -976,7 +1207,10 @@
     }
   }
 
-  function showAccessibleDialog(dialog, initialFocus) {
+  function showAccessibleDialog(
+    dialog: HTMLDialogElement,
+    initialFocus: HTMLElement,
+  ): boolean {
     if (!dialog || isDialogOpen(dialog)) {
       return false;
     }
@@ -1007,7 +1241,7 @@
     return true;
   }
 
-  function closeAccessibleDialog(dialog) {
+  function closeAccessibleDialog(dialog: HTMLDialogElement): boolean {
     if (!dialog || !isDialogOpen(dialog)) {
       return false;
     }
@@ -1021,7 +1255,7 @@
     return true;
   }
 
-  function normalizeWindowChromeState(rawValue) {
+  function normalizeWindowChromeState(rawValue: unknown): WindowChromeState {
     const raw = parseBridgeValue(rawValue);
     if (!isObject(raw) || raw.schemaVersion !== 1) {
       throw new Error("The desktop window returned an unsupported chrome state.");
@@ -1038,7 +1272,7 @@
     };
   }
 
-  function fallbackWindowChromeState() {
+  function fallbackWindowChromeState(): WindowChromeState {
     const isMac = /Macintosh|Mac OS X/.test(window.navigator.userAgent);
     return {
       schemaVersion: 1,
@@ -1051,7 +1285,7 @@
     };
   }
 
-  function renderWindowChromeState(chrome) {
+  function renderWindowChromeState(chrome: WindowChromeState): void {
     state.windowChrome = chrome;
     document.documentElement.dataset.windowPlatform = chrome.platform;
     document.documentElement.dataset.windowFocused = String(chrome.focused);
@@ -1080,20 +1314,22 @@
     elements.maximizeButton.title = chrome.fullscreen
       ? "Exit full screen before changing the window size"
       : maximizeLabel;
-    elements.maximizeButton.querySelector(".maximize-icon").hidden = restore;
-    elements.maximizeButton.querySelector(".restore-icon").hidden = !restore;
+    requiredDescendant<SVGElement>(elements.maximizeButton, ".maximize-icon")
+      .toggleAttribute("hidden", restore);
+    requiredDescendant<SVGElement>(elements.maximizeButton, ".restore-icon")
+      .toggleAttribute("hidden", !restore);
   }
 
-  function advanceWindowChromeRequestId() {
+  function advanceWindowChromeRequestId(): number {
     state.windowChromeRequestId += 1;
     return state.windowChromeRequestId;
   }
 
-  function isCurrentWindowChromeRequest(requestId) {
+  function isCurrentWindowChromeRequest(requestId: number): boolean {
     return requestId === state.windowChromeRequestId;
   }
 
-  function commitWindowChromeState(raw) {
+  function commitWindowChromeState(raw: unknown): void {
     // Invalidate focus/resize refreshes that began before an explicit window command. Otherwise
     // a late pre-launch response can overwrite the authoritative floating-panel result.
     advanceWindowChromeRequestId();
@@ -1114,7 +1350,7 @@
     }
   }
 
-  function scheduleWindowChromeRefresh() {
+  function scheduleWindowChromeRefresh(): void {
     if (state.windowChromeRefreshTimer !== null) {
       window.clearTimeout(state.windowChromeRefreshTimer);
     }
@@ -1124,7 +1360,7 @@
     }, 80);
   }
 
-  function resolveColorTheme(preference = state.themePreference) {
+  function resolveColorTheme(preference: ThemePreference = state.themePreference): ColorTheme {
     if (preference !== "system") {
       return preference;
     }
@@ -1145,7 +1381,7 @@
     }
   }
 
-  function storeThemePreference(preference) {
+  function storeThemePreference(preference: ThemePreference): void {
     try {
       window.localStorage.setItem(THEME_STORAGE_KEY, preference);
     } catch (_error) {
@@ -1153,8 +1389,11 @@
     }
   }
 
-  function applyThemePreference(preference, persist = true) {
-    const normalizedPreference = THEME_PREFERENCES.has(preference)
+  function applyThemePreference(
+    preference: unknown,
+    persist = true,
+  ): Promise<void> {
+    const normalizedPreference: ThemePreference = isThemePreference(preference)
       ? preference
       : "system";
     state.themePreference = normalizedPreference;
@@ -1168,13 +1407,13 @@
     return syncWindowChromeTheme();
   }
 
-  function handleSystemThemeChange() {
+  function handleSystemThemeChange(): void {
     if (state.themePreference === "system") {
       syncWindowChromeTheme();
     }
   }
 
-  async function refreshSnapshot() {
+  async function refreshSnapshot(): Promise<void> {
     if (state.refreshPending) {
       return;
     }
@@ -1208,7 +1447,7 @@
     }
   }
 
-  async function refreshUsage() {
+  async function refreshUsage(): Promise<void> {
     if (state.usagePending) {
       return;
     }
@@ -1217,7 +1456,7 @@
     state.lastUsageAttemptAtMs = Date.now();
     updateRefreshControl();
     try {
-      let current;
+      let current: UsageSnapshot;
       try {
         const raw = await invoke("get_usage", {});
         current = normalizeUsageSnapshot(raw);
@@ -1233,8 +1472,8 @@
     }
   }
 
-  function refreshUsageIfDue() {
-    if (!Number.isFinite(state.lastUsageAttemptAtMs)
+  function refreshUsageIfDue(): void {
+    if (state.lastUsageAttemptAtMs === null
         || Date.now() - state.lastUsageAttemptAtMs >= USAGE_REFRESH_INTERVAL_MS) {
       refreshUsage();
     }
@@ -1244,15 +1483,17 @@
     return Promise.allSettled([refreshSnapshot(), refreshUsage()]);
   }
 
-  function updateWorkspaceOpeningState(instanceId, opening) {
-    const button = Array.from(elements.workspaceList.querySelectorAll(".open-button"))
+  function updateWorkspaceOpeningState(instanceId: string, opening: boolean): void {
+    const button = Array.from(
+      elements.workspaceList.querySelectorAll<HTMLButtonElement>(".open-button"),
+    )
       .find((candidate) => candidate.dataset.instanceId === instanceId);
     const row = button?.closest(".workspace-row");
     row?.classList.toggle("is-opening", opening);
     button?.setAttribute("aria-busy", String(opening));
   }
 
-  function beginWorkspaceLaunch(workspace) {
+  function beginWorkspaceLaunch(workspace: Workspace): void {
     state.openingInstanceId = workspace.instanceId;
     document.documentElement.dataset.workspaceOpening = "true";
     elements.launchStatus.textContent = `Opening ${workspace.name}…`;
@@ -1260,7 +1501,7 @@
     updateWorkspaceOpeningState(workspace.instanceId, true);
   }
 
-  function finishWorkspaceLaunch(instanceId) {
+  function finishWorkspaceLaunch(instanceId: string): void {
     updateWorkspaceOpeningState(instanceId, false);
     state.openingInstanceId = null;
     delete document.documentElement.dataset.workspaceOpening;
@@ -1268,20 +1509,21 @@
     elements.launchStatus.textContent = "Opening workspace…";
   }
 
-  async function openWorkspace(workspace) {
+  async function openWorkspace(workspace: Workspace): Promise<void> {
     if (!workspace.openable || state.openingInstanceId) {
       return;
     }
 
     beginWorkspaceLaunch(workspace);
-    const transitionDelay = new Promise((resolve) => {
+    const transitionDelay = new Promise<void>((resolve) => {
       window.setTimeout(resolve, LAUNCH_TRANSITION_MIN_MS);
     });
 
     try {
       const result = await invoke("open_workspace", { instanceId: workspace.instanceId });
-      if (result === false || (isObject(result) && result.ok === false)) {
-        throw new Error(asString(result?.error, "VS Code did not accept the open request."));
+      const response = isObject(result) ? result : null;
+      if (result === false || response?.ok === false) {
+        throw new Error(asString(response?.error, "VS Code did not accept the open request."));
       }
       commitWindowChromeState(result);
       await transitionDelay;
@@ -1293,7 +1535,7 @@
     }
   }
 
-  function getIntegrationElements(kind) {
+  function getIntegrationElements(kind: IntegrationKind): IntegrationElements {
     if (kind === "companion") {
       return {
         card: elements.companionCard,
@@ -1326,7 +1568,7 @@
     };
   }
 
-  function renderIntegrationComponent(component) {
+  function renderIntegrationComponent(component: IntegrationComponent): void {
     const componentElements = getIntegrationElements(component.kind);
     componentElements.card.dataset.state = component.visualState;
     componentElements.status.dataset.state = component.visualState;
@@ -1360,7 +1602,10 @@
     componentElements.meta.hidden = !meta;
   }
 
-  function integrationProgressLabel(component, operation) {
+  function integrationProgressLabel(
+    component: IntegrationComponent,
+    operation: IntegrationOperation,
+  ): string {
     if (operation === "uninstall") {
       return "Uninstalling…";
     }
@@ -1373,8 +1618,9 @@
     return "Installing…";
   }
 
-  function updateIntegrationControls() {
+  function updateIntegrationControls(): void {
     const status = state.integrationStatus;
+    const action = state.integrationAction;
     const busy = state.integrationPending || Boolean(state.integrationAction);
     elements.integrationList.setAttribute("aria-busy", String(busy));
     elements.diagnosticsRefreshButton.disabled = busy || state.setupRefreshPending;
@@ -1383,29 +1629,29 @@
       ? "Setting up…"
       : "Set up all";
 
-    ["companion", "codex", "claude"].forEach((kind) => {
+    INTEGRATION_KINDS.forEach((kind) => {
       const component = status?.[kind];
       const componentElements = getIntegrationElements(kind);
-      const isCurrentAction = state.integrationAction?.kind === kind;
+      const isCurrentAction = action?.kind === kind;
       componentElements.card.setAttribute("aria-busy", String(isCurrentAction));
       componentElements.installButton.disabled = busy || !component;
       componentElements.uninstallButton.disabled = busy || !component?.installed;
 
       if (component) {
         componentElements.installButton.textContent =
-          isCurrentAction && state.integrationAction.operation === "install"
+          isCurrentAction && action?.operation === "install"
             ? integrationProgressLabel(component, "install")
             : component.actionLabel;
         componentElements.uninstallButton.textContent =
-          isCurrentAction && state.integrationAction.operation === "uninstall"
+          isCurrentAction && action?.operation === "uninstall"
             ? "Uninstalling…"
             : "Uninstall";
       }
     });
   }
 
-  function updateSetupSummary() {
-    let summary;
+  function updateSetupSummary(): void {
+    let summary: string;
     let attention = false;
 
     if (!state.integrationStatus && !state.diagnosticsLoaded) {
@@ -1414,7 +1660,7 @@
         : "Local only";
       attention = state.diagnosticsUnavailable;
     } else {
-      const components = state.integrationStatus
+      const components: IntegrationComponent[] = state.integrationStatus
         ? [
             state.integrationStatus.companion,
             state.integrationStatus.codex,
@@ -1457,7 +1703,7 @@
     elements.settingsButton.title = `Settings and diagnostics · ${summary}`;
   }
 
-  function renderIntegrationStatus(status) {
+  function renderIntegrationStatus(status: IntegrationStatus): void {
     state.integrationStatus = status;
     state.integrationLoaded = true;
     renderIntegrationComponent(status.companion);
@@ -1470,14 +1716,17 @@
     updateSetupSummary();
   }
 
-  function setIntegrationMessage(message, kind = "neutral") {
+  function setIntegrationMessage(
+    message: string,
+    kind: IntegrationMessageKind = "neutral",
+  ): void {
     elements.integrationMessage.textContent = message;
     elements.integrationMessage.hidden = !message;
     elements.integrationMessage.classList.toggle("has-error", kind === "error");
     elements.integrationMessage.classList.toggle("has-success", kind === "success");
   }
 
-  async function refreshIntegrationStatus() {
+  async function refreshIntegrationStatus(): Promise<void> {
     if (state.integrationPending || state.integrationAction) {
       return;
     }
@@ -1511,7 +1760,10 @@
     }
   }
 
-  function integrationActionSuccess(kind, operation) {
+  function integrationActionSuccess(
+    kind: IntegrationKind,
+    operation: IntegrationOperation,
+  ): string {
     if (operation === "uninstall") {
       if (kind === "companion") {
         return "VS Code companion uninstalled. Existing stale heartbeats will age out automatically.";
@@ -1526,12 +1778,18 @@
       : "Claude Code hooks installed. Restart affected Claude Code sessions to load the new lifecycle handlers.";
   }
 
-  async function runIntegrationAction(kind, operation) {
+  async function runIntegrationAction(
+    kind: IntegrationKind,
+    operation: IntegrationOperation,
+  ): Promise<void> {
     if (state.integrationAction) {
       return;
     }
 
-    const commands = {
+    const commands: Record<
+      IntegrationKind,
+      { install: TauriCommand; uninstall: TauriCommand; name: string }
+    > = {
       companion: {
         install: "install_companion",
         uninstall: "uninstall_companion",
@@ -1572,7 +1830,7 @@
     }
   }
 
-  function formatNaturalList(values) {
+  function formatNaturalList(values: readonly string[]): string {
     if (values.length < 2) {
       return values[0] || "";
     }
@@ -1582,16 +1840,20 @@
     return `${values.slice(0, -1).join(", ")}, and ${values.at(-1)}`;
   }
 
-  function trimTerminalPunctuation(value) {
+  function trimTerminalPunctuation(value: string): string {
     return value.replace(/[.!?\s]+$/g, "");
   }
 
-  async function setupAllIntegrations() {
+  async function setupAllIntegrations(): Promise<void> {
     if (state.integrationAction || state.integrationPending) {
       return;
     }
 
-    const steps = [
+    const steps: Array<{
+      kind: IntegrationKind;
+      name: string;
+      command: TauriCommand;
+    }> = [
       {
         kind: "companion",
         name: "VS Code companion",
@@ -1608,8 +1870,8 @@
         command: "install_claude_hooks",
       },
     ];
-    const completed = [];
-    const unconfirmed = [];
+    const completed: string[] = [];
+    const unconfirmed: Array<{ name: string; error: string }> = [];
 
     state.integrationAction = { kind: "all", operation: "install" };
     updateIntegrationControls();
@@ -1660,22 +1922,22 @@
     updateIntegrationControls();
   }
 
-  function openSettingsDialog() {
+  function openSettingsDialog(): void {
     if (showAccessibleDialog(elements.settingsDialog, elements.settingsCloseButton)) {
       refreshSetup();
     }
   }
 
-  function closeSettingsDialog() {
+  function closeSettingsDialog(): void {
     closeAccessibleDialog(elements.settingsDialog);
   }
 
-  function requestUninstall(kind) {
+  function requestUninstall(kind: IntegrationKind): void {
     if (state.integrationAction) {
       return;
     }
 
-    const componentNames = {
+    const componentNames: Record<IntegrationKind, string> = {
       companion: "VS Code companion",
       codex: "Codex activity hooks",
       claude: "Claude Code activity hooks",
@@ -1690,11 +1952,11 @@
     showAccessibleDialog(elements.uninstallDialog, elements.uninstallCancelButton);
   }
 
-  function closeUninstallDialog() {
+  function closeUninstallDialog(): void {
     closeAccessibleDialog(elements.uninstallDialog);
   }
 
-  async function confirmUninstall() {
+  async function confirmUninstall(): Promise<void> {
     const kind = state.pendingUninstall;
     if (!kind) {
       return;
@@ -1706,7 +1968,7 @@
     await runIntegrationAction(kind, "uninstall");
   }
 
-  function formatDuration(milliseconds) {
+  function formatDuration(milliseconds: unknown): string {
     const value = asFiniteNumber(milliseconds);
     if (value === null) {
       return "Unknown";
@@ -1720,13 +1982,13 @@
     return `${Math.round(value / 3_600_000)} hours`;
   }
 
-  function appendDiagnostic(label, value, warning = false) {
+  function appendDiagnostic(label: string, value: string, warning = false): void {
     const term = createElement("dt", "", label);
     const description = createElement("dd", warning ? "has-warning" : "", value);
     elements.diagnosticsList.append(term, description);
   }
 
-  function renderDiagnostics(rawValue) {
+  function renderDiagnostics(rawValue: unknown): void {
     const raw = parseBridgeValue(rawValue);
     if (!isObject(raw)) {
       throw new Error("The local monitor returned invalid diagnostics.");
@@ -1782,7 +2044,7 @@
       : "No valid workspace heartbeat is present yet. Check that the companion extension is enabled in an open VS Code window.";
   }
 
-  async function refreshDiagnostics() {
+  async function refreshDiagnostics(): Promise<void> {
     if (state.diagnosticsPending) {
       return;
     }
@@ -1807,7 +2069,7 @@
     }
   }
 
-  async function refreshSetup() {
+  async function refreshSetup(): Promise<[void, void] | undefined> {
     if (state.setupRefreshPromise) {
       return state.setupRefreshPromise;
     }
@@ -1835,7 +2097,7 @@
     return state.setupRefreshPromise;
   }
 
-  async function hideWindow() {
+  async function hideWindow(): Promise<void> {
     elements.hideButton.disabled = true;
     elements.hideButton.setAttribute("aria-busy", "true");
     try {
@@ -1848,7 +2110,7 @@
     }
   }
 
-  async function hideFloatingPanel() {
+  async function hideFloatingPanel(): Promise<void> {
     elements.hidePanelButton.disabled = true;
     elements.hidePanelButton.setAttribute("aria-busy", "true");
     try {
@@ -1861,7 +2123,7 @@
     }
   }
 
-  async function restoreFullWindow() {
+  async function restoreFullWindow(): Promise<void> {
     elements.restoreFullButton.disabled = true;
     elements.restoreFullButton.setAttribute("aria-busy", "true");
     try {
@@ -1877,7 +2139,7 @@
     }
   }
 
-  async function toggleWindowMaximize() {
+  async function toggleWindowMaximize(): Promise<void> {
     if (elements.maximizeButton.disabled) {
       return;
     }
@@ -1896,7 +2158,7 @@
     }
   }
 
-  async function closeWindow() {
+  async function closeWindow(): Promise<void> {
     elements.closeButton.disabled = true;
     elements.closeButton.setAttribute("aria-busy", "true");
     try {
@@ -1909,18 +2171,22 @@
     }
   }
 
-  function navigateOpenButtons(event) {
+  function navigateOpenButtons(event: KeyboardEvent): void {
     if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) {
       return;
     }
 
-    const currentButton = event.target.closest?.(".open-button:not(:disabled)");
+    const currentButton = event.target instanceof Element
+      ? event.target.closest<HTMLButtonElement>(".open-button:not(:disabled)")
+      : null;
     if (!currentButton || !elements.workspaceList.contains(currentButton)) {
       return;
     }
 
     const buttons = Array.from(
-      elements.workspaceList.querySelectorAll(".open-button:not(:disabled)"),
+      elements.workspaceList.querySelectorAll<HTMLButtonElement>(
+        ".open-button:not(:disabled)",
+      ),
     );
     const currentIndex = buttons.indexOf(currentButton);
     let nextIndex = currentIndex;
@@ -1941,7 +2207,7 @@
     buttons[nextIndex]?.focus({ preventScroll: true });
   }
 
-  function handleGlobalKeydown(event) {
+  function handleGlobalKeydown(event: KeyboardEvent): void {
     const commandModifier = (event.ctrlKey || event.metaKey) && !event.altKey;
     const normalizedKey = event.key.toLowerCase();
 

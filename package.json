@@ -1,0 +1,16 @@
+{
+  "name": "vsparallel",
+  "version": "0.1.0",
+  "private": true,
+  "description": "TypeScript tooling for the VSParallel desktop UI",
+  "scripts": {
+    "build:ui": "tsc --project tsconfig.json",
+    "build:ui-tests": "tsc --project tsconfig.test.json",
+    "test:ui": "npm run build:ui && npm run build:ui-tests && node --test .ui-test-build/ui/test/*.test.js",
+    "check:ui": "npm run test:ui"
+  },
+  "devDependencies": {
+    "@types/node": "24.13.3",
+    "typescript": "6.0.3"
+  }
+}

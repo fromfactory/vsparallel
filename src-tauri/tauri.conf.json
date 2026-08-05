@@ -4,11 +4,16 @@
   "version": "0.1.0",
   "identifier": "app.vsparallel.desktop",
   "build": {
+    "beforeBuildCommand": "npm run build:ui",
+    "beforeDevCommand": {
+      "script": "npm run build:ui",
+      "wait": true
+    },
     "frontendDist": [
       "../ui/index.html",
       "../ui/styles.css",
-      "../ui/app.js",
-      "../ui/theme-init.js",
+      "../ui/generated/app.js",
+      "../ui/generated/theme-init.js",
       "../ui/vsparallel-icon.png"
     ]
   },

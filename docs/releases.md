@@ -12,7 +12,8 @@ all platform builds succeed.
    `Cargo.lock`.
 2. If the companion changed, keep its independent version synchronized between
    `companion/package.json` and `companion/extension.vsixmanifest`.
-3. Run `./scripts/check.sh`, commit the release changes, and push the commit.
+3. Run `npm ci` and `./scripts/check.sh`, commit the release changes, and push
+   the commit.
 4. Tag that commit with the application version and push the tag:
 
    ```bash
