@@ -152,95 +152,110 @@ pub fn build_usage_snapshot_with<R: CodexUsageRunner + ?Sized>(
 
 impl CodexUsageRunner for ProcessCodexUsageRunner {
     fn read_rate_limits(&self, executable: &OsStr) -> Result<Value, String> {
-        let mut command = Command::new(executable);
-        command
-            .args(["app-server", "--stdio"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            command.process_group(0);
-        }
-
-        let mut child = command
-            .spawn()
-            .map_err(|_| "could not start the Codex usage service".to_string())?;
-        let mut stdin = match child.stdin.take() {
-            Some(stdin) => stdin,
-            None => {
-                let _ = terminate_and_reap(&mut child);
-                return Err("Codex usage service input was unavailable".to_string());
-            }
-        };
-        let stdout = match child.stdout.take() {
-            Some(stdout) => stdout,
-            None => {
-                drop(stdin);
-                let _ = terminate_and_reap(&mut child);
-                return Err("Codex usage service output was unavailable".to_string());
-            }
-        };
-        let stderr = match child.stderr.take() {
-            Some(stderr) => stderr,
-            None => {
-                drop(stdin);
-                drop(stdout);
-                let _ = terminate_and_reap(&mut child);
-                return Err("Codex usage service diagnostics were unavailable".to_string());
-            }
-        };
-
-        let (line_sender, line_receiver) = mpsc::channel();
-        let stdout_reader = thread::spawn(move || pump_protocol_lines(stdout, line_sender));
-        let stderr_reader =
-            thread::spawn(move || drain_capped(stderr, CODEX_OUTPUT_LIMIT).map(|_| ()));
-        let deadline = Instant::now() + CODEX_PROTOCOL_TIMEOUT;
-
-        let protocol_result = (|| {
-            send_rpc(
-                &mut stdin,
-                &json!({
-                    "method": "initialize",
-                    "id": 1,
-                    "params": {
-                        "clientInfo": {
-                            "name": "vsparallel",
-                            "title": "VSParallel",
-                            "version": env!("CARGO_PKG_VERSION")
-                        }
-                    }
-                }),
-            )?;
-            let _ = wait_for_rpc_response(&line_receiver, 1, deadline)?;
-            send_rpc(&mut stdin, &json!({"method": "initialized", "params": {}}))?;
-            send_rpc(
-                &mut stdin,
-                &json!({
-                    "method": "account/rateLimits/read",
-                    "id": 2,
-                    "params": {}
-                }),
-            )?;
-            wait_for_rpc_response(&line_receiver, 2, deadline)
-        })();
-
-        drop(stdin);
-        let _ = terminate_and_reap(&mut child);
-        let _ = stdout_reader.join();
-        let _ = stderr_reader.join();
-        protocol_result
+        codex_app_server_request(
+            executable,
+            "account/rateLimits/read",
+            Value::Object(Default::default()),
+        )
     }
+}
+
+/// Send one initialized request to the installed Codex app-server.
+///
+/// Integration status and live usage use the same bounded subprocess protocol,
+/// so neither path can leave a Codex child running or consume unbounded output.
+pub(crate) fn codex_app_server_request(
+    executable: &OsStr,
+    method: &str,
+    params: Value,
+) -> Result<Value, String> {
+    let mut command = Command::new(executable);
+    command
+        .args(["app-server", "--stdio"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+
+    let mut child = command
+        .spawn()
+        .map_err(|_| "could not start the Codex app-server".to_string())?;
+    let mut stdin = match child.stdin.take() {
+        Some(stdin) => stdin,
+        None => {
+            let _ = terminate_and_reap(&mut child);
+            return Err("Codex app-server input was unavailable".to_string());
+        }
+    };
+    let stdout = match child.stdout.take() {
+        Some(stdout) => stdout,
+        None => {
+            drop(stdin);
+            let _ = terminate_and_reap(&mut child);
+            return Err("Codex app-server output was unavailable".to_string());
+        }
+    };
+    let stderr = match child.stderr.take() {
+        Some(stderr) => stderr,
+        None => {
+            drop(stdin);
+            drop(stdout);
+            let _ = terminate_and_reap(&mut child);
+            return Err("Codex app-server diagnostics were unavailable".to_string());
+        }
+    };
+
+    let (line_sender, line_receiver) = mpsc::channel();
+    let stdout_reader = thread::spawn(move || pump_protocol_lines(stdout, line_sender));
+    let stderr_reader = thread::spawn(move || drain_capped(stderr, CODEX_OUTPUT_LIMIT).map(|_| ()));
+    let deadline = Instant::now() + CODEX_PROTOCOL_TIMEOUT;
+
+    let protocol_result = (|| {
+        send_rpc(
+            &mut stdin,
+            &json!({
+                "method": "initialize",
+                "id": 1,
+                "params": {
+                    "clientInfo": {
+                        "name": "vsparallel",
+                        "title": "VSParallel",
+                        "version": env!("CARGO_PKG_VERSION")
+                    }
+                }
+            }),
+        )?;
+        let _ = wait_for_rpc_response(&line_receiver, 1, deadline)?;
+        send_rpc(&mut stdin, &json!({"method": "initialized", "params": {}}))?;
+        send_rpc(
+            &mut stdin,
+            &json!({
+                "method": method,
+                "id": 2,
+                "params": params
+            }),
+        )?;
+        wait_for_rpc_response(&line_receiver, 2, deadline)
+    })();
+
+    drop(stdin);
+    let _ = terminate_and_reap(&mut child);
+    let _ = stdout_reader.join();
+    let _ = stderr_reader.join();
+    protocol_result
 }
 
 fn send_rpc(writer: &mut impl Write, message: &Value) -> Result<(), String> {
     serde_json::to_writer(&mut *writer, message)
-        .map_err(|_| "could not encode a Codex usage request".to_string())?;
+        .map_err(|_| "could not encode a Codex app-server request".to_string())?;
     writer
         .write_all(b"\n")
         .and_then(|_| writer.flush())
-        .map_err(|_| "could not send a Codex usage request".to_string())
+        .map_err(|_| "could not send a Codex app-server request".to_string())
 }
 
 fn wait_for_rpc_response(
@@ -251,30 +266,30 @@ fn wait_for_rpc_response(
     loop {
         let remaining = deadline
             .checked_duration_since(Instant::now())
-            .ok_or_else(|| "Codex usage request timed out".to_string())?;
+            .ok_or_else(|| "Codex app-server request timed out".to_string())?;
         let line = receiver
             .recv_timeout(remaining)
             .map_err(|error| match error {
-                mpsc::RecvTimeoutError::Timeout => "Codex usage request timed out".to_string(),
+                mpsc::RecvTimeoutError::Timeout => "Codex app-server request timed out".to_string(),
                 mpsc::RecvTimeoutError::Disconnected => {
-                    "Codex usage service stopped before responding".to_string()
+                    "Codex app-server stopped before responding".to_string()
                 }
             })??;
         if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
         let response: Value = serde_json::from_slice(&line)
-            .map_err(|_| "Codex usage service returned malformed output".to_string())?;
+            .map_err(|_| "Codex app-server returned malformed output".to_string())?;
         if response.get("id").and_then(Value::as_i64) != Some(expected_id) {
             continue;
         }
         if response.get("error").is_some() {
-            return Err("Codex did not provide usage limits for this account".to_string());
+            return Err("Codex app-server rejected the request".to_string());
         }
         return response
             .get("result")
             .cloned()
-            .ok_or_else(|| "Codex usage response had no result".to_string());
+            .ok_or_else(|| "Codex app-server response had no result".to_string());
     }
 }
 
@@ -330,7 +345,7 @@ fn read_protocol_line<R: BufRead>(
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "Codex usage output exceeded its safety limit",
+                "Codex app-server output exceeded its safety limit",
             ));
         }
         let has_newline = available[consumed - 1] == b'\n';

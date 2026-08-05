@@ -94,9 +94,10 @@ Allowed on-disk states are `activity_detected`, `turn_finished`,
 `session_ended`, and `failed_or_interrupted`. The Claude adapter writes
 `failed_or_interrupted` for its documented `StopFailure` event. Codex does not
 currently expose a corresponding documented hook, so its adapter produces the
-other three states only. The UI derives `Unknown` when no usable recent record
-can be associated with a workspace; `unknown` is not written as a lifecycle
-state.
+other three states only. The snapshot derives `unknown` when no usable recent
+record can be associated with a workspace; `unknown` is not written as a
+lifecycle state. The main UI labels an initial absence **No activity yet** and
+reserves **Unknown** for a previous lifecycle signal that has become stale.
 
 Both adapters map only documented lifecycle events:
 
@@ -150,6 +151,18 @@ oversized, malformed, future-dated, wrong-version, symlinked, or otherwise
 unusable records are ignored. If the user already has a custom Claude Code
 `statusLine`, VSParallel does not replace or wrap it, so this file is not
 refreshed and Claude usage is reported as unavailable or stale.
+
+## Codex hook review status (not persisted)
+
+When Setup status is checked, VSParallel starts the configured Codex
+`app-server` and calls `hooks/list` from `CODEX_HOME` to isolate the user hook
+layer. It matches only the three exact VSParallel handlers and reads their
+`enabled` and `trustStatus` fields. The response is used only to distinguish
+**Installed · trusted** from **Installed · review required** and is not
+persisted. This confirms the user-layer decision; workspace configuration can
+still disable hooks. If the installed Codex version cannot provide the status,
+the hooks remain **Installed** with neutral guidance to check `/hooks`;
+VSParallel never approves a handler.
 
 ## Live Codex usage (not persisted)
 

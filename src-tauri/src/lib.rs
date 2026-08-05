@@ -138,6 +138,7 @@ struct LifecycleIntegrationView {
     label: String,
     detail: String,
     config_path: Option<String>,
+    review_required: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -333,18 +334,67 @@ fn codex_view() -> LifecycleIntegrationView {
     };
     match codex_integration::codex_integration_status(&codex_home, &executable) {
         Ok(status) => {
-            let (state, label) = match status.state.as_str() {
-                "installed" => ("installed", "Installed · review required"),
-                "not_installed" => ("not_installed", "Not installed"),
-                "stale" => ("repair_needed", "Update available"),
-                "partial" => ("repair_needed", "Repair needed"),
-                _ => ("unavailable", "Status unavailable"),
+            let (state, label, detail, review_required) = match status.state.as_str() {
+                "installed" => {
+                    let codex_command = usage::codex_command();
+                    match codex_integration::codex_hook_review_status(
+                        &codex_home,
+                        &executable,
+                        codex_command.as_os_str(),
+                    ) {
+                        Ok(codex_integration::CodexHookReviewStatus::Trusted) => (
+                            "installed",
+                            "Installed · trusted",
+                            "Codex has trusted the installed user-level VSParallel handlers. Workspace settings can still disable hooks."
+                                .to_string(),
+                            Some(false),
+                        ),
+                        Ok(codex_integration::CodexHookReviewStatus::ReviewRequired) => (
+                            "installed",
+                            "Installed · review required",
+                            status.message.clone(),
+                            Some(true),
+                        ),
+                        Err(_) => (
+                            "installed",
+                            "Installed",
+                            "Codex activity monitoring is installed. VSParallel could not verify its review status; check /hooks in Codex if needed."
+                                .to_string(),
+                            None,
+                        ),
+                    }
+                }
+                "not_installed" => (
+                    "not_installed",
+                    "Not installed",
+                    status.message.clone(),
+                    None,
+                ),
+                "stale" => (
+                    "repair_needed",
+                    "Update available",
+                    status.message.clone(),
+                    None,
+                ),
+                "partial" => (
+                    "repair_needed",
+                    "Repair needed",
+                    status.message.clone(),
+                    None,
+                ),
+                _ => (
+                    "unavailable",
+                    "Status unavailable",
+                    status.message.clone(),
+                    None,
+                ),
             };
             LifecycleIntegrationView {
                 state: state.to_string(),
                 label: label.to_string(),
-                detail: status.message,
+                detail,
                 config_path: Some(status.config_path),
+                review_required,
             }
         }
         Err(error) => unavailable_codex_view(
@@ -357,9 +407,10 @@ fn codex_view() -> LifecycleIntegrationView {
 fn unavailable_codex_view(error: String, config_path: Option<String>) -> LifecycleIntegrationView {
     LifecycleIntegrationView {
         state: "unavailable".to_string(),
-        label: "Review required".to_string(),
+        label: "Status unavailable".to_string(),
         detail: error,
         config_path,
+        review_required: None,
     }
 }
 
@@ -400,6 +451,7 @@ fn claude_view() -> LifecycleIntegrationView {
                 label: label.to_string(),
                 detail: status.message,
                 config_path: Some(status.config_path),
+                review_required: None,
             }
         }
         Err(error) => unavailable_claude_view(
@@ -415,6 +467,7 @@ fn unavailable_claude_view(error: String, config_path: Option<String>) -> Lifecy
         label: "Review required".to_string(),
         detail: error,
         config_path,
+        review_required: None,
     }
 }
 
@@ -2268,11 +2321,14 @@ mod tests {
             label: "Not installed".to_string(),
             detail: "Optional lifecycle monitoring is not installed.".to_string(),
             config_path: Some("/config/settings.json".to_string()),
+            review_required: None,
         };
+        let mut codex = lifecycle.clone();
+        codex.review_required = Some(false);
         let status = IntegrationStatusView {
             schema_version: INTEGRATION_SCHEMA_VERSION,
             companion: companion_view(companion_status(CompanionStatusState::NotInstalled)),
-            codex: lifecycle.clone(),
+            codex,
             claude: lifecycle,
             requires_restart: false,
         };
@@ -2280,6 +2336,8 @@ mod tests {
         let serialized = serde_json::to_value(status).unwrap();
         assert_eq!(serialized["schemaVersion"], INTEGRATION_SCHEMA_VERSION);
         assert_eq!(serialized["codex"]["state"], "not_installed");
+        assert_eq!(serialized["codex"]["reviewRequired"], false);
+        assert!(serialized["claude"]["reviewRequired"].is_null());
         assert_eq!(serialized["claude"]["state"], "not_installed");
         assert!(serialized["companion"].is_object());
     }

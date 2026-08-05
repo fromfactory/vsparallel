@@ -12,6 +12,13 @@ preserves unrelated handlers. It maps only documented events:
 - `Stop` to `turn_finished`
 - `SessionEnd` to `session_ended`
 
+Codex requires non-managed handlers to be reviewed and trusted. VSParallel
+queries `hooks/list` through the installed Codex `app-server` to display that
+user-level review state, but it never changes the decision. Workspace settings
+can still disable hooks. Opening Codex or reviewing `/hooks` alone emits no
+monitored lifecycle event; submit a prompt from inside the VS Code workspace to
+create the first activity marker.
+
 Codex currently has no corresponding documented hook that lets this
 integration distinguish a failed or user-interrupted turn. If a terminal event
 is missing, VSParallel eventually presents the stale lifecycle information as

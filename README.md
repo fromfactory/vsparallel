@@ -10,9 +10,9 @@ attention, and access active workspaces directly from the native system tray—a
 without interrupting your flow.
 
 VSParallel has no account system, telemetry, analytics, or advertising. Its
-workspace and Claude Code monitoring remain local. To populate the Codex usage
-card, VSParallel asks the user's installed, signed-in Codex `app-server` for
-live rate-limit percentages and reset times; that Codex subprocess may contact
+workspace and Claude Code monitoring remain local. VSParallel asks the user's
+installed Codex `app-server` for local hook-review status and, when signed in,
+live rate-limit percentages and reset times. That Codex subprocess may contact
 the Codex service using its own existing sign-in. VSParallel does not read or
 store the credential.
 
@@ -62,14 +62,18 @@ Install the package for your platform, launch VSParallel, and then:
 5. After installing Codex hooks, run `/hooks` in Codex, review the three
    VSParallel handlers, and trust them.
 
-The final Codex review is an intentional security boundary. VSParallel does not
-attempt to approve user hooks on your behalf.
+The final Codex review is an intentional security boundary. VSParallel reads
+Codex's resulting user-level trust status but never attempts to approve user
+hooks on your behalf. Workspace settings can still disable hooks. Opening Codex
+or `/hooks` does not create an activity marker; after trusting the handlers,
+submit a prompt from the monitored workspace.
 
 The bundled companion extension reports workspace, focus, heartbeat, and
 provider-extension presence through documented VS Code APIs. Optional lifecycle
-hooks add coarse **Activity detected**, **Turn finished**,
-**Failed/interrupted**, and **Unknown** states. Extension activation alone is
-never presented as active work.
+hooks add coarse **Activity detected**, **Turn finished**, and
+**Failed/interrupted** states. Before the first matching hook event, the UI says
+**No activity yet**; lifecycle information older than 24 hours becomes
+**Unknown**. Extension activation alone is never presented as active work.
 
 The global usage cards refresh every 60 seconds and when **Refresh** is selected.
 Codex usage is available when the `codex` executable is installed, supports
@@ -127,7 +131,7 @@ VS Code companion ─ workspace/focus/extension heartbeat ─┐
 Codex hooks ───────────── coarse lifecycle marker ────────┼─ local state ─┐
 Claude Code hooks ─────── coarse lifecycle marker ────────┤               │
 Claude Code statusLine ── usage percentages/reset times ──┘               ├─ Rust core ─ Tauri UI
-Codex app-server ───────── live usage percentages/reset times ─────────────┘      │
+Codex app-server ───── hook trust + live usage percentages/reset times ────┘      │
                                                                                   └─ native tray
 ```
 

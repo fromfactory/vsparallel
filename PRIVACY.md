@@ -1,14 +1,15 @@
 # VSParallel privacy and local data
 
 VSParallel contains no account system, telemetry, analytics, or advertising.
-Workspace monitoring and Claude Code usage capture operate locally. Every 60
-seconds, and when the user explicitly refreshes the app, VSParallel starts the
-installed Codex `app-server` to request current rate-limit percentages and reset
-times. The Codex subprocess may contact the Codex service using its own existing
-sign-in. VSParallel does not receive, read, or store that credential, and it
-does not persist the returned Codex usage data. A recent, unexpired response may
-be retained in application memory for up to 15 minutes and is visibly marked
-stale if a later refresh fails.
+Workspace monitoring and Claude Code usage capture operate locally. When Setup
+status is checked, VSParallel starts the installed Codex `app-server` to read
+whether its exact user-level handlers are enabled and trusted. Every 60 seconds,
+and when the user explicitly refreshes the app, it also requests current rate-limit
+percentages and reset times. The Codex subprocess may contact the Codex service
+using its own existing sign-in. VSParallel does not receive, read, or store that
+credential, and it does not persist either app-server response. A recent,
+unexpired usage response may be retained in application memory for up to 15
+minutes and is visibly marked stale if a later refresh fails.
 
 VSParallel does not extract, log, store, or transmit prompts, responses, source
 files, terminal contents, transcripts, or Git data. Optional lifecycle hooks

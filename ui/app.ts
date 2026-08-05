@@ -100,6 +100,7 @@
     installedVersion: string;
     targetVersion: string;
     configPath: string;
+    reviewRequired: boolean | null;
   }
 
   interface IntegrationStatus {
@@ -443,6 +444,7 @@
       installedVersion,
       targetVersion: asString(raw.targetVersion),
       configPath: asString(raw.configPath),
+      reviewRequired: asNullableBoolean(raw.reviewRequired),
     };
   }
 
@@ -498,8 +500,10 @@
 
   function normalizeActivityView(rawValue: unknown): ActivityView {
     const raw = isObject(rawValue) ? rawValue : {};
+    const description = describeActivityState(normalizeStateToken(raw.state));
     return {
-      ...describeActivityState(normalizeStateToken(raw.state)),
+      ...description,
+      label: asString(raw.label, description.label),
       changedAtMs: asTimestamp(raw.changedAtMs),
       detail: asString(raw.detail),
       extensionDetectionAvailable: asNullableBoolean(raw.extensionDetectionAvailable),
@@ -891,8 +895,8 @@
     }
     return {
       state: "unknown",
-      label: "IDE extension status unknown",
-      title: "IDE extension presence and activation are unavailable. Lifecycle state remains independent.",
+      label: "Reload VS Code for IDE status",
+      title: "This window is reporting through an older VSParallel Companion. Update the companion in Setup if offered, then run Developer: Reload Window in VS Code.",
     };
   }
 
@@ -1710,8 +1714,9 @@
     renderIntegrationComponent(status.codex);
     renderIntegrationComponent(status.claude);
     elements.restartNotice.hidden = !status.requiresRestart;
-    elements.codexTrustGuidance.dataset.active = String(status.codex.installed);
-    elements.codexTrustGuidance.hidden = !status.codex.installed;
+    const codexReviewRequired = status.codex.reviewRequired === true;
+    elements.codexTrustGuidance.dataset.active = String(codexReviewRequired);
+    elements.codexTrustGuidance.hidden = !codexReviewRequired;
     updateIntegrationControls();
     updateSetupSummary();
   }
@@ -2305,6 +2310,9 @@
     document.documentElement.dataset.windowFocused = "true";
     refreshSnapshot();
     refreshUsageIfDue();
+    if (isDialogOpen(elements.settingsDialog)) {
+      refreshIntegrationStatus();
+    }
     scheduleWindowChromeRefresh();
   });
   window.addEventListener("blur", () => {

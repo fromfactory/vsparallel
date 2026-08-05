@@ -635,7 +635,7 @@ fn aggregate_activity(
     now_ms: i64,
 ) -> ActivityView {
     if workspace_paths.is_empty() {
-        return unknown_activity(provider, extension);
+        return pathless_activity(provider, extension);
     }
 
     let mut matching: Vec<&ActivityRecord> = records
@@ -709,8 +709,20 @@ fn aggregate_activity(
     }
 }
 
+fn pathless_activity(provider: &str, extension: Option<ExtensionPresenceRecord>) -> ActivityView {
+    activity_view(
+        "unknown",
+        "Workspace path needed",
+        None,
+        format!(
+            "Open a local folder or saved workspace so VSParallel can associate {provider} lifecycle signals with this window."
+        ),
+        extension,
+    )
+}
+
 fn unknown_activity(provider: &str, extension: Option<ExtensionPresenceRecord>) -> ActivityView {
-    let detail = match extension {
+    let mut detail = match extension {
         Some(extension) if !extension.available => format!(
             "{provider} extension presence could not be checked; no lifecycle signal has been observed."
         ),
@@ -723,7 +735,10 @@ fn unknown_activity(provider: &str, extension: Option<ExtensionPresenceRecord>) 
         Some(_) => format!("The {provider} extension was not detected in this VS Code window."),
         None => format!("No matching {provider} lifecycle signal has been observed."),
     };
-    activity_view("unknown", "Unknown", None, detail, extension)
+    detail.push_str(&format!(
+        " Start {provider} in this workspace and submit a prompt to create the first lifecycle marker."
+    ));
+    activity_view("unknown", "No activity yet", None, detail, extension)
 }
 
 fn activity_view(
@@ -1013,6 +1028,47 @@ mod tests {
     }
 
     #[test]
+    fn codex_parent_cwd_is_not_workspace_activity_and_explains_first_signal() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let now = 2_000_000;
+        write_json(
+            &temp.path().join("instances/repo.json"),
+            instance("repo", &repo, now, false),
+        );
+        write_json(
+            &temp.path().join("codex/parent.json"),
+            json!({
+                "schemaVersion": 1,
+                "sessionKey": "parent",
+                "cwd": temp.path(),
+                "state": "activity_detected",
+                "changedAtMs": now - 10
+            }),
+        );
+
+        let snapshot = StateStore::new(temp.path().to_path_buf()).snapshot(now);
+        let codex = &snapshot.workspaces[0].codex;
+        assert_eq!(codex.state, "unknown");
+        assert_eq!(codex.label, "No activity yet");
+        assert!(codex
+            .detail
+            .contains("Start Codex in this workspace and submit a prompt"));
+    }
+
+    #[test]
+    fn pathless_workspace_explains_that_activity_cannot_be_associated() {
+        let view = aggregate_activity("Codex", &[], &[], None, 20_000);
+        assert_eq!(view.state, "unknown");
+        assert_eq!(view.label, "Workspace path needed");
+        assert!(view
+            .detail
+            .contains("Open a local folder or saved workspace"));
+        assert!(!view.detail.contains("submit a prompt"));
+    }
+
+    #[test]
     fn marks_old_codex_signal_unknown() {
         let temp = TempDir::new().unwrap();
         let repo = temp.path().join("repo");
@@ -1034,6 +1090,7 @@ mod tests {
         );
         let snapshot = StateStore::new(temp.path().to_path_buf()).snapshot(now);
         assert_eq!(snapshot.workspaces[0].codex.state, "unknown");
+        assert_eq!(snapshot.workspaces[0].codex.label, "Unknown");
     }
 
     #[test]

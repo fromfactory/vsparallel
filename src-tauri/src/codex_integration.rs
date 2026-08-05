@@ -9,6 +9,7 @@ use serde::{Deserializer, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::env;
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -60,7 +61,6 @@ pub struct CodexIntegrationStatus {
     pub config_path: String,
     pub backup_path: String,
     pub event_states: BTreeMap<String, String>,
-    pub trust_review_required: bool,
     pub message: String,
 }
 
@@ -71,6 +71,13 @@ pub struct CodexIntegrationChange {
     pub changed: bool,
     pub migrated: bool,
     pub status: CodexIntegrationStatus,
+}
+
+/// Codex's runtime decision for the exact three handlers VSParallel owns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexHookReviewStatus {
+    Trusted,
+    ReviewRequired,
 }
 
 #[derive(Debug, Default)]
@@ -221,6 +228,28 @@ pub fn codex_integration_status(
     let handler = managed_handler(executable)?;
     let (config, _) = read_config(&paths.config)?;
     status_from_config(&paths, &config, &handler)
+}
+
+/// Ask Codex whether the installed VSParallel handlers are enabled and trusted.
+///
+/// Trust is recorded against Codex's own handler hash, so VSParallel uses the
+/// app-server's `hooks/list` result instead of duplicating that private hash.
+pub fn codex_hook_review_status(
+    codex_home: &Path,
+    executable: &Path,
+    codex_command: &OsStr,
+) -> Result<CodexHookReviewStatus, String> {
+    let paths = IntegrationPaths::new(codex_home)?;
+    let handler = managed_handler(executable)?;
+    let cwd = codex_home
+        .to_str()
+        .ok_or_else(|| "the Codex home path is not valid Unicode".to_string())?;
+    let result = crate::usage::codex_app_server_request(
+        codex_command,
+        "hooks/list",
+        serde_json::json!({"cwds": [cwd]}),
+    )?;
+    hook_review_status_from_response(&paths, &handler, &result)
 }
 
 /// Install or migrate VSParallel's three lifecycle hooks.
@@ -731,9 +760,95 @@ fn status_from_states(
             .into_iter()
             .map(|(event, state)| (event.to_string(), state.as_str().to_string()))
             .collect(),
-        trust_review_required: state == "installed",
         message: message.to_string(),
     })
+}
+
+fn hook_review_status_from_response(
+    paths: &IntegrationPaths,
+    handler: &Value,
+    result: &Value,
+) -> Result<CodexHookReviewStatus, String> {
+    let entries = result
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Codex returned no hook status data".to_string())?;
+    let expected_commands: Vec<_> = ["command", "commandWindows"]
+        .into_iter()
+        .filter_map(|key| handler.get(key).and_then(Value::as_str))
+        .collect();
+    if expected_commands.len() != 2 {
+        return Err("the VSParallel hook commands could not be compared".to_string());
+    }
+    let expected_source_path = comparable_hook_source_path(&paths.config)
+        .ok_or_else(|| "the VSParallel hook source path could not be compared".to_string())?;
+
+    let mut matching = BTreeMap::new();
+    for hook in entries
+        .iter()
+        .filter_map(|entry| entry.get("hooks").and_then(Value::as_array))
+        .flatten()
+    {
+        let Some(object) = hook.as_object() else {
+            continue;
+        };
+        let Some(event) = object.get("eventName").and_then(Value::as_str) else {
+            continue;
+        };
+        if !["userPromptSubmit", "stop", "sessionEnd"].contains(&event)
+            || object.get("handlerType").and_then(Value::as_str) != Some("command")
+            || object.get("source").and_then(Value::as_str) != Some("user")
+            || object.get("statusMessage").and_then(Value::as_str) != Some(MANAGED_STATUS_MESSAGE)
+            || object
+                .get("command")
+                .and_then(Value::as_str)
+                .is_none_or(|command| !expected_commands.contains(&command))
+            || object.get("timeoutSec").and_then(Value::as_u64) != Some(HOOK_TIMEOUT_SECONDS)
+            || object
+                .get("sourcePath")
+                .and_then(Value::as_str)
+                .and_then(|path| comparable_hook_source_path(Path::new(path)))
+                .as_ref()
+                != Some(&expected_source_path)
+        {
+            continue;
+        }
+        if matching.insert(event, object).is_some() {
+            return Err(format!("Codex returned duplicate {event} hook status"));
+        }
+    }
+
+    let mut review_required = false;
+    for event in ["userPromptSubmit", "stop", "sessionEnd"] {
+        let hook = matching
+            .get(event)
+            .ok_or_else(|| format!("Codex did not report the installed {event} handler"))?;
+        let enabled = hook
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| format!("Codex returned invalid {event} enablement status"))?;
+        let trust = hook
+            .get("trustStatus")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("Codex returned invalid {event} trust status"))?;
+        match trust {
+            "trusted" | "managed" if enabled => {}
+            "trusted" | "managed" | "untrusted" | "modified" => review_required = true,
+            _ => return Err(format!("Codex returned an unknown {event} trust status")),
+        }
+    }
+
+    Ok(if review_required {
+        CodexHookReviewStatus::ReviewRequired
+    } else {
+        CodexHookReviewStatus::Trusted
+    })
+}
+
+fn comparable_hook_source_path(path: &Path) -> Option<PathBuf> {
+    fs::canonicalize(path)
+        .ok()
+        .or_else(|| lexical_normalize_absolute(path))
 }
 
 fn ensure_backup(path: &Path, original: &[u8]) -> Result<bool, String> {
@@ -1244,6 +1359,31 @@ mod tests {
         (code, String::from_utf8(output).unwrap())
     }
 
+    fn hooks_list_result(home: &Path, executable: &Path) -> Value {
+        let handler = managed_handler(executable).unwrap();
+        #[cfg(windows)]
+        let command = handler["commandWindows"].clone();
+        #[cfg(not(windows))]
+        let command = handler["command"].clone();
+        let hooks: Vec<_> = ["userPromptSubmit", "stop", "sessionEnd"]
+            .into_iter()
+            .map(|event| {
+                json!({
+                    "eventName": event,
+                    "handlerType": "command",
+                    "command": command.clone(),
+                    "timeoutSec": HOOK_TIMEOUT_SECONDS,
+                    "statusMessage": MANAGED_STATUS_MESSAGE,
+                    "sourcePath": home.join(HOOKS_FILENAME),
+                    "source": "user",
+                    "enabled": true,
+                    "trustStatus": "trusted"
+                })
+            })
+            .collect();
+        json!({"data": [{"cwd": home, "hooks": hooks, "warnings": [], "errors": []}]})
+    }
+
     #[test]
     fn sha256_matches_standard_vectors() {
         assert_eq!(
@@ -1603,6 +1743,67 @@ mod tests {
         assert!(!status.installed);
         assert_eq!(status.event_states["Stop"], "current");
         assert_eq!(status.event_states["SessionEnd"], "missing");
+    }
+
+    #[test]
+    fn app_server_status_confirms_all_current_hooks_are_trusted() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("codex");
+        let executable = executable(temp.path());
+        let paths = IntegrationPaths::new(&home).unwrap();
+        let handler = managed_handler(&executable).unwrap();
+        let response = hooks_list_result(&home, &executable);
+
+        assert_eq!(
+            hook_review_status_from_response(&paths, &handler, &response).unwrap(),
+            CodexHookReviewStatus::Trusted
+        );
+
+        let unnormalized_paths =
+            IntegrationPaths::new(&temp.path().join("nested/../codex")).unwrap();
+        assert_eq!(
+            hook_review_status_from_response(&unnormalized_paths, &handler, &response).unwrap(),
+            CodexHookReviewStatus::Trusted
+        );
+    }
+
+    #[test]
+    fn app_server_status_requires_review_for_untrusted_modified_or_disabled_hook() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("codex");
+        let executable = executable(temp.path());
+        let paths = IntegrationPaths::new(&home).unwrap();
+        let handler = managed_handler(&executable).unwrap();
+
+        for (field, value) in [
+            ("trustStatus", json!("untrusted")),
+            ("trustStatus", json!("modified")),
+            ("enabled", json!(false)),
+        ] {
+            let mut response = hooks_list_result(&home, &executable);
+            response["data"][0]["hooks"][1][field] = value;
+            assert_eq!(
+                hook_review_status_from_response(&paths, &handler, &response).unwrap(),
+                CodexHookReviewStatus::ReviewRequired
+            );
+        }
+    }
+
+    #[test]
+    fn app_server_status_rejects_unknown_or_incomplete_hook_metadata() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("codex");
+        let executable = executable(temp.path());
+        let paths = IntegrationPaths::new(&home).unwrap();
+        let handler = managed_handler(&executable).unwrap();
+
+        let mut unknown = hooks_list_result(&home, &executable);
+        unknown["data"][0]["hooks"][0]["trustStatus"] = json!("future-status");
+        assert!(hook_review_status_from_response(&paths, &handler, &unknown).is_err());
+
+        let mut incomplete = hooks_list_result(&home, &executable);
+        incomplete["data"][0]["hooks"].as_array_mut().unwrap().pop();
+        assert!(hook_review_status_from_response(&paths, &handler, &incomplete).is_err());
     }
 
     #[test]

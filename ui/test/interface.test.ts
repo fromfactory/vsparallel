@@ -239,6 +239,99 @@ test("usage normalization selects the limiting window and bounds last-known fall
   assert.equal(fullyExpired.remainingPercent, null);
 });
 
+test("workspace activity preserves the backend's distinct no-activity label", () => {
+  const javascript = read("ui/generated/app.js");
+  const functions = [
+    "isObject",
+    "asString",
+    "asFiniteNumber",
+    "asTimestamp",
+    "asNullableBoolean",
+    "normalizeStateToken",
+    "describeActivityState",
+    "normalizeActivityView",
+  ].map((name) => appFunction(javascript, name)).join("\n");
+  const context = {} as {
+    normalizeActivityView(value: unknown): { label: string; kind: string };
+  };
+  vm.runInNewContext(
+    `const MAX_JAVASCRIPT_TIMESTAMP_MS = 8_640_000_000_000_000; ${functions}`,
+    context,
+  );
+
+  const initial = context.normalizeActivityView({
+    state: "unknown",
+    label: "No activity yet",
+    detail: "Submit a prompt from this workspace.",
+  });
+  assert.equal(initial.kind, "unknown");
+  assert.equal(initial.label, "No activity yet");
+  assert.equal(context.normalizeActivityView({ state: "unknown" }).label, "Unknown");
+});
+
+test("legacy companion heartbeats give an actionable IDE extension status", () => {
+  const javascript = read("ui/generated/app.js");
+  const context = {} as {
+    describeExtensionPresence(value: {
+      extensionDetectionAvailable: boolean | null;
+      extensionInstalled: boolean | null;
+      extensionActive: boolean | null;
+    }): { state: string; label: string; title: string };
+  };
+  vm.runInNewContext(appFunction(javascript, "describeExtensionPresence"), context);
+
+  const legacy = context.describeExtensionPresence({
+    extensionDetectionAvailable: null,
+    extensionInstalled: null,
+    extensionActive: null,
+  });
+  assert.equal(legacy.label, "Reload VS Code for IDE status");
+  assert.match(legacy.title, /Developer: Reload Window/);
+
+  const unavailable = context.describeExtensionPresence({
+    extensionDetectionAvailable: false,
+    extensionInstalled: false,
+    extensionActive: false,
+  });
+  assert.equal(unavailable.label, "IDE extension status unavailable");
+
+  const missing = context.describeExtensionPresence({
+    extensionDetectionAvailable: true,
+    extensionInstalled: false,
+    extensionActive: false,
+  });
+  assert.equal(missing.label, "IDE extension not installed");
+});
+
+test("Codex setup keeps review guidance separate from installed status", () => {
+  const javascript = read("ui/generated/app.js");
+  const functions = [
+    "isObject",
+    "asString",
+    "asNullableBoolean",
+    "normalizeStateToken",
+    "normalizeIntegrationComponent",
+  ].map((name) => appFunction(javascript, name)).join("\n");
+  const context = {} as {
+    normalizeIntegrationComponent(value: unknown, kind: string): {
+      installed: boolean;
+      reviewRequired: boolean | null;
+    };
+  };
+  vm.runInNewContext(functions, context);
+
+  const trusted = context.normalizeIntegrationComponent({
+    state: "installed",
+    reviewRequired: false,
+  }, "codex");
+  assert.equal(trusted.installed, true);
+  assert.equal(trusted.reviewRequired, false);
+  assert.equal(context.normalizeIntegrationComponent({
+    state: "installed",
+    reviewRequired: true,
+  }, "codex").reviewRequired, true);
+});
+
 test("the interface uses the reference icon on every in-app brand surface", () => {
   const html = read("ui/index.html");
   assert.match(html, /<link\b(?=[^>]*rel="icon")(?=[^>]*href="vsparallel-icon\.png")[^>]*>/i);
@@ -409,6 +502,7 @@ test("platform, tray, UI, and companion icon assets use the complete size set", 
 
 test("setup and diagnostics uses the compact neutral visual language of the main screen", () => {
   const html = read("ui/index.html");
+  const javascript = read("ui/generated/app.js");
   const css = read("ui/styles.css");
 
   assert.doesNotMatch(html, /settings-dialog__title-icon/);
@@ -441,6 +535,13 @@ test("setup and diagnostics uses the compact neutral visual language of the main
     css,
     /\.monitor-diagnostics\s*\{[^}]*border-top:\s*1px solid var\(--border\)[^}]*background:\s*transparent[^}]*box-shadow:\s*none/s,
   );
+  assert.match(javascript, /status\.codex\.reviewRequired === true/);
+  assert.doesNotMatch(javascript, /codexTrustGuidance\.hidden = !status\.codex\.installed/);
+  assert.match(
+    javascript,
+    /addEventListener\("focus",\s*\(\) => \{[\s\S]*?isDialogOpen\(elements\.settingsDialog\)[\s\S]*?refreshIntegrationStatus\(\)/,
+  );
+  assert.match(html, /review and trust or re-enable the\s+VSParallel handlers/i);
 });
 
 test("workspace rows use a transparent native full-card action without visible Open text", () => {
