@@ -70,6 +70,11 @@ fn main() {
         Some(argument) if argument == std::ffi::OsStr::new("claude-hook") => {
             std::process::exit(vsparallel_lib::run_claude_hook_stdio());
         }
+        Some(argument)
+            if argument == std::ffi::OsStr::new(vsparallel_lib::CLAUDE_STATUSLINE_ARGUMENT) =>
+        {
+            std::process::exit(vsparallel_lib::run_claude_statusline_stdio());
+        }
         _ => {}
     }
     prepare_desktop_environment();

@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const test = require("node:test");
+const vm = require("node:vm");
 
 const repository = path.resolve(__dirname, "../..");
 
@@ -13,6 +14,14 @@ function read(relativePath) {
 
 function readBuffer(relativePath) {
   return fs.readFileSync(path.join(repository, relativePath));
+}
+
+function appFunction(source, name) {
+  const match = source.match(
+    new RegExp(`^  function ${name}\\([^\\n]*\\) \\{[\\s\\S]*?^  \\}`, "m"),
+  );
+  assert.ok(match, `${name} should be independently testable`);
+  return match[0];
 }
 
 function pngMetadata(relativePath) {
@@ -74,6 +83,127 @@ test("the main chrome omits redundant labels while retaining an accessible works
     1,
     "the workspace count should have one canonical location",
   );
+});
+
+test("global Codex and Claude usage meters emphasize remaining capacity", () => {
+  const html = read("ui/index.html");
+  const css = read("ui/styles.css");
+  const javascript = read("ui/app.js");
+  const overview = html.match(
+    /<section\b(?=[^>]*class="[^"]*\busage-overview\b[^"]*")[^>]*>[\s\S]*?<\/section>/i,
+  )?.[0];
+  assert.ok(overview, "a global usage overview should exist outside workspace rows");
+  assert.match(overview, /id="usageHeading"[^>]*>\s*Usage remaining\s*</i);
+  assert.match(overview, /\baria-busy="true"/i);
+  assert.equal(Array.from(overview.matchAll(/\bdata-provider="(?:codex|claude)"/g)).length, 2);
+
+  for (const [provider, label] of [["codex", "Codex"], ["claude", "Claude"]]) {
+    const card = overview.match(
+      new RegExp(`<article\\b(?=[^>]*data-provider="${provider}")[\\s\\S]*?<\\/article>`, "i"),
+    )?.[0];
+    assert.ok(card, `${label} should have one usage card`);
+    assert.match(card, new RegExp(`>\\s*${label}\\s*<`, "i"));
+    assert.match(card, /\bdata-state="checking"/i);
+    assert.match(card, /\baria-describedby="(?:codex|claude)UsageDetail"/i);
+    assert.match(card, /class="usage-card__state"[^>]*hidden[^>]*>\s*Stale\s*</i);
+    assert.match(card, /class="usage-meter"[^>]*aria-hidden="true"/i);
+    assert.doesNotMatch(card, /\brole="meter"/i);
+  }
+
+  assert.match(
+    css,
+    /\.usage-grid\s*\{[^}]*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\)/s,
+  );
+  assert.match(css, /\.usage-card__value\s*\{[^}]*font-variant-numeric:\s*tabular-nums/s);
+  assert.match(css, /\.usage-meter__fill\s*\{[^}]*width:\s*calc\(var\(--usage-remaining\)\s*\*\s*1%\)/s);
+  assert.match(css, /\.usage-card\[data-level="warning"\][^{]*\{[^}]*var\(--amber\)/s);
+  assert.match(css, /\.usage-card\[data-level="critical"\][^{]*\{[^}]*var\(--red\)/s);
+  assert.match(css, /\.usage-card\[data-state="stale"\][^{}]*\.usage-meter__fill\s*\{/s);
+  assert.match(css, /\.usage-card__state\s*\{[^}]*text-transform:\s*uppercase/s);
+  assert.match(javascript, /invoke\("get_usage",\s*\{\}\)/);
+  assert.match(javascript, /textContent\s*=\s*`\$\{roundedRemaining\}% left`/);
+  assert.match(javascript, /setAttribute\("role",\s*"meter"\)/);
+  assert.match(javascript, /removeAttribute\("role"\)/);
+  assert.match(javascript, /removeAttribute\("aria-valuenow"\)/);
+  assert.match(javascript, /remaining\$\{stale \? " \(last known\)" : ""\}/);
+  assert.match(javascript, /USAGE_REFRESH_INTERVAL_MS\s*=\s*60_000/);
+
+  const asFiniteNumber = javascript.match(
+    /function asFiniteNumber\(value, fallback = null\) \{[\s\S]*?^  \}/m,
+  )?.[0];
+  const asPercentage = javascript.match(
+    /function asPercentage\(value\) \{[\s\S]*?^  \}/m,
+  )?.[0];
+  assert.ok(asFiniteNumber && asPercentage, "percentage normalization should be independently testable");
+  const context = {};
+  vm.runInNewContext(`${asFiniteNumber}\n${asPercentage}`, context);
+  assert.equal(context.asPercentage(null), null);
+  assert.equal(context.asPercentage("42"), null);
+  assert.equal(context.asPercentage(-8), 0);
+  assert.equal(context.asPercentage(108), 100);
+  assert.equal(context.asPercentage(42.5), 42.5);
+});
+
+test("usage normalization selects the limiting window and bounds last-known fallback", () => {
+  const javascript = read("ui/app.js");
+  const functions = [
+    "isObject",
+    "asString",
+    "asFiniteNumber",
+    "asTimestamp",
+    "asPercentage",
+    "normalizeStateToken",
+    "usageWindowLabel",
+    "normalizeUsageWindow",
+    "normalizeUsageProvider",
+    "usageProviderWithFallback",
+  ].map((name) => appFunction(javascript, name)).join("\n");
+  const context = {};
+  vm.runInNewContext(
+    `const MAX_JAVASCRIPT_TIMESTAMP_MS = 8_640_000_000_000_000;
+     const USAGE_LAST_KNOWN_MAX_AGE_MS = 15 * 60_000;
+     ${functions}`,
+    context,
+  );
+
+  const previous = context.normalizeUsageProvider({
+    state: "available",
+    updatedAtMs: 1_000,
+    windows: [
+      {
+        label: "5-hour limit",
+        durationMinutes: 300,
+        remainingPercent: 60,
+        resetsAtMs: 200_000,
+      },
+      {
+        label: "7-day limit",
+        durationMinutes: 10_080,
+        remainingPercent: 18,
+        resetsAtMs: 400_000,
+      },
+    ],
+  }, "Codex");
+  assert.equal(previous.remainingPercent, 18);
+  assert.equal(previous.windowLabel, "7-day limit");
+  assert.equal(previous.resetsAtMs, 400_000);
+
+  const unavailable = context.normalizeUsageProvider({
+    state: "unavailable",
+    detail: "Open Codex and sign in to view limits.",
+  }, "Codex");
+  const fallback = context.usageProviderWithFallback(unavailable, previous, 2_000);
+  assert.equal(fallback.state, "stale");
+  assert.equal(fallback.remainingPercent, 18);
+  assert.equal(fallback.detail, "Open Codex and sign in to view limits.");
+
+  const partiallyExpired = context.usageProviderWithFallback(unavailable, previous, 250_000);
+  assert.equal(partiallyExpired.windows.length, 1);
+  assert.equal(partiallyExpired.windowLabel, "7-day limit");
+
+  const fullyExpired = context.usageProviderWithFallback(unavailable, previous, 500_000);
+  assert.equal(fullyExpired.state, "unavailable");
+  assert.equal(fullyExpired.remainingPercent, null);
 });
 
 test("the interface uses the reference icon on every in-app brand surface", () => {

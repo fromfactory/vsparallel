@@ -48,5 +48,11 @@
         ]
       }
     ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "'/ABSOLUTE/PATH/TO/vsparallel' claude-usage",
+    "padding": 0,
+    "refreshInterval": 60
   }
 }

@@ -3,6 +3,8 @@
 
   const SCHEMA_VERSION = 1;
   const REFRESH_INTERVAL_MS = 3_000;
+  const USAGE_REFRESH_INTERVAL_MS = 60_000;
+  const USAGE_LAST_KNOWN_MAX_AGE_MS = 15 * 60_000;
   const LAUNCH_TRANSITION_MIN_MS = 750;
   const THEME_STORAGE_KEY = "vsparallel.appearance";
   const THEME_PREFERENCES = new Set(["system", "light", "dark"]);
@@ -24,6 +26,18 @@
     maximizeButton: document.querySelector("#maximizeButton"),
     closeButton: document.querySelector("#closeButton"),
     workspaceCount: document.querySelector("#workspaceCount"),
+    usageOverview: document.querySelector("#usageOverview"),
+    usageStatus: document.querySelector("#usageStatus"),
+    codexUsage: document.querySelector("#codexUsage"),
+    codexUsageValue: document.querySelector("#codexUsageValue"),
+    codexUsageState: document.querySelector("#codexUsageState"),
+    codexUsageMeter: document.querySelector("#codexUsageMeter"),
+    codexUsageDetail: document.querySelector("#codexUsageDetail"),
+    claudeUsage: document.querySelector("#claudeUsage"),
+    claudeUsageValue: document.querySelector("#claudeUsageValue"),
+    claudeUsageState: document.querySelector("#claudeUsageState"),
+    claudeUsageMeter: document.querySelector("#claudeUsageMeter"),
+    claudeUsageDetail: document.querySelector("#claudeUsageDetail"),
     workspaceList: document.querySelector("#workspaceList"),
     errorBanner: document.querySelector("#errorBanner"),
     errorText: document.querySelector("#errorText"),
@@ -79,6 +93,7 @@
 
   const state = {
     refreshPending: false,
+    usagePending: false,
     diagnosticsPending: false,
     diagnosticsLoaded: false,
     diagnosticsUnavailable: false,
@@ -92,6 +107,8 @@
     pendingUninstall: null,
     openingInstanceId: null,
     lastGoodSnapshot: null,
+    lastUsage: null,
+    lastUsageAttemptAtMs: null,
     windowChrome: null,
     windowChromeRequestId: 0,
     windowChromeRefreshTimer: null,
@@ -122,6 +139,11 @@
     return number !== null && number >= 0 && number <= MAX_JAVASCRIPT_TIMESTAMP_MS
       ? number
       : fallback;
+  }
+
+  function asPercentage(value) {
+    const number = asFiniteNumber(value);
+    return number === null ? null : Math.min(100, Math.max(0, number));
   }
 
   function asNullableBoolean(value) {
@@ -353,6 +375,159 @@
     };
   }
 
+  function usageWindowLabel(durationMinutes, fallback = "Usage limit") {
+    if (durationMinutes === 300) {
+      return "5-hour limit";
+    }
+    if (durationMinutes === 10_080) {
+      return "7-day limit";
+    }
+    if (Number.isFinite(durationMinutes) && durationMinutes > 0) {
+      if (durationMinutes % 1_440 === 0) {
+        const days = durationMinutes / 1_440;
+        return `${days}-day limit`;
+      }
+      if (durationMinutes % 60 === 0) {
+        const hours = durationMinutes / 60;
+        return `${hours}-hour limit`;
+      }
+      return `${durationMinutes}-minute limit`;
+    }
+    return fallback;
+  }
+
+  function normalizeUsageWindow(rawValue) {
+    const raw = isObject(rawValue) ? rawValue : {};
+    const usedPercent = asPercentage(raw.usedPercent);
+    const suppliedRemaining = asPercentage(raw.remainingPercent);
+    const remainingPercent = suppliedRemaining ?? (
+      usedPercent === null ? null : 100 - usedPercent
+    );
+    if (remainingPercent === null) {
+      return null;
+    }
+
+    const durationMinutes = asFiniteNumber(raw.durationMinutes)
+      ?? asFiniteNumber(raw.windowDurationMins);
+    return {
+      label: asString(
+        raw.label ?? raw.kind,
+        usageWindowLabel(durationMinutes),
+      ),
+      durationMinutes,
+      usedPercent: usedPercent ?? 100 - remainingPercent,
+      remainingPercent,
+      resetsAtMs: asTimestamp(raw.resetsAtMs),
+    };
+  }
+
+  function normalizeUsageProvider(rawValue, providerName) {
+    const raw = isObject(rawValue) ? rawValue : {};
+    const windows = Array.isArray(raw.windows)
+      ? raw.windows.map(normalizeUsageWindow).filter(Boolean)
+      : [];
+    const limitingWindow = windows.reduce(
+      (current, candidate) => !current || candidate.remainingPercent < current.remainingPercent
+        ? candidate
+        : current,
+      null,
+    );
+    const suppliedRemaining = asPercentage(
+      raw.summaryRemainingPercent ?? raw.remainingPercent,
+    );
+    const remainingPercent = suppliedRemaining ?? limitingWindow?.remainingPercent ?? null;
+    const rawState = normalizeStateToken(raw.state);
+    const available = remainingPercent !== null
+      && !["unavailable", "unsupported", "not_authenticated", "unknown"].includes(rawState);
+
+    return {
+      providerName,
+      state: available ? (rawState === "stale" ? "stale" : "available") : "unavailable",
+      remainingPercent: available ? remainingPercent : null,
+      windowLabel: asString(
+        raw.summaryWindowLabel ?? raw.windowLabel,
+        limitingWindow?.label || "Usage limit",
+      ),
+      resetsAtMs: asTimestamp(raw.summaryResetsAtMs ?? raw.resetsAtMs, limitingWindow?.resetsAtMs),
+      updatedAtMs: asTimestamp(raw.updatedAtMs ?? raw.capturedAtMs),
+      detail: asString(raw.detail),
+      windows,
+    };
+  }
+
+  function normalizeUsageSnapshot(rawValue) {
+    const raw = parseBridgeValue(rawValue);
+    if (!isObject(raw) || raw.schemaVersion !== SCHEMA_VERSION) {
+      throw new Error("The local monitor returned unsupported usage data.");
+    }
+
+    return {
+      schemaVersion: raw.schemaVersion,
+      generatedAtMs: asTimestamp(raw.generatedAtMs, Date.now()),
+      codex: normalizeUsageProvider(raw.codex, "Codex"),
+      claude: normalizeUsageProvider(raw.claude, "Claude"),
+    };
+  }
+
+  function usageProviderWithFallback(current, previous, nowMs) {
+    if (!previous || current.remainingPercent !== null || previous.remainingPercent === null) {
+      return current;
+    }
+
+    if (!Number.isFinite(previous.updatedAtMs)) {
+      return current;
+    }
+    const ageMs = nowMs - previous.updatedAtMs;
+    if (ageMs < 0 || ageMs > USAGE_LAST_KNOWN_MAX_AGE_MS) {
+      return current;
+    }
+
+    const windows = previous.windows.filter(
+      (window) => !Number.isFinite(window.resetsAtMs) || window.resetsAtMs > nowMs,
+    );
+    if (previous.windows.length && !windows.length) {
+      return current;
+    }
+
+    const limitingWindow = windows.reduce(
+      (selected, candidate) => !selected
+          || candidate.remainingPercent < selected.remainingPercent
+        ? candidate
+        : selected,
+      null,
+    );
+    return {
+      ...previous,
+      state: "stale",
+      remainingPercent: limitingWindow?.remainingPercent ?? previous.remainingPercent,
+      windowLabel: limitingWindow?.label || previous.windowLabel,
+      resetsAtMs: limitingWindow ? limitingWindow.resetsAtMs : previous.resetsAtMs,
+      detail: current.detail || "Provider refresh failed; showing the last known value.",
+      windows,
+    };
+  }
+
+  function resolveUsageSnapshot(current, previous, nowMs = Date.now()) {
+    if (!previous) {
+      return current;
+    }
+    return {
+      ...current,
+      codex: usageProviderWithFallback(current.codex, previous.codex, nowMs),
+      claude: usageProviderWithFallback(current.claude, previous.claude, nowMs),
+    };
+  }
+
+  function unavailableUsageSnapshot(detail) {
+    const unavailable = normalizeUsageProvider({ detail }, "Provider");
+    return {
+      schemaVersion: SCHEMA_VERSION,
+      generatedAtMs: Date.now(),
+      codex: { ...unavailable, providerName: "Codex" },
+      claude: { ...unavailable, providerName: "Claude" },
+    };
+  }
+
   function deriveName(path) {
     if (!path) {
       return "";
@@ -415,6 +590,18 @@
       minute: "2-digit",
       second: "2-digit",
     }).format(new Date(timestamp));
+  }
+
+  function formatResetTime(timestamp) {
+    if (!Number.isFinite(timestamp)) {
+      return "reset time unavailable";
+    }
+    const includeWeekday = timestamp - Date.now() > 24 * 60 * 60 * 1_000;
+    return `resets ${new Intl.DateTimeFormat(undefined, {
+      ...(includeWeekday ? { weekday: "short" } : {}),
+      hour: "numeric",
+      minute: "2-digit",
+    }).format(new Date(timestamp))}`;
   }
 
   function createElement(tag, className, text) {
@@ -636,6 +823,112 @@
     }
   }
 
+  function usageElements(kind) {
+    return kind === "codex"
+      ? {
+          card: elements.codexUsage,
+          value: elements.codexUsageValue,
+          stateLabel: elements.codexUsageState,
+          meter: elements.codexUsageMeter,
+          detail: elements.codexUsageDetail,
+        }
+      : {
+          card: elements.claudeUsage,
+          value: elements.claudeUsageValue,
+          stateLabel: elements.claudeUsageState,
+          meter: elements.claudeUsageMeter,
+          detail: elements.claudeUsageDetail,
+        };
+  }
+
+  function usageLevel(remainingPercent) {
+    if (remainingPercent <= 10) {
+      return "critical";
+    }
+    if (remainingPercent <= 25) {
+      return "warning";
+    }
+    return "normal";
+  }
+
+  function renderUsageProvider(kind, provider) {
+    const target = usageElements(kind);
+    const available = provider.remainingPercent !== null;
+    const stale = available && provider.state === "stale";
+    target.card.dataset.state = available ? (stale ? "stale" : "available") : "unavailable";
+    target.stateLabel.hidden = !stale;
+
+    if (!available) {
+      delete target.card.dataset.level;
+      target.card.style.setProperty("--usage-remaining", "0");
+      target.value.textContent = "—";
+      target.detail.textContent = provider.detail || "Usage unavailable";
+      target.meter.removeAttribute("role");
+      target.meter.removeAttribute("aria-label");
+      target.meter.removeAttribute("aria-valuemin");
+      target.meter.removeAttribute("aria-valuemax");
+      target.meter.removeAttribute("aria-valuenow");
+      target.meter.removeAttribute("aria-valuetext");
+      target.meter.setAttribute("aria-hidden", "true");
+      target.card.title = provider.detail || `${provider.providerName} usage is unavailable.`;
+      return provider.detail
+        ? `${provider.providerName} usage unavailable: ${provider.detail}`
+        : `${provider.providerName} usage unavailable`;
+    }
+
+    const roundedRemaining = Math.round(provider.remainingPercent);
+    const resetLabel = formatResetTime(provider.resetsAtMs);
+    const updateLabel = Number.isFinite(provider.updatedAtMs)
+      ? formatRelativeTime(provider.updatedAtMs).toLowerCase()
+      : "";
+    const detailParts = [provider.windowLabel, resetLabel];
+    if (stale) {
+      detailParts.push("last known value");
+    }
+    target.card.dataset.level = usageLevel(provider.remainingPercent);
+    target.card.style.setProperty("--usage-remaining", provider.remainingPercent.toFixed(2));
+    target.value.textContent = `${roundedRemaining}% left`;
+    target.detail.textContent = detailParts.join(" · ");
+    target.meter.removeAttribute("aria-hidden");
+    target.meter.setAttribute("role", "meter");
+    target.meter.setAttribute("aria-label", `${provider.providerName} usage remaining`);
+    target.meter.setAttribute("aria-valuemin", "0");
+    target.meter.setAttribute("aria-valuemax", "100");
+    target.meter.setAttribute("aria-valuenow", provider.remainingPercent.toFixed(1));
+    target.meter.setAttribute(
+      "aria-valuetext",
+      [
+        `${roundedRemaining}% remaining on the ${provider.windowLabel.toLowerCase()}`,
+        resetLabel,
+        stale ? "last known value" : "",
+        stale ? provider.detail : "",
+      ].filter(Boolean).join("; "),
+    );
+    const windowDescriptions = provider.windows.map((window) => {
+      const remaining = Math.round(window.remainingPercent);
+      return `${window.label}: ${remaining}% remaining, ${formatResetTime(window.resetsAtMs)}`;
+    });
+    target.card.title = [
+      `${provider.providerName}: ${roundedRemaining}% remaining on the ${provider.windowLabel.toLowerCase()}`,
+      resetLabel,
+      ...windowDescriptions,
+      updateLabel,
+      provider.detail,
+    ].filter(Boolean).join(" · ");
+    return `${provider.providerName} ${roundedRemaining}% remaining${stale ? " (last known)" : ""}`;
+  }
+
+  function renderUsageSnapshot(snapshot) {
+    const summaries = [
+      renderUsageProvider("codex", snapshot.codex),
+      renderUsageProvider("claude", snapshot.claude),
+    ];
+    const summary = summaries.join(". ");
+    if (elements.usageStatus.textContent !== summary) {
+      elements.usageStatus.textContent = summary;
+    }
+  }
+
   function showNotice(message, kind = "error") {
     elements.errorText.textContent = message;
     elements.errorBanner.hidden = false;
@@ -648,6 +941,17 @@
     elements.errorText.textContent = "";
     elements.errorBanner.classList.add("notice--error");
     elements.errorBanner.classList.remove("notice--warning");
+  }
+
+  function updateRefreshControl() {
+    const pending = state.refreshPending || state.usagePending;
+    elements.refreshButton.disabled = pending;
+    elements.refreshButton.setAttribute("aria-busy", String(pending));
+    elements.refreshButton.classList.toggle("is-loading", pending);
+    elements.usageOverview.setAttribute(
+      "aria-busy",
+      String(state.usagePending || !state.lastUsage),
+    );
   }
 
   function readableError(error, fallback) {
@@ -876,9 +1180,7 @@
     }
 
     state.refreshPending = true;
-    elements.refreshButton.disabled = true;
-    elements.refreshButton.setAttribute("aria-busy", "true");
-    elements.refreshButton.classList.add("is-loading");
+    updateRefreshControl();
     if (!state.lastGoodSnapshot) {
       elements.workspaceList.setAttribute("aria-busy", "true");
     }
@@ -902,10 +1204,44 @@
       }
     } finally {
       state.refreshPending = false;
-      elements.refreshButton.disabled = false;
-      elements.refreshButton.setAttribute("aria-busy", "false");
-      elements.refreshButton.classList.remove("is-loading");
+      updateRefreshControl();
     }
+  }
+
+  async function refreshUsage() {
+    if (state.usagePending) {
+      return;
+    }
+
+    state.usagePending = true;
+    state.lastUsageAttemptAtMs = Date.now();
+    updateRefreshControl();
+    try {
+      let current;
+      try {
+        const raw = await invoke("get_usage", {});
+        current = normalizeUsageSnapshot(raw);
+      } catch (_error) {
+        current = unavailableUsageSnapshot("Could not refresh provider usage.");
+      }
+      const usage = resolveUsageSnapshot(current, state.lastUsage);
+      state.lastUsage = usage;
+      renderUsageSnapshot(usage);
+    } finally {
+      state.usagePending = false;
+      updateRefreshControl();
+    }
+  }
+
+  function refreshUsageIfDue() {
+    if (!Number.isFinite(state.lastUsageAttemptAtMs)
+        || Date.now() - state.lastUsageAttemptAtMs >= USAGE_REFRESH_INTERVAL_MS) {
+      refreshUsage();
+    }
+  }
+
+  function refreshAll() {
+    return Promise.allSettled([refreshSnapshot(), refreshUsage()]);
   }
 
   function updateWorkspaceOpeningState(instanceId, opening) {
@@ -1625,7 +1961,7 @@
       if (isDialogOpen(elements.settingsDialog)) {
         refreshSetup();
       } else {
-        refreshSnapshot();
+        refreshAll();
       }
       return;
     }
@@ -1645,7 +1981,7 @@
     }
   }
 
-  elements.refreshButton.addEventListener("click", refreshSnapshot);
+  elements.refreshButton.addEventListener("click", refreshAll);
   elements.emptyRefreshButton.addEventListener("click", refreshSnapshot);
   elements.restoreFullButton.addEventListener("click", restoreFullWindow);
   elements.hidePanelButton.addEventListener("click", hideFloatingPanel);
@@ -1702,6 +2038,7 @@
   window.addEventListener("focus", () => {
     document.documentElement.dataset.windowFocused = "true";
     refreshSnapshot();
+    refreshUsageIfDue();
     scheduleWindowChromeRefresh();
   });
   window.addEventListener("blur", () => {
@@ -1721,6 +2058,7 @@
   refreshWindowChromeState();
   applyThemePreference(state.themePreference, false);
   refreshIntegrationStatus();
-  refreshSnapshot();
+  refreshAll();
   window.setInterval(refreshSnapshot, REFRESH_INTERVAL_MS);
+  window.setInterval(refreshUsage, USAGE_REFRESH_INTERVAL_MS);
 })();

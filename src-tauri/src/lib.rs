@@ -4,9 +4,11 @@ mod companion_integration;
 mod opener;
 mod state;
 mod tray;
+mod usage;
 
 pub use claude_integration::run_claude_hook_stdio;
 pub use codex_integration::run_codex_hook_stdio;
+pub use usage::{run_claude_statusline_stdio, CLAUDE_STATUSLINE_ARGUMENT};
 
 use companion_integration::{CompanionOperationResult, CompanionStatus, CompanionStatusState};
 use opener::{code_command, open_with, ProcessWorkspaceLauncher, WorkspaceLaunchMode};
@@ -151,6 +153,11 @@ struct IntegrationStatusView {
 #[tauri::command]
 async fn get_snapshot() -> Result<Snapshot, String> {
     run_background(current_snapshot).await
+}
+
+#[tauri::command]
+async fn get_usage() -> Result<usage::UsageSnapshot, String> {
+    run_background(|| Ok(usage::get_usage_snapshot())).await
 }
 
 fn current_snapshot() -> Result<Snapshot, String> {
@@ -1851,6 +1858,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_snapshot,
+            get_usage,
             get_diagnostics,
             get_integration_status,
             install_companion,

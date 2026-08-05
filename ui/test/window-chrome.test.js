@@ -247,6 +247,30 @@ test("floating mode is compact translucent glass with an opaque fallback", () =>
     css,
     /data-window-mode="floating"\][^{}]*\.activity-providers\s*\{[^}]*display:\s*none/,
   );
+  assert.match(
+    css,
+    /data-window-mode="floating"\][^{}]*\.usage-overview\s*\{[^}]*padding:\s*5px 6px 6px/,
+  );
+  assert.doesNotMatch(
+    css,
+    /data-window-mode="floating"\][^{}]*\.usage-overview\s*\{[^}]*display:\s*none/,
+  );
+  assert.match(
+    css,
+    /data-window-mode="floating"\][^{}]*\.usage-card__state\s*\{[^}]*font-size:\s*6px/,
+  );
+  assert.doesNotMatch(
+    css,
+    /data-window-mode="floating"\][^{}]*\.usage-card__state\s*\{[^}]*display:\s*none/,
+  );
+  assert.doesNotMatch(
+    css,
+    /data-window-mode="floating"\][^{}]*\.usage-card__detail\s*\{[^}]*display:\s*none/,
+  );
+  assert.match(
+    css,
+    /@media \(max-height:\s*300px\)[\s\S]*?data-window-mode="floating"\][^{}]*\.empty-state__mark,[\s\S]*?data-window-mode="floating"\][^{}]*\.empty-state p\s*\{[^}]*display:\s*none/,
+  );
   assert.match(css, /@supports not \(\(backdrop-filter:/);
   assert.match(css, /@media \(prefers-reduced-transparency: reduce\)/);
   assert.match(

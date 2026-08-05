@@ -113,6 +113,63 @@ Both adapters map only documented lifecycle events:
 Each adapter hashes the provider session ID and does not retain the raw session
 ID or turn ID.
 
+## Claude Code usage record (schema version 1)
+
+Claude Code usage is provider-global rather than workspace- or session-specific.
+When the Claude integration owns the user's `statusLine` setting, Claude Code
+runs VSParallel's local capture command every 60 seconds and supplies its
+documented status-line JSON on standard input. VSParallel extracts only the
+five-hour and weekly percentage/reset fields and atomically replaces
+`usage/claude.json`:
+
+```json
+{
+  "schemaVersion": 1,
+  "capturedAtMs": 1785800000000,
+  "fiveHour": {
+    "usedPercent": 23.5,
+    "resetsAtMs": 1785803600000
+  },
+  "sevenDay": {
+    "usedPercent": 41.2,
+    "resetsAtMs": 1786404800000
+  }
+}
+```
+
+`fiveHour` and `sevenDay` are independently optional because Claude Code can
+omit either window. `resetsAtMs` is also optional. At least one valid window is
+required before the record is replaced. `usedPercent` is bounded to 0–100; the
+UI derives `remainingPercent` as `100 - usedPercent` and uses the lowest
+remaining value as the provider's compact summary.
+
+Records older than 15 minutes are presented as stale. Individual windows that
+have passed their reset times are omitted; when no unexpired window remains,
+Claude usage is unavailable until a fresh value is captured. Missing,
+oversized, malformed, future-dated, wrong-version, symlinked, or otherwise
+unusable records are ignored. If the user already has a custom Claude Code
+`statusLine`, VSParallel does not replace or wrap it, so this file is not
+refreshed and Claude usage is reported as unavailable or stale.
+
+## Live Codex usage (not persisted)
+
+Codex usage does not have an on-disk record. Every 60 seconds, and on an
+explicit refresh, VSParallel starts the installed Codex executable's
+`app-server` and requests the signed-in account's documented rate-limit view.
+For each valid primary or secondary window, the UI-safe response contains the
+percentage used, the percentage remaining, the provider-defined window
+duration, and the optional reset time. The compact card uses the lowest
+remaining percentage so it cannot overstate available capacity.
+
+The Codex subprocess owns authentication and any provider connection.
+VSParallel never reads Codex credentials or writes the response to the state
+directory. If the executable is not installed, does not support `app-server`,
+is signed out, times out, or returns no valid windows, Codex usage is reported
+as unavailable. The UI may retain a recent, unexpired last-known value in memory
+for up to 15 minutes and marks it as stale; it is never written to disk.
+`VSPARALLEL_CODEX_COMMAND` can select a different executable; otherwise
+VSParallel runs `codex` from `PATH`.
+
 ## Privacy invariant
 
 No record may contain prompt text, assistant output, source text, terminal
@@ -120,5 +177,9 @@ content, Git diffs, tool inputs/output, transcript paths/content, credentials,
 or machine identifiers. The companion records only the public extension
 presence booleans shown above; it never reads extension exports or private
 state. The lifecycle adapters receive richer documented hook payloads but
-create new five-field objects and discard the input before writing. Automated
-Rust and JavaScript tests assert these boundaries.
+create new five-field objects and discard the input before writing. The Claude
+status-line adapter likewise creates the minimal usage record shown above and
+does not represent or persist the accompanying session ID, working directory,
+model, cost, repository data, or transcript path. Codex usage remains in memory
+only, and VSParallel never reads or stores provider credentials.
+Automated Rust and JavaScript tests assert these boundaries.

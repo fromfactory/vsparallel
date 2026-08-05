@@ -156,6 +156,72 @@
         <time id="updatedAt"></time>
       </div>
 
+      <section
+        class="usage-overview"
+        id="usageOverview"
+        aria-labelledby="usageHeading"
+        aria-busy="true"
+      >
+        <h2 class="sr-only" id="usageHeading">Usage remaining</h2>
+        <div class="usage-grid">
+          <article
+            class="usage-card"
+            id="codexUsage"
+            data-provider="codex"
+            data-state="checking"
+            aria-labelledby="codexUsageName"
+            aria-describedby="codexUsageDetail"
+          >
+            <div class="usage-card__identity">
+              <svg class="usage-card__icon" viewBox="0 0 20 20" aria-hidden="true">
+                <path d="M6.1 2.8h7.8l3.9 7.2-3.9 7.2H6.1L2.2 10l3.9-7.2Z" />
+                <path d="m7.1 10 2 2 4-4.3" />
+              </svg>
+              <span class="usage-card__name" id="codexUsageName">Codex</span>
+              <span class="usage-card__state" id="codexUsageState" hidden>Stale</span>
+            </div>
+            <strong class="usage-card__value" id="codexUsageValue">…</strong>
+            <div
+              class="usage-meter"
+              id="codexUsageMeter"
+              aria-hidden="true"
+            >
+              <span class="usage-meter__fill" id="codexUsageFill"></span>
+            </div>
+            <span class="usage-card__detail" id="codexUsageDetail">Checking usage…</span>
+          </article>
+
+          <article
+            class="usage-card"
+            id="claudeUsage"
+            data-provider="claude"
+            data-state="checking"
+            aria-labelledby="claudeUsageName"
+            aria-describedby="claudeUsageDetail"
+          >
+            <div class="usage-card__identity">
+              <svg class="usage-card__icon" viewBox="0 0 20 20" aria-hidden="true">
+                <path d="M10 2.3v15.4M3.3 6.1l13.4 7.8M3.3 13.9l13.4-7.8" />
+              </svg>
+              <span class="usage-card__name" id="claudeUsageName">Claude</span>
+              <span class="usage-card__state" id="claudeUsageState" hidden>Stale</span>
+            </div>
+            <strong class="usage-card__value" id="claudeUsageValue">…</strong>
+            <div
+              class="usage-meter"
+              id="claudeUsageMeter"
+              aria-hidden="true"
+            >
+              <span class="usage-meter__fill" id="claudeUsageFill"></span>
+            </div>
+            <span class="usage-card__detail" id="claudeUsageDetail">Checking usage…</span>
+          </article>
+        </div>
+        <p class="sr-only" id="usageStatus" role="status" aria-live="polite">
+          Checking provider usage.
+        </p>
+      </section>
+
       <main>
         <section class="workspace-section" aria-labelledby="workspaceHeading">
           <h2 class="sr-only" id="workspaceHeading">Workspaces</h2>

@@ -24,7 +24,9 @@ const EVENTS: [&str; 4] = ["UserPromptSubmit", "Stop", "StopFailure", "SessionEn
 const SETTINGS_FILENAME: &str = "settings.json";
 const BACKUP_FILENAME: &str = "settings.json.vsparallel.bak";
 const HOOK_ARGUMENT: &str = "claude-hook";
+const USAGE_ARGUMENT: &str = crate::usage::CLAUDE_STATUSLINE_ARGUMENT;
 const HOOK_TIMEOUT_SECONDS: u64 = 2;
+const USAGE_REFRESH_SECONDS: u64 = 60;
 const SCHEMA_VERSION: u32 = 1;
 const MAX_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_HOOK_INPUT_BYTES: usize = 1024 * 1024;
@@ -49,6 +51,25 @@ enum EventState {
     Missing,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UsageCaptureState {
+    Current,
+    Stale,
+    Missing,
+    Conflict,
+}
+
+impl UsageCaptureState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Stale => "stale",
+            Self::Missing => "missing",
+            Self::Conflict => "conflict",
+        }
+    }
+}
+
 impl EventState {
     fn as_str(self) -> &'static str {
         match self {
@@ -68,6 +89,7 @@ pub struct ClaudeIntegrationStatus {
     pub config_path: String,
     pub backup_path: String,
     pub event_states: BTreeMap<String, String>,
+    pub usage_capture_state: String,
     pub hooks_disabled: bool,
     pub message: String,
 }
@@ -127,8 +149,9 @@ pub fn claude_integration_status(
 ) -> Result<ClaudeIntegrationStatus, String> {
     let paths = IntegrationPaths::new(claude_config_dir)?;
     let handler = managed_handler(executable)?;
+    let usage_handler = managed_usage_status_line(executable)?;
     let (config, _) = read_config(&paths.config)?;
-    status_from_config(&paths, &config, &handler)
+    status_from_config(&paths, &config, &handler, &usage_handler)
 }
 
 /// Install or repair VSParallel's four Claude Code lifecycle hooks.
@@ -139,15 +162,22 @@ pub fn install_claude_integration(
     let paths = IntegrationPaths::new(claude_config_dir)?;
     validate_install_executable(executable)?;
     let handler = managed_handler(executable)?;
+    let usage_handler = managed_usage_status_line(executable)?;
     let (mut config, original) = read_config(&paths.config)?;
 
     let states = event_states(&config, &handler)?;
+    let usage_state = usage_capture_state(&config, &usage_handler);
     let hooks_disabled = hooks_disabled(&config)?;
-    if states.values().all(|state| *state == EventState::Current) {
+    if states.values().all(|state| *state == EventState::Current)
+        && matches!(
+            usage_state,
+            UsageCaptureState::Current | UsageCaptureState::Conflict
+        )
+    {
         return Ok(ClaudeIntegrationChange {
             changed: false,
             migrated: false,
-            status: status_from_states(&paths, states, hooks_disabled),
+            status: status_from_states(&paths, states, usage_state, hooks_disabled),
         });
     }
 
@@ -169,6 +199,14 @@ pub fn install_claude_integration(
         hooks.insert(event.to_string(), Value::Array(filtered));
     }
 
+    if matches!(
+        usage_state,
+        UsageCaptureState::Missing | UsageCaptureState::Stale
+    ) {
+        migrated |= usage_state == UsageCaptureState::Stale;
+        config.insert("statusLine".to_string(), usage_handler);
+    }
+
     ensure_backup(&paths.backup, &original)?;
     atomic_write_json(&paths.config, &config)?;
     let status = claude_integration_status(claude_config_dir, executable)?;
@@ -186,6 +224,7 @@ pub fn uninstall_claude_integration(
 ) -> Result<ClaudeIntegrationChange, String> {
     let paths = IntegrationPaths::new(claude_config_dir)?;
     let handler = managed_handler(executable)?;
+    let usage_handler = managed_usage_status_line(executable)?;
     let (mut config, original) = read_config(&paths.config)?;
 
     // Validate first, so malformed settings cannot cause a partial uninstall.
@@ -204,12 +243,20 @@ pub fn uninstall_claude_integration(
         }
     }
 
+    if matches!(
+        usage_capture_state(&config, &usage_handler),
+        UsageCaptureState::Current | UsageCaptureState::Stale
+    ) {
+        config.remove("statusLine");
+        changed = true;
+    }
+
     if changed {
         ensure_backup(&paths.backup, &original)?;
         atomic_write_json(&paths.config, &config)?;
     }
 
-    let status = status_from_config(&paths, &config, &handler)?;
+    let status = status_from_config(&paths, &config, &handler, &usage_handler)?;
     Ok(ClaudeIntegrationChange {
         changed,
         migrated: false,
@@ -325,6 +372,41 @@ fn managed_handler(executable: &Path) -> Result<Value, String> {
         "args": [HOOK_ARGUMENT],
         "timeout": HOOK_TIMEOUT_SECONDS,
     }))
+}
+
+fn managed_usage_status_line(executable: &Path) -> Result<Value, String> {
+    if !executable.is_absolute() {
+        return Err("the VSParallel usage executable must be an absolute path".to_string());
+    }
+    let executable = executable
+        .to_str()
+        .ok_or_else(|| "the VSParallel usage executable path is not valid Unicode".to_string())?;
+    if executable.contains(['\0', '\n', '\r']) {
+        return Err("the VSParallel usage executable path contains unsafe characters".to_string());
+    }
+
+    Ok(serde_json::json!({
+        "type": "command",
+        "command": usage_status_line_command(executable),
+        "padding": 0,
+        "refreshInterval": USAGE_REFRESH_SECONDS,
+    }))
+}
+
+#[cfg(not(windows))]
+fn usage_status_line_command(executable: &str) -> String {
+    format!("{} {USAGE_ARGUMENT}", quote_posix(executable))
+}
+
+#[cfg(not(windows))]
+fn quote_posix(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+#[cfg(windows)]
+fn usage_status_line_command(executable: &str) -> String {
+    let executable = executable.replace('\\', "/").replace('\'', "''");
+    format!("powershell -NoProfile -NonInteractive -Command \"& '{executable}' {USAGE_ARGUMENT}\"")
 }
 
 fn validate_install_executable(executable: &Path) -> Result<(), String> {
@@ -563,14 +645,79 @@ fn without_owned_handlers(groups: Vec<Value>, current: &Value) -> (Vec<Value>, b
     (filtered_groups, changed)
 }
 
+fn usage_capture_state(config: &Map<String, Value>, current: &Value) -> UsageCaptureState {
+    let Some(candidate) = config.get("statusLine") else {
+        return UsageCaptureState::Missing;
+    };
+    if candidate == current {
+        return UsageCaptureState::Current;
+    }
+    if is_stale_usage_status_line(candidate) {
+        UsageCaptureState::Stale
+    } else {
+        UsageCaptureState::Conflict
+    }
+}
+
+fn is_stale_usage_status_line(candidate: &Value) -> bool {
+    let Some(object) = candidate.as_object() else {
+        return false;
+    };
+    const ALLOWED_KEYS: [&str; 4] = ["type", "command", "padding", "refreshInterval"];
+    if object.len() > ALLOWED_KEYS.len()
+        || object
+            .keys()
+            .any(|key| !ALLOWED_KEYS.contains(&key.as_str()))
+        || object.get("type").and_then(Value::as_str) != Some("command")
+    {
+        return false;
+    }
+    object
+        .get("command")
+        .and_then(Value::as_str)
+        .is_some_and(command_targets_vsparallel_usage)
+}
+
+fn command_targets_vsparallel_usage(command: &str) -> bool {
+    if command.is_empty()
+        || command.len() > MAX_CWD_BYTES
+        || command.contains(['\0', '\n', '\r', '|', ';'])
+        || !command.contains(USAGE_ARGUMENT)
+    {
+        return false;
+    }
+
+    let lower = command.to_ascii_lowercase();
+    let targets_binary = [
+        "/vsparallel ",
+        "/vsparallel' ",
+        "/vsparallel\" ",
+        "/vsparallel.exe ",
+        "/vsparallel.exe' ",
+        "/vsparallel.exe\" ",
+        "/vsparallel.appimage ",
+        "/vsparallel.appimage' ",
+        "/vsparallel.appimage\" ",
+        "\\vsparallel.exe' ",
+        "\\vsparallel.exe\" ",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+        || lower.contains("/vsparallel-")
+        || lower.contains("/vsparallel_");
+    targets_binary && lower.trim_end_matches('"').ends_with(USAGE_ARGUMENT)
+}
+
 fn status_from_config(
     paths: &IntegrationPaths,
     config: &Map<String, Value>,
     handler: &Value,
+    usage_handler: &Value,
 ) -> Result<ClaudeIntegrationStatus, String> {
     Ok(status_from_states(
         paths,
         event_states(config, handler)?,
+        usage_capture_state(config, usage_handler),
         hooks_disabled(config)?,
     ))
 }
@@ -578,6 +725,7 @@ fn status_from_config(
 fn status_from_states(
     paths: &IntegrationPaths,
     states: BTreeMap<&'static str, EventState>,
+    usage_state: UsageCaptureState,
     hooks_disabled: bool,
 ) -> ClaudeIntegrationStatus {
     let current = states
@@ -605,6 +753,22 @@ fn status_from_states(
         }
         _ => "Claude Code activity monitoring is only partially installed.".to_string(),
     };
+    match usage_state {
+        UsageCaptureState::Current => {
+            message.push_str(" Claude Code usage-limit monitoring is installed.");
+        }
+        UsageCaptureState::Stale => {
+            message.push_str(" Claude Code usage-limit monitoring needs repair.");
+        }
+        UsageCaptureState::Missing => {
+            message.push_str(" Claude Code usage-limit monitoring is not installed.");
+        }
+        UsageCaptureState::Conflict => {
+            message.push_str(
+                " An existing custom Claude Code status line was kept, so VSParallel cannot capture usage limits.",
+            );
+        }
+    }
     if hooks_disabled {
         message.push_str(
             " Claude Code's disableAllHooks setting is true, so no lifecycle activity can be received.",
@@ -620,6 +784,7 @@ fn status_from_states(
             .into_iter()
             .map(|(event, state)| (event.to_string(), state.as_str().to_string()))
             .collect(),
+        usage_capture_state: usage_state.as_str().to_string(),
         hooks_disabled,
         message,
     }
@@ -1262,6 +1427,7 @@ mod tests {
         assert!(result.changed);
         assert!(!result.migrated);
         assert!(result.status.installed);
+        assert_eq!(result.status.usage_capture_state, "current");
         assert_eq!(fs::read(home.join(BACKUP_FILENAME)).unwrap(), original);
 
         let installed = parse_config(&home);
@@ -1281,6 +1447,13 @@ mod tests {
             assert_eq!(handler["timeout"], 2);
             assert_eq!(handler.as_object().unwrap().len(), 4);
         }
+        assert_eq!(installed["statusLine"]["type"], "command");
+        assert!(installed["statusLine"]["command"]
+            .as_str()
+            .unwrap()
+            .contains("claude-usage"));
+        assert_eq!(installed["statusLine"]["padding"], 0);
+        assert_eq!(installed["statusLine"]["refreshInterval"], 60);
 
         let backup = fs::read(home.join(BACKUP_FILENAME)).unwrap();
         let second = install_claude_integration(&home, &executable).unwrap();
@@ -1328,6 +1501,60 @@ mod tests {
     }
 
     #[test]
+    fn custom_status_line_is_preserved_without_claiming_usage_capture() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("claude");
+        let custom = json!({
+            "type": "command",
+            "command": "/usr/local/bin/my-status",
+            "padding": 2
+        });
+        write_json(
+            &home.join(SETTINGS_FILENAME),
+            &json!({"statusLine": custom}),
+        );
+        let executable = executable(temp.path());
+
+        let installed = install_claude_integration(&home, &executable).unwrap();
+        assert!(installed.changed);
+        assert!(installed.status.installed);
+        assert_eq!(installed.status.usage_capture_state, "conflict");
+        assert_eq!(parse_config(&home)["statusLine"], custom);
+
+        let second = install_claude_integration(&home, &executable).unwrap();
+        assert!(!second.changed);
+        assert_eq!(parse_config(&home)["statusLine"], custom);
+
+        let removed = uninstall_claude_integration(&home, &executable).unwrap();
+        assert!(removed.changed);
+        assert_eq!(parse_config(&home)["statusLine"], custom);
+    }
+
+    #[test]
+    fn stale_owned_usage_status_line_is_repaired() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("claude");
+        write_json(
+            &home.join(SETTINGS_FILENAME),
+            &json!({"statusLine": {
+                "type": "command",
+                "command": "'/old/vsparallel' claude-usage",
+                "padding": 0,
+                "refreshInterval": 30
+            }}),
+        );
+        let executable = executable(temp.path());
+        let result = install_claude_integration(&home, &executable).unwrap();
+        assert!(result.changed);
+        assert!(result.migrated);
+        assert_eq!(result.status.usage_capture_state, "current");
+        assert!(parse_config(&home)["statusLine"]["command"]
+            .as_str()
+            .unwrap()
+            .contains(executable.to_string_lossy().as_ref()));
+    }
+
+    #[test]
     fn handlers_with_extra_fields_or_non_vsparallel_commands_are_not_owned() {
         let current = managed_handler(Path::new("/new/vsparallel")).unwrap();
         let extra = json!({
@@ -1363,6 +1590,7 @@ mod tests {
         assert!(!result.status.installed);
         assert_eq!(fs::read(home.join(BACKUP_FILENAME)).unwrap(), backup_before);
         let remaining = parse_config(&home);
+        assert!(remaining.get("statusLine").is_none());
         assert_eq!(remaining["hooks"]["Stop"][0]["matcher"], "keep");
         assert_eq!(
             remaining["hooks"]["Stop"][0]["hooks"][0]["command"],
@@ -1427,6 +1655,7 @@ mod tests {
         assert!(status.hooks_disabled);
         assert_eq!(status.event_states["Stop"], "current");
         assert_eq!(status.event_states["StopFailure"], "missing");
+        assert_eq!(status.usage_capture_state, "missing");
         assert!(status.message.contains("disableAllHooks"));
     }
 
