@@ -32,6 +32,10 @@ working directory, and discard all unselected fields. See
 Build macOS and Windows packages on native runners. Production signing and
 notarization are not configured yet.
 
+The macOS glass panel uses Tauri's transparent-window private API. This is
+compatible with the project's direct DMG distribution, but not with Mac App
+Store submission.
+
 See the [release and download guide](docs/releases.md) for the tag-based release
 process, exact files to download, and current signing warnings.
 
@@ -60,10 +64,19 @@ hooks add coarse **Activity detected**, **Turn finished**,
 **Failed/interrupted**, and **Unknown** states. Extension activation alone is
 never presented as active work.
 
-Use a workspace card to open its exact target in a new VS Code window, or use
-the tray menu to ask VS Code to activate an active target. Closing the main
-window hides it when the tray is available; choose **Quit VSParallel** from the
-tray menu to stop the application.
+Use a workspace card to ask VS Code to open or activate its exact target.
+VSParallel then stays available as a compact always-on-top panel: choose another
+workspace, restore the full window, or temporarily hide the panel. The panel
+uses native vibrancy on macOS and acrylic blur on supported Windows versions;
+Linux uses a compositor-friendly translucent surface when native background
+blur is unavailable. A short non-focusing visibility check follows delayed VS
+Code activation so the panel remains available when an existing editor window
+is on another virtual desktop. On macOS it requests the native auxiliary
+full-screen Space behavior; on Windows it follows the verified foreground
+editor with the public virtual-desktop API.
+The tray menu can also activate an active target. Closing the full window hides
+it when the tray is available; choose **Quit VSParallel** from the tray menu to
+stop the application.
 
 ### Installed components
 
@@ -155,8 +168,9 @@ From the repository root:
 ./scripts/run-dev.sh
 ```
 
-The script also removes VS Code Snap-specific GTK/GIO environment settings when
-necessary. The equivalent direct command is:
+The script removes VS Code Snap-specific GTK/GIO environment settings before
+Cargo starts. VSParallel repeats that cleanup at application startup, so the
+equivalent direct command is also safe from a VS Code Snap integrated terminal:
 
 ```bash
 cargo run --locked --bin vsparallel

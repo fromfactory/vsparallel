@@ -37,6 +37,32 @@
 
         <div class="header-actions" role="group" aria-label="Application actions">
           <button
+            class="icon-button floating-panel-button"
+            id="restoreFullButton"
+            type="button"
+            title="Restore full VSParallel window"
+            aria-label="Restore full VSParallel window"
+            data-tauri-drag-region="false"
+            hidden
+          >
+            <svg class="button-icon" viewBox="0 0 16 16" aria-hidden="true">
+              <path d="M5.25 2.75h-2.5v2.5M10.75 2.75h2.5v2.5M13.25 10.75v2.5h-2.5M5.25 13.25h-2.5v-2.5" />
+            </svg>
+          </button>
+          <button
+            class="icon-button floating-panel-button"
+            id="hidePanelButton"
+            type="button"
+            title="Hide floating panel"
+            aria-label="Hide floating panel"
+            data-tauri-drag-region="false"
+            hidden
+          >
+            <svg class="button-icon" viewBox="0 0 16 16" aria-hidden="true">
+              <path d="M3.25 10.75h9.5" />
+            </svg>
+          </button>
+          <button
             class="quiet-button"
             id="refreshButton"
             type="button"

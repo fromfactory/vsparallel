@@ -12,6 +12,7 @@
         "center": true,
         "resizable": true,
         "decorations": true,
+        "transparent": true,
         "titleBarStyle": "Transparent",
         "hiddenTitle": true,
         "fullscreen": false,

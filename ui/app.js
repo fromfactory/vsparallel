@@ -15,6 +15,8 @@
     connectionText: document.querySelector("#connectionText"),
     updatedAt: document.querySelector("#updatedAt"),
     refreshButton: document.querySelector("#refreshButton"),
+    restoreFullButton: document.querySelector("#restoreFullButton"),
+    hidePanelButton: document.querySelector("#hidePanelButton"),
     hideButton: document.querySelector("#hideButton"),
     appTitlebar: document.querySelector("#appTitlebar"),
     titlebarDragRegion: document.querySelector("#titlebarDragRegion"),
@@ -91,7 +93,7 @@
     openingInstanceId: null,
     lastGoodSnapshot: null,
     windowChrome: null,
-    windowChromePending: false,
+    windowChromeRequestId: 0,
     windowChromeRefreshTimer: null,
     themePreference: initialThemePreference,
   };
@@ -574,15 +576,16 @@
     row.append(providers);
 
     const openButton = createElement("button", "open-button");
+    const actionLabel = workspace.active ? "Switch to" : "Open";
     openButton.type = "button";
     openButton.dataset.instanceId = workspace.instanceId;
     openButton.disabled = !openable;
-    openButton.setAttribute("aria-label", `Open ${workspace.name} in VS Code`);
+    openButton.setAttribute("aria-label", `${actionLabel} ${workspace.name} in VS Code`);
     openButton.setAttribute("aria-busy", String(opening));
     if (!workspace.openable) {
       openButton.title = "This workspace cannot currently be opened";
     } else {
-      openButton.title = `Open ${workspace.name} in VS Code`;
+      openButton.title = `${actionLabel} ${workspace.name} in VS Code`;
     }
     openButton.addEventListener("click", () => openWorkspace(workspace));
     row.append(openButton);
@@ -727,6 +730,7 @@
       maximized: raw.maximized === true,
       fullscreen: raw.fullscreen === true,
       focused: raw.focused !== false,
+      floating: raw.floating === true,
     };
   }
 
@@ -739,6 +743,7 @@
       maximized: false,
       fullscreen: false,
       focused: document.hasFocus(),
+      floating: false,
     };
   }
 
@@ -748,9 +753,13 @@
     document.documentElement.dataset.windowFocused = String(chrome.focused);
     document.documentElement.dataset.windowMaximized = String(chrome.maximized);
     document.documentElement.dataset.windowFullscreen = String(chrome.fullscreen);
+    document.documentElement.dataset.windowMode = chrome.floating ? "floating" : "full";
+
+    elements.restoreFullButton.hidden = !chrome.floating;
+    elements.hidePanelButton.hidden = !chrome.floating;
 
     elements.windowControls.hidden = !chrome.customControls;
-    if (chrome.customControls) {
+    if (chrome.customControls || chrome.floating) {
       elements.appTitlebar.setAttribute("data-tauri-drag-region", "deep");
       elements.titlebarDragRegion.setAttribute("data-tauri-drag-region", "deep");
     } else {
@@ -771,21 +780,33 @@
     elements.maximizeButton.querySelector(".restore-icon").hidden = !restore;
   }
 
-  async function refreshWindowChromeState() {
-    if (state.windowChromePending) {
-      return;
-    }
+  function advanceWindowChromeRequestId() {
+    state.windowChromeRequestId += 1;
+    return state.windowChromeRequestId;
+  }
 
-    state.windowChromePending = true;
+  function isCurrentWindowChromeRequest(requestId) {
+    return requestId === state.windowChromeRequestId;
+  }
+
+  function commitWindowChromeState(raw) {
+    // Invalidate focus/resize refreshes that began before an explicit window command. Otherwise
+    // a late pre-launch response can overwrite the authoritative floating-panel result.
+    advanceWindowChromeRequestId();
+    renderWindowChromeState(normalizeWindowChromeState(raw));
+  }
+
+  async function refreshWindowChromeState() {
+    const requestId = advanceWindowChromeRequestId();
     try {
       const raw = await invoke("get_window_chrome_state", {});
-      renderWindowChromeState(normalizeWindowChromeState(raw));
+      if (isCurrentWindowChromeRequest(requestId)) {
+        renderWindowChromeState(normalizeWindowChromeState(raw));
+      }
     } catch (_error) {
-      if (!state.windowChrome) {
+      if (isCurrentWindowChromeRequest(requestId) && !state.windowChrome) {
         renderWindowChromeState(fallbackWindowChromeState());
       }
-    } finally {
-      state.windowChromePending = false;
     }
   }
 
@@ -926,9 +947,11 @@
       if (result === false || (isObject(result) && result.ok === false)) {
         throw new Error(asString(result?.error, "VS Code did not accept the open request."));
       }
+      commitWindowChromeState(result);
       await transitionDelay;
     } catch (error) {
       showNotice(readableError(error, `Could not open ${workspace.name} in VS Code.`));
+      await refreshWindowChromeState();
     } finally {
       finishWorkspaceLaunch(workspace.instanceId);
     }
@@ -1489,6 +1512,35 @@
     }
   }
 
+  async function hideFloatingPanel() {
+    elements.hidePanelButton.disabled = true;
+    elements.hidePanelButton.setAttribute("aria-busy", "true");
+    try {
+      await invoke("hide_window", {});
+    } catch (error) {
+      showNotice(readableError(error, "Could not hide the floating panel."));
+    } finally {
+      elements.hidePanelButton.disabled = false;
+      elements.hidePanelButton.setAttribute("aria-busy", "false");
+    }
+  }
+
+  async function restoreFullWindow() {
+    elements.restoreFullButton.disabled = true;
+    elements.restoreFullButton.setAttribute("aria-busy", "true");
+    try {
+      const raw = await invoke("restore_full_window", {});
+      commitWindowChromeState(raw);
+      scheduleWindowChromeRefresh();
+    } catch (error) {
+      showNotice(readableError(error, "Could not restore the full VSParallel window."));
+      await refreshWindowChromeState();
+    } finally {
+      elements.restoreFullButton.setAttribute("aria-busy", "false");
+      elements.restoreFullButton.disabled = false;
+    }
+  }
+
   async function toggleWindowMaximize() {
     if (elements.maximizeButton.disabled) {
       return;
@@ -1498,7 +1550,7 @@
     elements.maximizeButton.setAttribute("aria-busy", "true");
     try {
       const raw = await invoke("toggle_window_maximize", {});
-      renderWindowChromeState(normalizeWindowChromeState(raw));
+      commitWindowChromeState(raw);
       scheduleWindowChromeRefresh();
     } catch (error) {
       showNotice(readableError(error, "Could not maximize or restore VSParallel."));
@@ -1588,12 +1640,15 @@
     } else if (isDialogOpen(elements.settingsDialog)) {
       closeSettingsDialog();
     } else {
-      hideWindow();
+      const hideAction = state.windowChrome?.floating ? hideFloatingPanel : hideWindow;
+      hideAction();
     }
   }
 
   elements.refreshButton.addEventListener("click", refreshSnapshot);
   elements.emptyRefreshButton.addEventListener("click", refreshSnapshot);
+  elements.restoreFullButton.addEventListener("click", restoreFullWindow);
+  elements.hidePanelButton.addEventListener("click", hideFloatingPanel);
   elements.hideButton.addEventListener("click", hideWindow);
   elements.maximizeButton.addEventListener("click", toggleWindowMaximize);
   elements.closeButton.addEventListener("click", closeWindow);

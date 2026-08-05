@@ -300,6 +300,8 @@ test("workspace rows use a transparent native full-card action without visible O
   );
   assert.doesNotMatch(createRow, /\.textContent\s*=\s*["']Open["']/);
   assert.match(createRow, /setAttribute\(\s*["']aria-label["']/);
+  assert.match(createRow, /workspace\.active \? "Switch to" : "Open"/);
+  assert.match(createRow, /`\$\{actionLabel\} \$\{workspace\.name\} in VS Code`/);
 
   const openButtonCss = cssBlocksMatching(css, /\.open-button\b/);
   assert.match(openButtonCss, /position\s*:\s*absolute/i);
@@ -386,7 +388,7 @@ test("workspace launching exposes live glass feedback", () => {
   );
 });
 
-test("workspace launches never auto-minimize VSParallel", () => {
+test("workspace switches compact VSParallel without minimizing it", () => {
   const library = read("src-tauri/src/lib.rs");
   const tray = read("src-tauri/src/tray.rs");
   const openWorkspace = sliceBetween(
@@ -413,6 +415,18 @@ test("workspace launches never auto-minimize VSParallel", () => {
   assert.ok(trayWorkspaceStart >= 0 && trayWorkspaceEnd > trayWorkspaceStart);
   const trayWorkspace = menuHandler.slice(trayWorkspaceStart, trayWorkspaceEnd);
   assert.match(openWorkspace, /open_with\s*\(/);
+  assert.match(openWorkspace, /enter_floating_panel\s*\(/);
+  assert.match(openWorkspace, /find_active_open_target\s*\(/);
+  assert.match(openWorkspace, /WorkspaceLaunchMode::PreferExisting/);
+  assert.match(openWorkspace, /WorkspaceLaunchMode::NewWindow/);
+  assert.match(library, /wait_for_restored_window_state\s*\(/);
+  assert.match(library, /wait_for_floating_panel_ready\s*\(/);
+  assert.match(library, /set_visible_on_all_workspaces\(true\)/);
+  assert.match(openWorkspace, /schedule_floating_panel_watchdog\s*\(/);
+  assert.ok(
+    openWorkspace.indexOf("enter_floating_panel") < openWorkspace.indexOf("open_with"),
+    "the native panel must be ready before VS Code can switch desktops",
+  );
   assert.doesNotMatch(openWorkspace, /\.minimize\s*\(/);
   assert.doesNotMatch(trayWorkspace, /\.minimize\s*\(/);
   assert.match(hideWindow, /\.minimize\s*\(/);
