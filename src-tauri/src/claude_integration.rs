@@ -1471,7 +1471,7 @@ mod tests {
         let home = temp.path().join("claude");
         let old = json!({
             "type": "command",
-            "command": "/old/VSParallel",
+            "command": "/Volumes/VSParallel/VSParallel.app/Contents/MacOS/vsparallel",
             "args": ["claude-hook"],
             "timeout": 5
         });
@@ -1500,6 +1500,7 @@ mod tests {
 
         let installed = parse_config(&home);
         let text = installed.to_string();
+        assert!(!text.contains("/Volumes/VSParallel"));
         assert!(!text.contains("\"timeout\":5"));
         assert!(text.contains("different-mode"));
     }

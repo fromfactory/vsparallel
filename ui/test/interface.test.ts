@@ -276,7 +276,8 @@ test("legacy companion heartbeats give an actionable IDE extension status", () =
       extensionDetectionAvailable: boolean | null;
       extensionInstalled: boolean | null;
       extensionActive: boolean | null;
-    }): { state: string; label: string; title: string };
+      extensionRemote: boolean | null;
+    }, remoteWindow?: boolean): { state: string; label: string; title: string };
   };
   vm.runInNewContext(appFunction(javascript, "describeExtensionPresence"), context);
 
@@ -284,6 +285,7 @@ test("legacy companion heartbeats give an actionable IDE extension status", () =
     extensionDetectionAvailable: null,
     extensionInstalled: null,
     extensionActive: null,
+    extensionRemote: null,
   });
   assert.equal(legacy.label, "Reload VS Code for IDE status");
   assert.match(legacy.title, /Developer: Reload Window/);
@@ -292,6 +294,7 @@ test("legacy companion heartbeats give an actionable IDE extension status", () =
     extensionDetectionAvailable: false,
     extensionInstalled: false,
     extensionActive: false,
+    extensionRemote: null,
   });
   assert.equal(unavailable.label, "IDE extension status unavailable");
 
@@ -299,8 +302,35 @@ test("legacy companion heartbeats give an actionable IDE extension status", () =
     extensionDetectionAvailable: true,
     extensionInstalled: false,
     extensionActive: false,
+    extensionRemote: null,
   });
-  assert.equal(missing.label, "IDE extension not installed");
+  assert.equal(missing.label, "IDE extension not detected · this window/profile");
+
+  const remoteActive = context.describeExtensionPresence({
+    extensionDetectionAvailable: true,
+    extensionInstalled: true,
+    extensionActive: true,
+    extensionRemote: true,
+  }, true);
+  assert.equal(remoteActive.label, "IDE extension active · remote");
+  assert.match(remoteActive.title, /cannot cross the remote host boundary/);
+
+  const remoteUnavailable = context.describeExtensionPresence({
+    extensionDetectionAvailable: false,
+    extensionInstalled: false,
+    extensionActive: false,
+    extensionRemote: null,
+  }, true);
+  assert.equal(remoteUnavailable.label, "IDE extension status unavailable · remote window");
+  assert.match(remoteUnavailable.title, /window\/profile/);
+
+  const remoteInactive = context.describeExtensionPresence({
+    extensionDetectionAvailable: true,
+    extensionInstalled: true,
+    extensionActive: false,
+    extensionRemote: true,
+  }, true);
+  assert.equal(remoteInactive.label, "IDE extension installed · remote · inactive");
 });
 
 test("Codex setup keeps review guidance separate from installed status", () => {
@@ -363,7 +393,7 @@ test("provider names stay complete and the status panel owns most row width", ()
   const css = read("ui/styles.css");
   assert.match(
     javascript,
-    /createProviderState\(\s*"Claude"\s*,\s*workspace\.claude\s*,\s*"Claude Code"\s*\)/,
+    /createProviderState\(\s*"Claude"\s*,\s*workspace\.claude\s*,\s*"Claude Code"\s*,\s*workspace\.remoteWindow\s*\)/,
   );
   assert.doesNotMatch(javascript, /createProviderState\(\s*"Claude Code"\s*,/);
   assert.match(

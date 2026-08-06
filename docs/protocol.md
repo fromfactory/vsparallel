@@ -35,16 +35,19 @@ Stored as `instances/<safe-instance-id>.json`:
   "openTarget": "/work/example-workspace",
   "focused": true,
   "active": true,
+  "remoteWindow": false,
   "agentExtensions": {
     "codex": {
       "available": true,
       "installed": true,
-      "active": true
+      "active": true,
+      "remote": false
     },
     "claude": {
       "available": true,
       "installed": true,
-      "active": false
+      "active": false,
+      "remote": false
     }
   },
   "lastSeenAtMs": 1785800000000,
@@ -56,23 +59,32 @@ Stored as `instances/<safe-instance-id>.json`:
 VSParallel derives liveness only from `lastSeenAtMs`.
 
 `agentExtensions` is additive to schema version 1 and is always included by
-companion version 0.2.0 and later. Each provider entry has exactly three
+companion version 0.2.0 and later. Each provider entry has three status
 booleans:
 
 - `available`: the public VS Code extension lookup succeeded
-- `installed`: the extension was found in this VS Code extension host
+- `installed`: the extension was found for this VS Code window/profile; this
+  does not by itself identify which extension host runs it
 - `active`: VS Code reports that the extension has activated
+- `remote`: added in companion 0.3.0; `true` means the installed extension runs
+  in the remote/workspace extension host, `false` means the local/UI extension
+  host, and `null` means placement is not known or not applicable
 
-When lookup is unavailable or fails, all three values are false. A false
-`available` value distinguishes that case from a successful lookup that
-confirmed the extension is absent.
-Older heartbeats without `agentExtensions` are still valid. Installation and
-activation are not agent lifecycle signals: in particular, `active: true` does
-not mean that Codex or Claude is processing a turn.
+When lookup is unavailable or fails, the three booleans are false and `remote`
+is `null`. A false `available` value distinguishes that case from a successful
+lookup that confirmed the extension is absent. `remoteWindow`, also added in
+companion 0.3.0, says only whether VS Code reports a remote window. It never
+contains the remote name, authority, or host identity.
+Older heartbeats without `agentExtensions`, and 0.2.x heartbeats without the
+placement fields, are still valid. Installation and activation are not agent
+lifecycle signals: in particular, `active: true` does not mean that Codex or
+Claude is processing a turn.
 
 Only local `file` paths are serialized. Remote or virtual workspace URIs and
 their authorities are deliberately omitted; such windows remain listable by
-their VS Code-provided display names but are not openable by VSParallel.
+their VS Code-provided display names but are not openable by VSParallel. The
+desktop app, lifecycle hooks, and live usage subprocesses are machine-local;
+this release has no bridge for reading provider state from a remote host.
 
 ## Lifecycle record (schema version 1)
 
@@ -223,14 +235,16 @@ is signed out, times out, or returns no valid windows, Codex usage is reported
 as unavailable. The UI may retain a recent, unexpired last-known value in memory
 for up to 15 minutes and marks it as stale; it is never written to disk.
 `VSPARALLEL_CODEX_COMMAND` can select a different executable; otherwise
-VSParallel runs `codex` from `PATH`.
+VSParallel tries `codex` from `PATH` and the executable bundled with a locally
+installed Codex VS Code extension. An explicit `VSPARALLEL_CODEX_COMMAND` is
+used literally and does not enable bundled-extension fallback.
 
 ## Privacy invariant
 
 No record may contain prompt text, assistant output, source text, terminal
 content, Git diffs, tool inputs/output, transcript paths/content, credentials,
-or machine identifiers. The companion records only the public extension
-presence booleans shown above; it never reads extension exports or private
+or machine identifiers. The companion records only the public extension status
+and placement fields shown above; it never reads extension exports or private
 state. The lifecycle adapters receive richer documented hook payloads but
 create new five-field objects and discard the input before writing. The Claude
 status-line adapter likewise creates the minimal usage record shown above and

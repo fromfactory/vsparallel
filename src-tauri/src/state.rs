@@ -39,6 +39,8 @@ struct ExtensionPresenceRecord {
     installed: bool,
     #[serde(default)]
     active: bool,
+    #[serde(default)]
+    remote: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -62,6 +64,8 @@ pub(crate) struct InstanceRecord {
     focused: bool,
     #[serde(default)]
     active: bool,
+    #[serde(default)]
+    remote_window: bool,
     agent_extensions: Option<AgentExtensionsRecord>,
     last_seen_at_ms: i64,
     started_at_ms: i64,
@@ -101,6 +105,7 @@ pub struct ActivityView {
     pub extension_detection_available: Option<bool>,
     pub extension_installed: Option<bool>,
     pub extension_active: Option<bool>,
+    pub extension_remote: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -113,6 +118,7 @@ pub struct WorkspaceView {
     pub active: bool,
     pub focused: bool,
     pub recently_active: bool,
+    pub remote_window: bool,
     pub last_seen_at_ms: i64,
     pub started_at_ms: i64,
     pub codex: ActivityView,
@@ -309,6 +315,7 @@ impl StateStore {
             active,
             focused: active && record.focused,
             recently_active: active && record.active,
+            remote_window: record.remote_window,
             last_seen_at_ms: record.last_seen_at_ms,
             started_at_ms: record.started_at_ms,
             codex: aggregate_activity(
@@ -316,6 +323,7 @@ impl StateStore {
                 &workspace_paths,
                 codex_records,
                 codex_extension,
+                record.remote_window,
                 now_ms,
             ),
             claude: aggregate_activity(
@@ -323,6 +331,7 @@ impl StateStore {
                 &workspace_paths,
                 claude_records,
                 claude_extension,
+                record.remote_window,
                 now_ms,
             ),
         }
@@ -632,10 +641,11 @@ fn aggregate_activity(
     workspace_paths: &[PathBuf],
     records: &[ActivityRecord],
     extension: Option<ExtensionPresenceRecord>,
+    remote_window: bool,
     now_ms: i64,
 ) -> ActivityView {
     if workspace_paths.is_empty() {
-        return pathless_activity(provider, extension);
+        return pathless_activity(provider, extension, remote_window);
     }
 
     let mut matching: Vec<&ActivityRecord> = records
@@ -709,7 +719,23 @@ fn aggregate_activity(
     }
 }
 
-fn pathless_activity(provider: &str, extension: Option<ExtensionPresenceRecord>) -> ActivityView {
+fn pathless_activity(
+    provider: &str,
+    extension: Option<ExtensionPresenceRecord>,
+    remote_window: bool,
+) -> ActivityView {
+    if remote_window {
+        return activity_view(
+            "unknown",
+            "Remote workspace",
+            None,
+            format!(
+                "Remote workspace paths are omitted for privacy. This release has no remote bridge for associating {provider} lifecycle signals with this window."
+            ),
+            extension,
+        );
+    }
+
     activity_view(
         "unknown",
         "Workspace path needed",
@@ -756,6 +782,7 @@ fn activity_view(
         extension_detection_available: extension.map(|value| value.available),
         extension_installed: extension.map(|value| value.installed),
         extension_active: extension.map(|value| value.active),
+        extension_remote: extension.and_then(|value| value.remote),
     }
 }
 
@@ -1059,13 +1086,23 @@ mod tests {
 
     #[test]
     fn pathless_workspace_explains_that_activity_cannot_be_associated() {
-        let view = aggregate_activity("Codex", &[], &[], None, 20_000);
+        let view = aggregate_activity("Codex", &[], &[], None, false, 20_000);
         assert_eq!(view.state, "unknown");
         assert_eq!(view.label, "Workspace path needed");
         assert!(view
             .detail
             .contains("Open a local folder or saved workspace"));
         assert!(!view.detail.contains("submit a prompt"));
+    }
+
+    #[test]
+    fn pathless_remote_workspace_explains_the_host_boundary() {
+        let view = aggregate_activity("Claude Code", &[], &[], None, true, 20_000);
+        assert_eq!(view.state, "unknown");
+        assert_eq!(view.label, "Remote workspace");
+        assert!(view.detail.contains("Remote workspace paths are omitted"));
+        assert!(view.detail.contains("no remote bridge"));
+        assert!(!view.detail.contains("Open a local folder"));
     }
 
     #[test]
@@ -1100,9 +1137,10 @@ mod tests {
         fs::create_dir_all(&repo).unwrap();
         let now = 2_000_000;
         let mut heartbeat = instance("repo", &repo, now, true);
+        heartbeat["remoteWindow"] = json!(true);
         heartbeat["agentExtensions"] = json!({
-            "codex": {"available": true, "installed": true, "active": false},
-            "claude": {"available": true, "installed": true, "active": true}
+            "codex": {"available": true, "installed": true, "active": false, "remote": false},
+            "claude": {"available": true, "installed": true, "active": true, "remote": true}
         });
         write_json(&temp.path().join("instances/repo.json"), heartbeat);
         write_json(
@@ -1123,9 +1161,12 @@ mod tests {
         assert_eq!(workspace.claude.extension_detection_available, Some(true));
         assert_eq!(workspace.claude.extension_installed, Some(true));
         assert_eq!(workspace.claude.extension_active, Some(true));
+        assert_eq!(workspace.claude.extension_remote, Some(true));
+        assert!(workspace.remote_window);
         assert_eq!(workspace.codex.state, "unknown");
         assert_eq!(workspace.codex.extension_installed, Some(true));
         assert_eq!(workspace.codex.extension_active, Some(false));
+        assert_eq!(workspace.codex.extension_remote, Some(false));
         assert_eq!(
             store.diagnostics(now, "code".into()).valid_claude_records,
             1

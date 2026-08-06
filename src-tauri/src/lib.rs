@@ -16,6 +16,8 @@ use serde::Serialize;
 use state::{now_ms, Diagnostics, Snapshot, StateStore};
 use std::ffi::OsStr;
 use std::path::PathBuf;
+#[cfg(any(target_os = "macos", test))]
+use std::path::{Component, Path};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 use tauri::window::{Color, Effect, EffectState, EffectsBuilder};
@@ -345,7 +347,8 @@ fn codex_view() -> LifecycleIntegrationView {
                     match codex_integration::codex_hook_review_status(
                         &codex_home,
                         &executable,
-                        codex_command.as_os_str(),
+                        codex_command.executable.as_os_str(),
+                        codex_command.allow_extension_fallback,
                     ) {
                         Ok(codex_integration::CodexHookReviewStatus::Trusted) => (
                             "installed",
@@ -484,7 +487,24 @@ fn integration_executable() -> Result<PathBuf, String> {
 
     let executable = std::env::current_exe()
         .map_err(|error| format!("could not locate the VSParallel executable: {error}"))?;
+    #[cfg(target_os = "macos")]
+    validate_macos_integration_location(&executable)?;
     validate_integration_executable(executable, "current executable")
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn validate_macos_integration_location(path: &Path) -> Result<(), String> {
+    let mounted_volume = path.starts_with(Path::new("/Volumes"));
+    let app_translocation = path.components().any(
+        |component| matches!(component, Component::Normal(value) if value == "AppTranslocation"),
+    );
+    if mounted_volume || app_translocation {
+        return Err(
+            "VSParallel is running from a temporary macOS location. Copy VSParallel.app to /Applications, relaunch it there, then use Repair for both the Codex and Claude Code integrations."
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn validate_integration_executable(path: PathBuf, source: &str) -> Result<PathBuf, String> {
@@ -1962,7 +1982,7 @@ mod tests {
         CompanionStatus {
             state,
             extension_id: companion_integration::EXTENSION_ID.to_string(),
-            bundled_version: Some("0.2.0".to_string()),
+            bundled_version: Some("0.3.0".to_string()),
             installed_version: None,
             detail: None,
         }
@@ -2272,11 +2292,11 @@ mod tests {
     #[test]
     fn maps_companion_states_to_the_versioned_setup_contract() {
         let current = companion_view(CompanionStatus {
-            installed_version: Some("0.2.0".to_string()),
+            installed_version: Some("0.3.0".to_string()),
             ..companion_status(CompanionStatusState::Current)
         });
         assert_eq!(current.state, "installed");
-        assert_eq!(current.target_version.as_deref(), Some("0.2.0"));
+        assert_eq!(current.target_version.as_deref(), Some("0.3.0"));
 
         assert_eq!(
             companion_view(companion_status(CompanionStatusState::DifferentVersion)).state,
@@ -2308,6 +2328,27 @@ mod tests {
             validate_integration_executable(executable.clone(), "test").unwrap(),
             executable
         );
+    }
+
+    #[test]
+    fn macos_hook_installation_rejects_transient_app_locations() {
+        for path in [
+            "/Volumes/VSParallel/VSParallel.app/Contents/MacOS/vsparallel",
+            "/private/var/folders/xy/random/AppTranslocation/UUID/d/VSParallel.app/Contents/MacOS/vsparallel",
+        ] {
+            let error = validate_macos_integration_location(Path::new(path)).unwrap_err();
+            assert!(error.contains("/Applications"));
+            assert!(error.contains("Repair"));
+        }
+
+        assert!(validate_macos_integration_location(Path::new(
+            "/Applications/VSParallel.app/Contents/MacOS/vsparallel"
+        ))
+        .is_ok());
+        assert!(validate_macos_integration_location(Path::new(
+            "/System/Volumes/Data/Applications/VSParallel.app/Contents/MacOS/vsparallel"
+        ))
+        .is_ok());
     }
 
     #[test]

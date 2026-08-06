@@ -75,6 +75,10 @@ function otherUri(scheme, serialized) {
 function fakeVscode(overrides = {}) {
   return {
     version: "1.95.2",
+    ExtensionKind: {
+      UI: 1,
+      Workspace: 2,
+    },
     env: {
       sessionId: "session-1",
       remoteName: undefined,
@@ -229,9 +233,10 @@ test("a single local folder has an exact folder open target", () => {
     openTarget: "/work/example-workspace",
     focused: true,
     active: true,
+    remoteWindow: false,
     agentExtensions: {
-      codex: { available: true, installed: false, active: false },
-      claude: { available: true, installed: false, active: false },
+      codex: { available: true, installed: false, active: false, remote: null },
+      claude: { available: true, installed: false, active: false, remote: null },
     },
     lastSeenAtMs: 2_000,
     startedAtMs: 1_000,
@@ -245,10 +250,10 @@ test("reports installed active and inactive agent extensions without activating 
       getExtension(extensionId) {
         lookups.push(extensionId);
         if (extensionId === AGENT_EXTENSION_IDS.codex) {
-          return { id: extensionId, isActive: true };
+          return { id: extensionId, isActive: true, extensionKind: 2 };
         }
         if (extensionId === AGENT_EXTENSION_IDS.claude) {
-          return { id: extensionId, isActive: false };
+          return { id: extensionId, isActive: false, extensionKind: 1 };
         }
         return undefined;
       },
@@ -260,9 +265,29 @@ test("reports installed active and inactive agent extensions without activating 
     "anthropic.claude-code",
   ]);
   assert.deepEqual(heartbeat.agentExtensions, {
-    codex: { available: true, installed: true, active: true },
-    claude: { available: true, installed: true, active: false },
+    codex: { available: true, installed: true, active: true, remote: false },
+    claude: { available: true, installed: true, active: false, remote: false },
   });
+});
+
+test("reports whether installed extensions run in the remote extension host", () => {
+  const heartbeat = record(fakeVscode({
+    env: { remoteName: "ssh-remote" },
+    extensions: {
+      getExtension(extensionId) {
+        return {
+          id: extensionId,
+          isActive: true,
+          extensionKind: extensionId === AGENT_EXTENSION_IDS.codex ? 2 : 1,
+        };
+      },
+    },
+  }));
+
+  assert.equal(heartbeat.remoteWindow, true);
+  assert.equal(heartbeat.agentExtensions.codex.remote, true);
+  assert.equal(heartbeat.agentExtensions.claude.remote, false);
+  assert.equal(JSON.stringify(heartbeat).includes("ssh-remote"), false);
 });
 
 test("reports a confirmed absent extension separately from unavailable detection", () => {
@@ -271,8 +296,8 @@ test("reports a confirmed absent extension separately from unavailable detection
   }));
 
   assert.deepEqual(heartbeat.agentExtensions, {
-    codex: { available: true, installed: false, active: false },
-    claude: { available: true, installed: false, active: false },
+    codex: { available: true, installed: false, active: false, remote: null },
+    claude: { available: true, installed: false, active: false, remote: null },
   });
 });
 
@@ -289,8 +314,8 @@ test("contains an extension API failure to the affected provider", () => {
   }));
 
   assert.deepEqual(heartbeat.agentExtensions, {
-    codex: { available: false, installed: false, active: false },
-    claude: { available: true, installed: false, active: false },
+    codex: { available: false, installed: false, active: false, remote: null },
+    claude: { available: true, installed: false, active: false, remote: null },
   });
 });
 
@@ -300,8 +325,8 @@ test("reports both providers unavailable when the extension API is unavailable",
     extensions: null,
   });
   assert.deepEqual(unavailable.agentExtensions, {
-    codex: { available: false, installed: false, active: false },
-    claude: { available: false, installed: false, active: false },
+    codex: { available: false, installed: false, active: false, remote: null },
+    claude: { available: false, installed: false, active: false, remote: null },
   });
 });
 
@@ -332,6 +357,7 @@ test("a saved multi-root window opens its workspace file, not one folder", () =>
   assert.equal(heartbeat.workspaceFolders.length, 2);
   assert.equal(heartbeat.focused, false);
   assert.equal(heartbeat.active, true);
+  assert.equal(heartbeat.remoteWindow, true);
   assert.equal("remoteName" in heartbeat, false);
   assert.equal("vscodeVersion" in heartbeat, false);
 });

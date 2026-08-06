@@ -55,6 +55,11 @@ AppIndicator or StatusNotifier host for the tray icon to appear.
 
 Install the package for your platform, launch VSParallel, and then:
 
+On macOS, copy `VSParallel.app` to `/Applications` before installing provider
+hooks. If hooks were installed while the app ran from a mounted `/Volumes` DMG
+or an App Translocation path, relaunch the installed app and choose **Repair**
+for both provider integrations.
+
 1. Select the settings gear beside **Refresh**.
 2. Install the **VS Code companion**.
 3. Optionally install **Codex lifecycle hooks**, **Claude Code lifecycle
@@ -78,8 +83,9 @@ hooks add coarse **Activity detected**, **Turn finished**, and
 **Unknown**. Extension activation alone is never presented as active work.
 
 The global usage cards refresh every 60 seconds and when **Refresh** is selected.
-Codex usage is available when the `codex` executable is installed, supports
-`app-server`, and is signed in. It does not depend on the Codex lifecycle hooks.
+Codex usage is available when a signed-in local `codex` executable—on `PATH`
+or bundled with a locally installed Codex VS Code extension—supports
+`app-server`. It does not depend on the Codex lifecycle hooks.
 Claude Code usage is available when a signed-in `claude` executable—on `PATH`
 or bundled with the installed Claude VS Code extension—supports the CLI/SDK
 control-channel usage getter. This is an evolving Claude CLI compatibility
@@ -143,9 +149,9 @@ To use VS Code Insiders or another installation, set
 `VSPARALLEL_CODE_COMMAND` to its absolute executable path before launching
 VSParallel.
 
-Codex usage looks for `codex` on `PATH` by default. If the signed-in executable
-is elsewhere, set `VSPARALLEL_CODEX_COMMAND` to its absolute path before
-launching VSParallel.
+Codex usage tries `codex` on `PATH` and the executable bundled with the locally
+installed Codex VS Code extension. To select another signed-in executable, set
+`VSPARALLEL_CODEX_COMMAND` to its absolute path before launching VSParallel.
 
 Claude Code usage can use either `claude` on `PATH` or the executable bundled
 with the installed Claude VS Code extension, trying the other source if the
@@ -178,7 +184,10 @@ Lifecycle state is hook-derived rather than an internal provider progress feed.
 Records are associated with workspaces by local path, and exact native-window
 foregrounding remains subject to VS Code and operating-system focus behavior.
 Remote, virtual, and untitled workspaces can be listed but do not expose a
-verified local open target.
+verified local open target. VSParallel shows whether a VS Code window and its
+provider extensions are local or remote, but the desktop app cannot query
+usage or receive lifecycle hooks across the remote-host boundary in this
+release.
 
 The record formats and privacy boundary are documented in the
 [versioned metadata protocol](docs/protocol.md).
@@ -189,7 +198,8 @@ VSParallel stores only the metadata required for the workspace overview:
 
 - local workspace paths, display names, focus state, and heartbeat timestamps;
 - whether the configured Codex and Claude Code extensions are installed and
-  active in a VS Code window; and
+  active in a VS Code window/profile and, when known, whether they run in the
+  local or remote extension host; and
 - coarse lifecycle state, a one-way hash of the provider session identifier,
   working directory, and timestamp when optional hooks are enabled; and
 - Claude Code five-hour and weekly usage percentages, their optional reset

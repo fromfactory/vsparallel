@@ -925,7 +925,7 @@ mod tests {
 
     #[test]
     fn embedded_identity_and_version_come_from_package_json() {
-        assert_eq!(bundled_companion_version().unwrap(), "0.2.0");
+        assert_eq!(bundled_companion_version().unwrap(), "0.3.0");
         let value: serde_json::Value = serde_json::from_slice(PACKAGE_JSON).unwrap();
         assert_eq!(
             format!(
@@ -971,12 +971,12 @@ mod tests {
     #[test]
     fn status_reports_current_version_and_uses_exact_cli_arguments() {
         let runner = ScriptedRunner::new(vec![successful(
-            b"unrelated.extension@9.0.0\nvsparallel.vsparallel-companion@0.2.0\n".to_vec(),
+            b"unrelated.extension@9.0.0\nvsparallel.vsparallel-companion@0.3.0\n".to_vec(),
         )]);
         let status = companion_status_with(&runner, OsStr::new("/opt/code with spaces"));
 
         assert_eq!(status.state, CompanionStatusState::Current);
-        assert_eq!(status.installed_version.as_deref(), Some("0.2.0"));
+        assert_eq!(status.installed_version.as_deref(), Some("0.3.0"));
         assert_eq!(
             runner.calls(),
             vec![RecordedCall {
@@ -1039,7 +1039,7 @@ mod tests {
     fn install_passes_a_real_embedded_vsix_as_one_argument_and_removes_it() {
         let runner = ScriptedRunner::new(vec![
             successful(b"installed\n".to_vec()),
-            successful(b"vsparallel.vsparallel-companion@0.2.0\n".to_vec()),
+            successful(b"vsparallel.vsparallel-companion@0.3.0\n".to_vec()),
         ]);
         let root = TempDir::new().unwrap();
         let temporary_directory = root.path().join("temporary packages with spaces");
@@ -1110,7 +1110,7 @@ mod tests {
     #[test]
     fn uninstall_uses_the_exact_extension_id_and_verifies_removal() {
         let runner = ScriptedRunner::new(vec![
-            successful(b"vsparallel.vsparallel-companion@0.2.0\n".to_vec()),
+            successful(b"vsparallel.vsparallel-companion@0.3.0\n".to_vec()),
             successful(b"uninstalled\n".to_vec()),
             successful(b"other.extension@1.0.0\n".to_vec()),
         ]);

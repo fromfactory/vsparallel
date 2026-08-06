@@ -238,17 +238,19 @@ pub fn codex_hook_review_status(
     codex_home: &Path,
     executable: &Path,
     codex_command: &OsStr,
+    allow_extension_fallback: bool,
 ) -> Result<CodexHookReviewStatus, String> {
     let paths = IntegrationPaths::new(codex_home)?;
     let handler = managed_handler(executable)?;
     let cwd = codex_home
         .to_str()
         .ok_or_else(|| "the Codex home path is not valid Unicode".to_string())?;
-    let result = crate::usage::codex_app_server_request(
-        codex_command,
-        "hooks/list",
-        serde_json::json!({"cwds": [cwd]}),
-    )?;
+    let params = serde_json::json!({"cwds": [cwd]});
+    let result = if allow_extension_fallback {
+        crate::usage::codex_app_server_request_resolved(codex_command, "hooks/list", params)?
+    } else {
+        crate::usage::codex_app_server_request(codex_command, "hooks/list", params)?
+    };
     hook_review_status_from_response(&paths, &handler, &result)
 }
 

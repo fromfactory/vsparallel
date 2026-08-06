@@ -541,6 +541,7 @@ mod tests {
             extension_detection_available: None,
             extension_installed: None,
             extension_active: None,
+            extension_remote: None,
         }
     }
 
@@ -561,6 +562,7 @@ mod tests {
             active,
             focused,
             recently_active: false,
+            remote_window: false,
             last_seen_at_ms: 1,
             started_at_ms: 0,
             codex: activity(codex, "PRIVATE CODEX DETAIL"),

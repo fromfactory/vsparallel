@@ -29,6 +29,7 @@ use std::os::windows::{ffi::OsStrExt, fs::MetadataExt};
 
 pub const CLAUDE_STATUSLINE_ARGUMENT: &str = "claude-usage";
 
+const CODEX_EXTENSION_ID: &str = "openai.chatgpt";
 const CLAUDE_EXTENSION_ID: &str = "anthropic.claude-code";
 const USAGE_SCHEMA_VERSION: u32 = 1;
 const CLAUDE_RECORD_SCHEMA_VERSION: u32 = 1;
@@ -47,13 +48,16 @@ const PROVIDER_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const CLAUDE_INPUT_LIMIT: usize = 256 * 1024;
 const CLAUDE_RECORD_LIMIT: u64 = 16 * 1024;
 const CLAUDE_STALE_AFTER_MS: i64 = 15 * 60 * 1_000;
-const CLAUDE_EXTENSION_RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
+const PROVIDER_EXTENSION_RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
 const MAX_FUTURE_SKEW_MS: i64 = 5 * 60 * 1_000;
+const AUTOMATIC_SOURCE_PREFIX: &str = "vsparallel-source=automatic;";
+const CONFIGURED_SOURCE_PREFIX: &str = "vsparallel-source=configured;";
 
-static CLAUDE_EXTENSION_CACHE: OnceLock<Mutex<ClaudeExtensionCache>> = OnceLock::new();
+static CODEX_EXTENSION_CACHE: OnceLock<Mutex<ProviderExtensionCache>> = OnceLock::new();
+static CLAUDE_EXTENSION_CACHE: OnceLock<Mutex<ProviderExtensionCache>> = OnceLock::new();
 
 #[derive(Debug, Default)]
-struct ClaudeExtensionCache {
+struct ProviderExtensionCache {
     executable: Option<PathBuf>,
     checked_at: Option<Instant>,
 }
@@ -116,24 +120,50 @@ pub trait CodexUsageRunner: Sync {
     fn read_rate_limits(&self, executable: &OsStr) -> Result<Value, String>;
 }
 
-#[derive(Debug, Default, Clone, Copy)]
-pub struct ProcessCodexUsageRunner;
+#[derive(Debug, Clone, Copy)]
+pub struct ProcessCodexUsageRunner {
+    allow_extension_fallback: bool,
+}
+
+impl Default for ProcessCodexUsageRunner {
+    fn default() -> Self {
+        Self {
+            allow_extension_fallback: true,
+        }
+    }
+}
 
 /// Injectable boundary around Claude Code's SDK control conversation.
 pub trait ClaudeUsageRunner: Sync {
     fn read_rate_limits(&self, executable: &OsStr) -> Result<Value, String>;
 }
 
-#[derive(Debug, Default, Clone, Copy)]
-pub struct ProcessClaudeUsageRunner;
+#[derive(Debug, Clone, Copy)]
+pub struct ProcessClaudeUsageRunner {
+    allow_extension_fallback: bool,
+}
+
+impl Default for ProcessClaudeUsageRunner {
+    fn default() -> Self {
+        Self {
+            allow_extension_fallback: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderCommand {
+    pub executable: OsString,
+    pub allow_extension_fallback: bool,
+}
 
 /// Resolve the Codex executable without splitting or interpreting shell syntax.
-pub fn codex_command() -> OsString {
+pub fn codex_command() -> ProviderCommand {
     codex_command_from(env::var_os("VSPARALLEL_CODEX_COMMAND"))
 }
 
 /// Resolve the Claude Code executable without splitting or interpreting shell syntax.
-pub fn claude_command() -> OsString {
+pub fn claude_command() -> ProviderCommand {
     claude_command_from(env::var_os("VSPARALLEL_CLAUDE_COMMAND"))
 }
 
@@ -151,11 +181,17 @@ pub fn build_usage_snapshot(now_ms: i64) -> UsageSnapshot {
     let codex_command = codex_command();
     let claude_command = claude_command();
     let state_root = crate::state::state_dir_from_environment().ok();
+    let codex_runner = ProcessCodexUsageRunner {
+        allow_extension_fallback: codex_command.allow_extension_fallback,
+    };
+    let claude_runner = ProcessClaudeUsageRunner {
+        allow_extension_fallback: claude_command.allow_extension_fallback,
+    };
     build_usage_snapshot_with(
-        &ProcessCodexUsageRunner,
-        codex_command.as_os_str(),
-        &ProcessClaudeUsageRunner,
-        claude_command.as_os_str(),
+        &codex_runner,
+        codex_command.executable.as_os_str(),
+        &claude_runner,
+        claude_command.executable.as_os_str(),
         state_root.as_deref(),
         now_ms,
     )
@@ -177,25 +213,50 @@ pub fn build_usage_snapshot_with<
         let codex = scope.spawn(|| codex_runner.read_rate_limits(codex_executable));
         let claude = scope.spawn(|| claude_runner.read_rate_limits(claude_executable));
         (
-            codex.join().ok().and_then(Result::ok),
-            claude.join().ok().and_then(Result::ok),
+            codex
+                .join()
+                .unwrap_or_else(|_| Err("provider usage worker stopped unexpectedly".to_string())),
+            claude
+                .join()
+                .unwrap_or_else(|_| Err("provider usage worker stopped unexpectedly".to_string())),
         )
     });
-    let codex = codex_result
-        .and_then(|result| codex_provider_view(&result, now_ms))
-        .unwrap_or_else(|| {
-            unavailable_provider("Install or sign in to Codex to view usage limits.")
-        });
-    let claude = claude_result
-        .and_then(|result| claude_provider_view(&result, now_ms))
+    let codex = match codex_result {
+        Ok(result) => codex_provider_view(&result, now_ms).unwrap_or_else(|| {
+            unavailable_provider(
+                "Codex returned no compatible usage windows. Update Codex, then refresh usage.",
+            )
+        }),
+        Err(error) => unavailable_provider(&provider_failure_detail(
+            "Codex",
+            "VSPARALLEL_CODEX_COMMAND",
+            &error,
+            "Install or sign in to Codex to view usage limits.",
+        )),
+    };
+    let (claude_live, claude_error) = match claude_result {
+        Ok(result) => (
+            claude_provider_view(&result, now_ms),
+            "Claude Code returned no compatible usage windows. Update Claude Code, then refresh usage."
+                .to_string(),
+        ),
+        Err(error) => (
+            None,
+            provider_failure_detail(
+                "Claude Code",
+                "VSPARALLEL_CLAUDE_COMMAND",
+                &error,
+                "Update or sign in to Claude Code, then refresh usage.",
+            ),
+        ),
+    };
+    let claude = claude_live
         .or_else(|| {
             state_root
                 .map(|root| load_claude_usage(root, now_ms))
                 .filter(|view| view.remaining_percent.is_some())
         })
-        .unwrap_or_else(|| {
-            unavailable_provider("Update or sign in to Claude Code, then refresh usage.")
-        });
+        .unwrap_or_else(|| unavailable_provider(&claude_error));
 
     UsageSnapshot {
         schema_version: USAGE_SCHEMA_VERSION,
@@ -207,40 +268,134 @@ pub fn build_usage_snapshot_with<
 
 impl CodexUsageRunner for ProcessCodexUsageRunner {
     fn read_rate_limits(&self, executable: &OsStr) -> Result<Value, String> {
-        codex_app_server_request(
-            executable,
-            "account/rateLimits/read",
-            Value::Object(Default::default()),
-        )
+        read_codex_rate_limits(executable, self.allow_extension_fallback)
+            .map_err(|error| tag_provider_failure(error, self.allow_extension_fallback))
     }
+}
+
+fn codex_request_with_extension_fallback(
+    executable: &OsStr,
+    mut request: impl FnMut(&OsStr) -> Result<Value, String>,
+    mut bundled_executable: impl FnMut(bool) -> Option<PathBuf>,
+) -> Result<Value, String> {
+    if executable != OsStr::new("codex") {
+        return request(executable);
+    }
+    if let Some(bundled) = bundled_executable(false) {
+        return match request(bundled.as_os_str()) {
+            Ok(result) => Ok(result),
+            Err(bundled_error) => request(executable).or(Err(bundled_error)),
+        };
+    }
+    let path_result = request(executable);
+    if path_result.is_ok() {
+        return path_result;
+    }
+    if let Some(bundled) = bundled_executable(true) {
+        return request(bundled.as_os_str());
+    }
+    path_result
+}
+
+fn read_codex_rate_limits(
+    executable: &OsStr,
+    allow_extension_fallback: bool,
+) -> Result<Value, String> {
+    let params = Value::Object(Default::default());
+    if allow_extension_fallback {
+        codex_app_server_request_resolved(executable, "account/rateLimits/read", params)
+    } else {
+        codex_app_server_request(executable, "account/rateLimits/read", params)
+    }
+}
+
+/// Send a Codex app-server request using either a selected non-default
+/// executable or, for the `codex` command, the binary bundled with the installed
+/// Codex VS Code extension as a fallback.
+pub(crate) fn codex_app_server_request_resolved(
+    executable: &OsStr,
+    method: &str,
+    params: Value,
+) -> Result<Value, String> {
+    codex_request_with_extension_fallback(
+        executable,
+        |resolved| codex_app_server_request(resolved, method, params.clone()),
+        cached_codex_extension_executable,
+    )
 }
 
 impl ClaudeUsageRunner for ProcessClaudeUsageRunner {
     fn read_rate_limits(&self, executable: &OsStr) -> Result<Value, String> {
-        if executable == OsStr::new("claude") {
-            if let Some(bundled) = cached_claude_extension_executable(false) {
-                match claude_control_usage_request(bundled.as_os_str()) {
-                    Ok(result) => return Ok(result),
-                    Err(bundled_error) => {
-                        return claude_control_usage_request(executable).or(Err(bundled_error));
-                    }
-                }
-            }
-            let path_result = claude_control_usage_request(executable);
-            if path_result.is_ok() {
-                return path_result;
-            }
-            if let Some(bundled) = cached_claude_extension_executable(true) {
-                return claude_control_usage_request(bundled.as_os_str()).or(path_result);
-            }
-            return path_result;
-        }
-        claude_control_usage_request(executable)
+        let result = if self.allow_extension_fallback {
+            claude_request_with_extension_fallback(
+                executable,
+                claude_control_usage_request,
+                cached_claude_extension_executable,
+            )
+        } else {
+            claude_control_usage_request(executable)
+        };
+        result.map_err(|error| tag_provider_failure(error, self.allow_extension_fallback))
     }
 }
 
+fn tag_provider_failure(error: String, automatic: bool) -> String {
+    format!(
+        "{}{error}",
+        if automatic {
+            AUTOMATIC_SOURCE_PREFIX
+        } else {
+            CONFIGURED_SOURCE_PREFIX
+        }
+    )
+}
+
+fn claude_request_with_extension_fallback(
+    executable: &OsStr,
+    mut request: impl FnMut(&OsStr) -> Result<Value, String>,
+    mut bundled_executable: impl FnMut(bool) -> Option<PathBuf>,
+) -> Result<Value, String> {
+    if executable != OsStr::new("claude") {
+        return request(executable);
+    }
+    if let Some(bundled) = bundled_executable(false) {
+        return match request(bundled.as_os_str()) {
+            Ok(result) => Ok(result),
+            Err(bundled_error) => request(executable).or(Err(bundled_error)),
+        };
+    }
+    let path_result = request(executable);
+    if path_result.is_ok() {
+        return path_result;
+    }
+    if let Some(bundled) = bundled_executable(true) {
+        return request(bundled.as_os_str());
+    }
+    path_result
+}
+
+fn cached_codex_extension_executable(allow_lookup: bool) -> Option<PathBuf> {
+    cached_provider_extension_executable(
+        &CODEX_EXTENSION_CACHE,
+        allow_lookup,
+        locate_codex_extension_executable,
+    )
+}
+
 fn cached_claude_extension_executable(allow_lookup: bool) -> Option<PathBuf> {
-    let cache = CLAUDE_EXTENSION_CACHE.get_or_init(|| Mutex::new(ClaudeExtensionCache::default()));
+    cached_provider_extension_executable(
+        &CLAUDE_EXTENSION_CACHE,
+        allow_lookup,
+        locate_claude_extension_executable,
+    )
+}
+
+fn cached_provider_extension_executable(
+    storage: &OnceLock<Mutex<ProviderExtensionCache>>,
+    allow_lookup: bool,
+    locate: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    let cache = storage.get_or_init(|| Mutex::new(ProviderExtensionCache::default()));
     let now = Instant::now();
     {
         let mut cache = cache.lock().ok()?;
@@ -255,28 +410,43 @@ fn cached_claude_extension_executable(allow_lookup: bool) -> Option<PathBuf> {
         if !allow_lookup
             || cache
                 .checked_at
-                .is_some_and(|checked| now.duration_since(checked) < CLAUDE_EXTENSION_RETRY_AFTER)
+                .is_some_and(|checked| now.duration_since(checked) < PROVIDER_EXTENSION_RETRY_AFTER)
         {
             return None;
         }
         cache.checked_at = Some(now);
     }
-    let executable = locate_claude_extension_executable();
+    let executable = locate();
     if let Ok(mut cache) = cache.lock() {
         cache.executable = executable.clone();
     }
     executable
 }
 
+fn locate_codex_extension_executable() -> Option<PathBuf> {
+    locate_codex_extension_with_cli().or_else(locate_codex_extension_from_registry)
+}
+
 fn locate_claude_extension_executable() -> Option<PathBuf> {
     locate_claude_extension_with_cli().or_else(locate_claude_extension_from_registry)
 }
 
+fn locate_codex_extension_with_cli() -> Option<PathBuf> {
+    locate_extension_with_cli(CODEX_EXTENSION_ID, codex_extension_binary)
+}
+
 fn locate_claude_extension_with_cli() -> Option<PathBuf> {
+    locate_extension_with_cli(CLAUDE_EXTENSION_ID, claude_extension_binary)
+}
+
+fn locate_extension_with_cli(
+    extension_id: &str,
+    binary: fn(&Path) -> Option<PathBuf>,
+) -> Option<PathBuf> {
     let code_command = crate::opener::code_command();
     let arguments = [
         OsString::from("--locate-extension"),
-        OsString::from(CLAUDE_EXTENSION_ID),
+        OsString::from(extension_id),
     ];
     let output = ProcessCodeCliRunner
         .run(OsStr::new(&code_command), &arguments)
@@ -284,7 +454,7 @@ fn locate_claude_extension_with_cli() -> Option<PathBuf> {
     if !output.success {
         return None;
     }
-    claude_extension_executable_from_output(&output.stdout)
+    extension_executable_from_output(&output.stdout, binary)
 }
 
 #[derive(Debug, Deserialize)]
@@ -310,11 +480,22 @@ struct VsCodeExtensionMetadata {
 /// VS Code's launcher can be missing from PATH or unusable in a confined
 /// package even while its extensions are available. Its local registry is a
 /// bounded second source for the exact installed extension path.
+fn locate_codex_extension_from_registry() -> Option<PathBuf> {
+    locate_extension_from_registry(CODEX_EXTENSION_ID, codex_extension_binary)
+}
+
 fn locate_claude_extension_from_registry() -> Option<PathBuf> {
+    locate_extension_from_registry(CLAUDE_EXTENSION_ID, claude_extension_binary)
+}
+
+fn locate_extension_from_registry(
+    extension_id: &str,
+    binary: fn(&Path) -> Option<PathBuf>,
+) -> Option<PathBuf> {
     let home = platform_home_directory()?;
     vscode_extension_directories(&home)
         .into_iter()
-        .filter_map(|directory| claude_extension_from_registry(&directory))
+        .filter_map(|directory| extension_from_registry(&directory, extension_id, binary))
         .max_by_key(|(installed_at, _)| *installed_at)
         .map(|(_, executable)| executable)
 }
@@ -339,7 +520,21 @@ fn vscode_extension_directories(home: &Path) -> [PathBuf; 3] {
     ]
 }
 
+#[cfg(test)]
 fn claude_extension_from_registry(extensions: &Path) -> Option<(u64, PathBuf)> {
+    extension_from_registry(extensions, CLAUDE_EXTENSION_ID, claude_extension_binary)
+}
+
+#[cfg(test)]
+fn codex_extension_from_registry(extensions: &Path) -> Option<(u64, PathBuf)> {
+    extension_from_registry(extensions, CODEX_EXTENSION_ID, codex_extension_binary)
+}
+
+fn extension_from_registry(
+    extensions: &Path,
+    extension_id: &str,
+    binary: fn(&Path) -> Option<PathBuf>,
+) -> Option<(u64, PathBuf)> {
     let registry = extensions.join("extensions.json");
     let metadata = fs::metadata(&registry).ok()?;
     if !metadata.is_file() || metadata.len() > VSCODE_EXTENSION_REGISTRY_LIMIT {
@@ -357,12 +552,7 @@ fn claude_extension_from_registry(extensions: &Path) -> Option<(u64, PathBuf)> {
     let entries: Vec<VsCodeExtensionRegistryEntry> = serde_json::from_slice(&bytes).ok()?;
     entries
         .into_iter()
-        .filter(|entry| {
-            entry
-                .identifier
-                .id
-                .eq_ignore_ascii_case(CLAUDE_EXTENSION_ID)
-        })
+        .filter(|entry| entry.identifier.id.eq_ignore_ascii_case(extension_id))
         .filter_map(|entry| {
             let relative = PathBuf::from(entry.relative_location?);
             let mut components = relative.components();
@@ -370,22 +560,70 @@ fn claude_extension_from_registry(extensions: &Path) -> Option<(u64, PathBuf)> {
                 (Some(std::path::Component::Normal(name)), None) => extensions.join(name),
                 _ => return None,
             };
-            claude_extension_binary(&root)
-                .map(|executable| (entry.metadata.installed_timestamp, executable))
+            binary(&root).map(|executable| (entry.metadata.installed_timestamp, executable))
         })
         .max_by_key(|(installed_at, _)| *installed_at)
 }
 
+#[cfg(test)]
+fn codex_extension_executable_from_output(output: &[u8]) -> Option<PathBuf> {
+    extension_executable_from_output(output, codex_extension_binary)
+}
+
+#[cfg(test)]
 fn claude_extension_executable_from_output(output: &[u8]) -> Option<PathBuf> {
+    extension_executable_from_output(output, claude_extension_binary)
+}
+
+fn extension_executable_from_output(
+    output: &[u8],
+    binary: fn(&Path) -> Option<PathBuf>,
+) -> Option<PathBuf> {
     let root = PathBuf::from(std::str::from_utf8(output).ok()?.trim());
     if root.as_os_str().is_empty() {
         return None;
     }
-    claude_extension_binary(&root)
+    binary(&root)
+}
+
+fn codex_extension_binary(root: &Path) -> Option<PathBuf> {
+    let binary_name = if cfg!(windows) { "codex.exe" } else { "codex" };
+    let platform = if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        std::env::consts::OS
+    };
+    let architecture = std::env::consts::ARCH;
+    codex_extension_binary_for(root, platform, architecture, binary_name)
+}
+
+fn codex_extension_binary_for(
+    root: &Path,
+    platform: &str,
+    architecture: &str,
+    binary_name: &str,
+) -> Option<PathBuf> {
+    let bin = root.join("bin");
+    let mut candidates = vec![bin
+        .join(format!("{platform}-{architecture}"))
+        .join(binary_name)];
+    if platform == "macos" {
+        match architecture {
+            "aarch64" => candidates.push(bin.join("macos-x86_64").join(binary_name)),
+            "x86_64" => candidates.push(bin.join("macos-aarch64").join(binary_name)),
+            _ => {}
+        }
+    }
+    if platform == "windows" && architecture == "aarch64" {
+        candidates.push(bin.join("windows-x86_64").join(binary_name));
+    }
+    candidates.push(bin.join(binary_name));
+    candidates.into_iter().find(|candidate| candidate.is_file())
 }
 
 fn claude_extension_binary(root: &Path) -> Option<PathBuf> {
-    let resources = root.join("resources");
     let binary_name = if cfg!(windows) {
         "claude.exe"
     } else {
@@ -403,22 +641,41 @@ fn claude_extension_binary(root: &Path) -> Option<PathBuf> {
         "aarch64" => "arm64",
         architecture => architecture,
     };
-    let platform_architecture = if cfg!(all(target_os = "linux", target_env = "musl")) {
+    claude_extension_binary_for(
+        root,
+        platform,
+        architecture,
+        binary_name,
+        cfg!(all(target_os = "linux", target_env = "musl")),
+    )
+}
+
+fn claude_extension_binary_for(
+    root: &Path,
+    platform: &str,
+    architecture: &str,
+    binary_name: &str,
+    musl: bool,
+) -> Option<PathBuf> {
+    let resources = root.join("resources");
+    let platform_architecture = if platform == "linux" && musl {
         format!("{platform}-{architecture}-musl")
     } else {
         format!("{platform}-{architecture}")
     };
-    let mut candidates = vec![resources
-        .join("native-binaries")
+    let native_binaries = resources.join("native-binaries");
+    let mut candidates = vec![native_binaries
         .join(platform_architecture)
         .join(binary_name)];
-    if cfg!(all(target_os = "windows", target_arch = "aarch64")) {
-        candidates.push(
-            resources
-                .join("native-binaries")
-                .join("win32-x64")
-                .join(binary_name),
-        );
+    if platform == "darwin" {
+        match architecture {
+            "arm64" => candidates.push(native_binaries.join("darwin-x64").join(binary_name)),
+            "x64" => candidates.push(native_binaries.join("darwin-arm64").join(binary_name)),
+            _ => {}
+        }
+    }
+    if platform == "win32" && architecture == "arm64" {
+        candidates.push(native_binaries.join("win32-x64").join(binary_name));
     }
     candidates.push(resources.join("native-binary").join(binary_name));
     candidates.into_iter().find(|candidate| candidate.is_file())
@@ -1018,16 +1275,77 @@ fn unavailable_provider(detail: &str) -> ProviderUsageView {
     }
 }
 
-fn codex_command_from(value: Option<OsString>) -> OsString {
-    value
-        .filter(|command| !command.is_empty())
-        .unwrap_or_else(|| OsString::from("codex"))
+fn provider_failure_detail(
+    provider: &str,
+    override_variable: &str,
+    tagged_error: &str,
+    fallback: &str,
+) -> String {
+    let (source, error) = if let Some(error) = tagged_error.strip_prefix(AUTOMATIC_SOURCE_PREFIX) {
+        ("automatic", error)
+    } else if let Some(error) = tagged_error.strip_prefix(CONFIGURED_SOURCE_PREFIX) {
+        ("configured", error)
+    } else {
+        ("unknown", tagged_error)
+    };
+    let normalized = error.to_ascii_lowercase();
+    let subject = match source {
+        "automatic" => {
+            format!("{provider} from the app PATH or a local VS Code extension")
+        }
+        "configured" => {
+            format!("The {provider} executable selected by {override_variable}")
+        }
+        _ => provider.to_string(),
+    };
+
+    if normalized.contains("could not start") {
+        return if source == "unknown" {
+            fallback.to_string()
+        } else {
+            format!("{subject} could not start. Check or update it, sign in, then refresh usage.")
+        };
+    }
+    if normalized.contains("timed out") || normalized.contains("stopped before responding") {
+        return format!(
+            "{subject} started but did not answer the usage request. Restart or update it, then refresh usage."
+        );
+    }
+    if normalized.contains("rejected") || normalized.contains("no result") {
+        return format!(
+            "{subject} rejected the usage request. Sign in to the same local account used by VS Code, or update it, then refresh usage."
+        );
+    }
+    if normalized.contains("malformed")
+        || normalized.contains("exceeded its safety limit")
+        || normalized.contains("output limit")
+    {
+        return format!(
+            "{subject} returned an incompatible usage response. Update it, then refresh usage."
+        );
+    }
+    fallback.to_string()
 }
 
-fn claude_command_from(value: Option<OsString>) -> OsString {
-    value
-        .filter(|command| !command.is_empty())
-        .unwrap_or_else(|| OsString::from("claude"))
+fn codex_command_from(value: Option<OsString>) -> ProviderCommand {
+    provider_command_from(value, "codex")
+}
+
+fn claude_command_from(value: Option<OsString>) -> ProviderCommand {
+    provider_command_from(value, "claude")
+}
+
+fn provider_command_from(value: Option<OsString>, default: &str) -> ProviderCommand {
+    match value.filter(|command| !command.is_empty()) {
+        Some(executable) => ProviderCommand {
+            executable,
+            allow_extension_fallback: false,
+        },
+        None => ProviderCommand {
+            executable: OsString::from(default),
+            allow_extension_fallback: true,
+        },
+    }
 }
 
 /// Fail-open entry point for the Claude Code status-line command.
@@ -1594,22 +1912,78 @@ mod tests {
         assert_eq!(snapshot.codex.state, "unavailable");
         assert_eq!(snapshot.codex.remaining_percent, None);
         assert_eq!(snapshot.claude.state, "unavailable");
+        assert_eq!(
+            snapshot.codex.detail,
+            "Install or sign in to Codex to view usage limits."
+        );
+        assert!(!snapshot.codex.detail.contains("signed out"));
+    }
+
+    #[test]
+    fn provider_failure_details_report_safe_source_and_category() {
+        let automatic =
+            tag_provider_failure("could not start the Codex app-server".to_string(), true);
+        let detail =
+            provider_failure_detail("Codex", "VSPARALLEL_CODEX_COMMAND", &automatic, "fallback");
+        assert!(detail.contains("app PATH or a local VS Code extension"));
+
+        let configured = tag_provider_failure("could not start Claude Code".to_string(), false);
+        let detail = provider_failure_detail(
+            "Claude Code",
+            "VSPARALLEL_CLAUDE_COMMAND",
+            &configured,
+            "fallback",
+        );
+        assert!(detail.contains("selected by VSPARALLEL_CLAUDE_COMMAND"));
+
+        for (error, expected) in [
+            ("Claude Code usage request timed out", "did not answer"),
+            (
+                "Codex app-server rejected the request",
+                "same local account",
+            ),
+            ("Codex app-server returned malformed output", "incompatible"),
+        ] {
+            let detail = provider_failure_detail("Provider", "OVERRIDE", error, "fallback");
+            assert!(detail.contains(expected));
+        }
+
+        let detail = provider_failure_detail(
+            "Provider",
+            "OVERRIDE",
+            "private provider diagnostic",
+            "safe fallback",
+        );
+        assert_eq!(detail, "safe fallback");
     }
 
     #[test]
     fn command_override_is_literal_and_empty_values_fall_back() {
+        let explicit_codex = codex_command_from(Some(OsString::from("codex")));
+        assert_eq!(explicit_codex.executable, "codex");
+        assert!(!explicit_codex.allow_extension_fallback);
+        let explicit_claude =
+            claude_command_from(Some(OsString::from("/opt/Claude Preview/claude")));
         assert_eq!(
-            codex_command_from(Some(OsString::from("/opt/Codex Preview/codex"))),
-            OsString::from("/opt/Codex Preview/codex")
-        );
-        assert_eq!(codex_command_from(Some(OsString::new())), "codex");
-        assert_eq!(codex_command_from(None), "codex");
-        assert_eq!(
-            claude_command_from(Some(OsString::from("/opt/Claude Preview/claude"))),
+            explicit_claude.executable,
             OsString::from("/opt/Claude Preview/claude")
         );
-        assert_eq!(claude_command_from(Some(OsString::new())), "claude");
-        assert_eq!(claude_command_from(None), "claude");
+        assert!(!explicit_claude.allow_extension_fallback);
+
+        for default in [
+            codex_command_from(Some(OsString::new())),
+            codex_command_from(None),
+        ] {
+            assert_eq!(default.executable, "codex");
+            assert!(default.allow_extension_fallback);
+        }
+        for default in [
+            claude_command_from(Some(OsString::new())),
+            claude_command_from(None),
+        ] {
+            assert_eq!(default.executable, "claude");
+            assert!(default.allow_extension_fallback);
+        }
         assert_eq!(
             claude_secure_storage_config_from(
                 Some(OsString::from("/secure")),
@@ -1624,6 +1998,205 @@ mod tests {
         assert_eq!(
             claude_secure_storage_config_from(None, None),
             OsString::new()
+        );
+    }
+
+    #[test]
+    fn default_codex_command_retries_bundled_extension_but_nondefault_is_literal() {
+        let bundled = PathBuf::from("/test/extensions/openai.chatgpt/bin/codex");
+        let mut requests = Vec::new();
+        let mut lookups = Vec::new();
+        let result = codex_request_with_extension_fallback(
+            OsStr::new("codex"),
+            |executable| {
+                requests.push(executable.to_owned());
+                if executable == bundled.as_os_str() {
+                    Ok(json!({"rateLimits": {}}))
+                } else {
+                    Err("not on the desktop PATH".to_string())
+                }
+            },
+            |allow_lookup| {
+                lookups.push(allow_lookup);
+                allow_lookup.then(|| bundled.clone())
+            },
+        )
+        .unwrap();
+
+        assert!(result["rateLimits"].is_object());
+        assert_eq!(
+            requests,
+            [OsString::from("codex"), bundled.into_os_string()]
+        );
+        assert_eq!(lookups, [false, true]);
+
+        let bundled_failure = PathBuf::from("/test/extensions/openai.chatgpt/bin/broken-codex");
+        let error = codex_request_with_extension_fallback(
+            OsStr::new("codex"),
+            |executable| {
+                if executable == OsStr::new("codex") {
+                    Err("not on the desktop PATH".to_string())
+                } else {
+                    Err("bundled Codex could not authenticate".to_string())
+                }
+            },
+            |allow_lookup| allow_lookup.then(|| bundled_failure.clone()),
+        )
+        .unwrap_err();
+        assert_eq!(error, "bundled Codex could not authenticate");
+
+        let override_path = OsStr::new("/opt/Codex Preview/codex");
+        let mut override_requests = Vec::new();
+        let override_result = codex_request_with_extension_fallback(
+            override_path,
+            |executable| {
+                override_requests.push(executable.to_owned());
+                Err("configured command failed".to_string())
+            },
+            |_| panic!("a non-default Codex command must not trigger extension discovery"),
+        );
+        assert!(override_result.is_err());
+        assert_eq!(override_requests, [override_path.to_owned()]);
+    }
+
+    #[test]
+    fn default_claude_command_retries_bundled_extension_and_preserves_its_error() {
+        let bundled = PathBuf::from("/test/extensions/anthropic.claude-code/claude");
+        let mut requests = Vec::new();
+        let result = claude_request_with_extension_fallback(
+            OsStr::new("claude"),
+            |executable| {
+                requests.push(executable.to_owned());
+                if executable == bundled.as_os_str() {
+                    Ok(json!({"limits": {}}))
+                } else {
+                    Err("not on the desktop PATH".to_string())
+                }
+            },
+            |allow_lookup| allow_lookup.then(|| bundled.clone()),
+        )
+        .unwrap();
+        assert!(result["limits"].is_object());
+        assert_eq!(
+            requests,
+            [OsString::from("claude"), bundled.clone().into_os_string()]
+        );
+
+        let error = claude_request_with_extension_fallback(
+            OsStr::new("claude"),
+            |executable| {
+                if executable == OsStr::new("claude") {
+                    Err("not on the desktop PATH".to_string())
+                } else {
+                    Err("bundled Claude could not authenticate".to_string())
+                }
+            },
+            |allow_lookup| allow_lookup.then(|| bundled.clone()),
+        )
+        .unwrap_err();
+        assert_eq!(error, "bundled Claude could not authenticate");
+
+        let override_path = OsStr::new("/opt/Claude Preview/claude");
+        let mut override_requests = Vec::new();
+        let override_result = claude_request_with_extension_fallback(
+            override_path,
+            |executable| {
+                override_requests.push(executable.to_owned());
+                Err("configured command failed".to_string())
+            },
+            |_| panic!("a non-default Claude command must not trigger extension discovery"),
+        );
+        assert!(override_result.is_err());
+        assert_eq!(override_requests, [override_path.to_owned()]);
+    }
+
+    #[test]
+    fn codex_extension_location_resolves_its_bundled_binary() {
+        let temp = TempDir::new().unwrap();
+        let binary_name = if cfg!(windows) { "codex.exe" } else { "codex" };
+        let platform = if cfg!(target_os = "windows") {
+            "windows"
+        } else if cfg!(target_os = "macos") {
+            "macos"
+        } else {
+            std::env::consts::OS
+        };
+        let architecture = std::env::consts::ARCH;
+        let binary = temp
+            .path()
+            .join("bin")
+            .join(format!("{platform}-{architecture}"))
+            .join(binary_name);
+        fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        fs::write(&binary, b"test binary").unwrap();
+        let output = format!("{}\n", temp.path().display());
+
+        assert_eq!(
+            codex_extension_executable_from_output(output.as_bytes()),
+            Some(binary)
+        );
+        assert_eq!(codex_extension_executable_from_output(b"\n"), None);
+        assert_eq!(
+            codex_extension_executable_from_output(b"/missing/extension\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn codex_extension_location_accepts_the_other_macos_architecture() {
+        let temp = TempDir::new().unwrap();
+        let binary = temp.path().join("bin").join("macos-aarch64").join("codex");
+        fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        fs::write(&binary, b"test binary").unwrap();
+
+        assert_eq!(
+            codex_extension_binary_for(temp.path(), "macos", "x86_64", "codex"),
+            Some(binary)
+        );
+    }
+
+    #[test]
+    fn codex_extension_registry_fallback_is_bounded_to_a_child_directory() {
+        let temp = TempDir::new().unwrap();
+        let extensions = temp.path().join(".vscode").join("extensions");
+        let valid_relative = "openai.chatgpt-26.5513-test";
+        let binary_name = if cfg!(windows) { "codex.exe" } else { "codex" };
+        let platform = if cfg!(target_os = "windows") {
+            "windows"
+        } else if cfg!(target_os = "macos") {
+            "macos"
+        } else {
+            std::env::consts::OS
+        };
+        let architecture = std::env::consts::ARCH;
+        let binary = extensions
+            .join(valid_relative)
+            .join("bin")
+            .join(format!("{platform}-{architecture}"))
+            .join(binary_name);
+        fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        fs::write(&binary, b"test binary").unwrap();
+        fs::write(
+            extensions.join("extensions.json"),
+            serde_json::to_vec(&json!([
+                {
+                    "identifier": {"id": "OPENAI.CHATGPT"},
+                    "relativeLocation": valid_relative,
+                    "metadata": {"installedTimestamp": 100}
+                },
+                {
+                    "identifier": {"id": "openai.chatgpt"},
+                    "relativeLocation": "../outside",
+                    "metadata": {"installedTimestamp": 200}
+                }
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            codex_extension_from_registry(&extensions),
+            Some((100, binary))
         );
     }
 
@@ -1653,6 +2226,25 @@ mod tests {
             claude_extension_executable_from_output(b"/missing/extension\n"),
             None
         );
+    }
+
+    #[test]
+    fn claude_extension_location_accepts_the_other_macos_architecture() {
+        let temp = TempDir::new().unwrap();
+        for (process_architecture, bundled_architecture) in [("arm64", "x64"), ("x64", "arm64")] {
+            let root = temp.path().join(process_architecture);
+            let binary = root
+                .join("resources")
+                .join("native-binaries")
+                .join(format!("darwin-{bundled_architecture}"))
+                .join("claude");
+            fs::create_dir_all(binary.parent().unwrap()).unwrap();
+            fs::write(&binary, b"test binary").unwrap();
+            assert_eq!(
+                claude_extension_binary_for(&root, "darwin", process_architecture, "claude", false,),
+                Some(binary)
+            );
+        }
     }
 
     #[test]

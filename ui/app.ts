@@ -51,6 +51,7 @@
     extensionDetectionAvailable: boolean | null;
     extensionInstalled: boolean | null;
     extensionActive: boolean | null;
+    extensionRemote: boolean | null;
   }
 
   interface Workspace {
@@ -60,6 +61,7 @@
     openable: boolean;
     active: boolean;
     focused: boolean;
+    remoteWindow: boolean;
     lastSeenAtMs: number | null;
     codex: ActivityView;
     claude: ActivityView;
@@ -578,6 +580,7 @@
       extensionDetectionAvailable: asNullableBoolean(raw.extensionDetectionAvailable),
       extensionInstalled: asNullableBoolean(raw.extensionInstalled),
       extensionActive: asNullableBoolean(raw.extensionActive),
+      extensionRemote: asNullableBoolean(raw.extensionRemote),
     };
   }
 
@@ -597,6 +600,7 @@
       openable: raw.openable === true && Boolean(instanceId),
       active: raw.active === true,
       focused: raw.focused === true,
+      remoteWindow: raw.remoteWindow === true,
       lastSeenAtMs: asTimestamp(raw.lastSeenAtMs),
       codex: normalizeActivityView(raw.codex),
       claude: normalizeActivityView(raw.claude),
@@ -913,53 +917,67 @@
     );
   }
 
-  function describeExtensionPresence(activity: ActivityView): {
+  function describeExtensionPresence(activity: ActivityView, remoteWindow = false): {
     state: string;
     label: string;
     title: string;
   } {
+    const hostLabel = activity.extensionRemote === true
+      ? " · remote"
+      : remoteWindow && activity.extensionRemote === false
+        ? " · local"
+        : "";
+    const hostBoundary = remoteWindow
+      ? " VSParallel usage queries and lifecycle hooks run on the desktop host and cannot cross the remote host boundary."
+      : "";
     if (activity.extensionDetectionAvailable === false) {
       return {
         state: "unknown",
-        label: "IDE extension status unavailable",
-        title: "VS Code extension presence could not be checked. Lifecycle state remains independent.",
+        label: remoteWindow
+          ? "IDE extension status unavailable · remote window"
+          : "IDE extension status unavailable",
+        title: remoteWindow
+          ? `VS Code extension presence could not be checked for this remote window/profile. Reload the window after updating VSParallel Companion.${hostBoundary}`
+          : "VS Code extension presence could not be checked. Lifecycle state remains independent.",
       };
     }
     if (activity.extensionInstalled === false && activity.extensionActive === true) {
       return {
         state: "warning",
-        label: "IDE extension status inconsistent",
-        title: "The extension reports active but not installed. Lifecycle state remains independent.",
+        label: `IDE extension status inconsistent${hostLabel}`,
+        title: `The extension reports active but not installed. Lifecycle state remains independent.${hostBoundary}`,
       };
     }
     if (activity.extensionInstalled === false) {
       return {
         state: "missing",
-        label: "IDE extension not installed",
-        title: "The provider IDE extension was not detected in this VS Code window.",
+        label: "IDE extension not detected · this window/profile",
+        title: remoteWindow
+          ? `The provider IDE extension was not detected in this VS Code window/profile. Install or enable it in the intended Local or Remote extension host, then reload the window.${hostBoundary}`
+          : "The provider IDE extension was not detected in this VS Code window/profile.",
       };
     }
     if (activity.extensionActive === true) {
       return {
         state: "present",
         label: activity.extensionInstalled === true
-          ? "IDE extension active"
-          : "IDE extension active · install unknown",
-        title: "The IDE extension is active in this window. Activation does not mean an agent turn is running.",
+          ? `IDE extension active${hostLabel}`
+          : `IDE extension active${hostLabel} · install unknown`,
+        title: `The IDE extension is active${activity.extensionRemote === true ? " in the remote extension host" : " in this window"}. Activation does not mean an agent turn is running.${hostBoundary}`,
       };
     }
     if (activity.extensionInstalled === true && activity.extensionActive === false) {
       return {
         state: "present",
-        label: "IDE extension installed · inactive",
-        title: "The IDE extension is installed but inactive. This is separate from lifecycle activity.",
+        label: `IDE extension installed${hostLabel} · inactive`,
+        title: `The IDE extension is installed in this VS Code window/profile but inactive. This is separate from lifecycle activity.${hostBoundary}`,
       };
     }
     if (activity.extensionInstalled === true) {
       return {
         state: "present",
-        label: "IDE extension installed",
-        title: "The IDE extension is installed. Its activation state is unavailable.",
+        label: `IDE extension installed${hostLabel}`,
+        title: `The IDE extension is installed in this VS Code window/profile. Its activation state is unavailable.${hostBoundary}`,
       };
     }
     return {
@@ -973,6 +991,7 @@
     providerName: string,
     activity: ActivityView,
     accessibleProviderName = providerName,
+    remoteWindow = false,
   ): HTMLDivElement {
     const provider = createElement("div", "provider-state");
     provider.dataset.state = activity.kind;
@@ -998,7 +1017,7 @@
       changedAt.title = `Lifecycle marker: ${formatAbsoluteTime(activity.changedAtMs)}`;
     }
 
-    const presence = describeExtensionPresence(activity);
+    const presence = describeExtensionPresence(activity, remoteWindow);
     const extension = createElement("span", "provider-extension", presence.label);
     extension.dataset.state = presence.state;
     extension.title = presence.title;
@@ -1056,8 +1075,8 @@
     const providers = createElement("div", "activity-providers");
     providers.setAttribute("aria-label", "Agent lifecycle and IDE extension status");
     providers.append(
-      createProviderState("Codex", workspace.codex),
-      createProviderState("Claude", workspace.claude, "Claude Code"),
+      createProviderState("Codex", workspace.codex, "Codex", workspace.remoteWindow),
+      createProviderState("Claude", workspace.claude, "Claude Code", workspace.remoteWindow),
     );
     row.append(providers);
 

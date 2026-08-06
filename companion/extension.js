@@ -127,27 +127,50 @@ function workspaceFileMetadata(uri) {
   };
 }
 
+function extensionRunsRemote(vscode, extension) {
+  const remoteWindow = Boolean(
+    nonEmptyString(vscode && vscode.env && vscode.env.remoteName),
+  );
+  if (!remoteWindow) {
+    return false;
+  }
+
+  const extensionKind = extension && extension.extensionKind;
+  const kinds = vscode && vscode.ExtensionKind;
+  if (!kinds || extensionKind === undefined || extensionKind === null) {
+    return null;
+  }
+  if (extensionKind === kinds.Workspace) {
+    return true;
+  }
+  if (extensionKind === kinds.UI) {
+    return false;
+  }
+  return null;
+}
+
 function extensionPresence(vscode, extensionId) {
   try {
     const extensions = vscode && vscode.extensions;
     if (!extensions || typeof extensions.getExtension !== "function") {
-      return { available: false, installed: false, active: false };
+      return { available: false, installed: false, active: false, remote: null };
     }
 
     const extension = extensions.getExtension(extensionId);
     if (!extension) {
-      return { available: true, installed: false, active: false };
+      return { available: true, installed: false, active: false, remote: null };
     }
 
     return {
       available: true,
       installed: true,
       active: Boolean(extension.isActive),
+      remote: extensionRunsRemote(vscode, extension),
     };
   } catch {
     // `available` distinguishes an API failure from a confirmed absence. The
-    // boolean fields remain present to keep the on-disk shape predictable.
-    return { available: false, installed: false, active: false };
+    // status fields remain present to keep the on-disk shape predictable.
+    return { available: false, installed: false, active: false, remote: null };
   }
 }
 
@@ -229,6 +252,9 @@ function createHeartbeatRecord(vscode, options) {
     ),
     focused,
     active,
+    remoteWindow: Boolean(
+      nonEmptyString(vscode && vscode.env && vscode.env.remoteName),
+    ),
     agentExtensions: detectAgentExtensions(vscode),
     lastSeenAtMs: nowMs,
     startedAtMs: options.startedAtMs,

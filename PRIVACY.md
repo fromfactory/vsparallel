@@ -28,6 +28,9 @@ session ID, and working directory, and immediately discard all unselected
 fields. The live Claude response parser and status-line receiver represent only
 percentage and reset fields; account, session, behavior-attribution, and other
 unselected response fields are discarded and never reach the UI or storage.
+Provider stderr and raw failure messages are also discarded. When usage is
+unavailable, the UI receives only a fixed source/category explanation such as
+could not start, timed out, rejected, or incompatible response.
 
 To show its workspace overview, VSParallel stores the following metadata on the
 current device:
@@ -35,7 +38,8 @@ current device:
 - local workspace or `.code-workspace` paths, display names, focus state, and
   heartbeat timestamps reported by the VS Code companion;
 - whether the configured Codex and Claude Code VS Code extensions are installed
-  and active in each window;
+  and active in each window, whether the window is remote, and, when known,
+  whether an installed extension runs in the local or remote extension host;
 - coarse lifecycle state, a one-way hash of the provider session identifier,
   working directory, and timestamp when optional lifecycle hooks are installed;
   and
@@ -52,6 +56,11 @@ minutes. Windows that have passed their reset times are omitted. The active
 Claude response is never written to this record or elsewhere in the state
 directory.
 
+Remote-placement metadata is boolean only. VSParallel never stores a remote
+name, authority, hostname, address, or account identity, and the desktop app
+does not connect to the remote host to read provider state. Lifecycle hooks and
+live usage queries remain local to the machine on which they run.
+
 Graphical Claude sessions in VS Code do not run the terminal `statusLine`, so
 the active query supplies usage independently of those sessions and lifecycle
 hooks. VSParallel installs its local fallback command only when `statusLine` is
@@ -59,14 +68,13 @@ absent. If a custom command exists, it is preserved exactly; only the fallback
 cache's managed refresh is disabled, and an existing record may remain visible
 as stale.
 
-VSParallel runs `codex` from `PATH` by default. For Claude it can use either
-`claude` from `PATH` or the executable bundled with the installed Claude VS Code
-extension, trying the other source if the first query fails. To locate the
-bundled executable, it asks the configured VS Code launcher or reads the bounded
-local VS Code extension registry for the exact Anthropic extension path; that
-path may be cached in process memory but is not persisted. Explicit executables
-can be selected with `VSPARALLEL_CODEX_COMMAND` and
-`VSPARALLEL_CLAUDE_COMMAND`.
+For Codex and Claude, VSParallel can try the executable on `PATH` and the binary
+bundled with the corresponding locally installed VS Code extension. To locate
+a bundled executable, it asks the configured VS Code launcher or reads the
+bounded local VS Code extension registry for the exact provider extension path;
+that path may be cached in process memory but is not persisted. Explicit
+executables selected with `VSPARALLEL_CODEX_COMMAND` or
+`VSPARALLEL_CLAUDE_COMMAND` are used literally.
 
 The location of this state directory is shown in Setup diagnostics. Heartbeats
 older than 60 seconds are hidden and lifecycle state older than 24 hours is
