@@ -101,11 +101,16 @@ test("desktop platforms use custom chrome while macOS retains native chrome", ()
   assert.match(cargo, /Win32_System_Threading/);
 });
 
-test("the capability grants only the supported drag operation to the frontend", () => {
+test("the capability grants only the frontend operations used by the app", () => {
   const capability = readJson<CapabilityConfiguration>(
     "src-tauri/capabilities/default.json",
   );
-  assert.deepEqual(capability.permissions, ["core:window:allow-start-dragging"]);
+  assert.deepEqual(capability.permissions, [
+    "core:window:allow-start-dragging",
+    "process:allow-restart",
+    "updater:allow-check",
+    "updater:allow-download-and-install",
+  ]);
 });
 
 test("the production frontend contains only explicit runtime assets", () => {

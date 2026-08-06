@@ -3,5 +3,10 @@
   "identifier": "default",
   "description": "Core permissions for the VSParallel main window",
   "windows": ["main"],
-  "permissions": ["core:window:allow-start-dragging"]
+  "permissions": [
+    "core:window:allow-start-dragging",
+    "process:allow-restart",
+    "updater:allow-check",
+    "updater:allow-download-and-install"
+  ]
 }

@@ -157,6 +157,42 @@
       </div>
 
       <section
+        class="update-banner"
+        id="updateBanner"
+        data-state="available"
+        role="status"
+        aria-live="polite"
+        aria-labelledby="updateBannerTitle"
+        hidden
+      >
+        <svg class="update-banner__icon" viewBox="0 0 20 20" aria-hidden="true">
+          <path d="M10 2.5v10M6.5 9l3.5 3.5L13.5 9" />
+          <path d="M3.5 13.5v2.5h13v-2.5" />
+        </svg>
+        <div class="update-banner__body">
+          <strong id="updateBannerTitle">
+            VSParallel <span id="updateVersion"></span> is available
+          </strong>
+          <span class="update-banner__status" id="updateStatus">
+            Ready to download and install.
+          </span>
+          <progress
+            class="update-banner__progress"
+            id="updateProgress"
+            max="100"
+            aria-label="Update download progress"
+            hidden
+          ></progress>
+        </div>
+        <div class="update-banner__actions">
+          <button class="setup-button setup-button--primary" id="updateNowButton" type="button">
+            Update now
+          </button>
+          <button class="setup-button" id="updateLaterButton" type="button">Later</button>
+        </div>
+      </section>
+
+      <section
         class="usage-overview"
         id="usageOverview"
         aria-labelledby="usageHeading"
@@ -275,7 +311,7 @@
           <div class="settings-dialog__title">
             <div>
               <h2 id="settingsDialogTitle">Setup &amp; diagnostics</h2>
-              <p>Appearance and local integrations</p>
+              <p>Appearance, updates, and local integrations</p>
             </div>
           </div>
           <div class="settings-dialog__header-actions">
@@ -339,6 +375,20 @@
               stored.
             </p>
           </div>
+
+          <section class="update-settings" aria-labelledby="updateSettingsHeading">
+            <div class="subsection-heading">
+              <div>
+                <h3 id="updateSettingsHeading">Application updates</h3>
+                <p id="updateCheckStatus" role="status" aria-live="polite">
+                  Updates are checked quietly after VSParallel starts.
+                </p>
+              </div>
+              <button class="setup-button" id="checkForUpdatesButton" type="button">
+                Check for updates
+              </button>
+            </div>
+          </section>
 
           <section class="integration-section" aria-labelledby="integrationHeading">
               <div class="subsection-heading">

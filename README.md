@@ -113,6 +113,13 @@ The tray menu can also activate an active target. Closing the full window hides
 it when the tray is available; choose **Quit VSParallel** from the tray menu to
 stop the application.
 
+Packaged releases check GitHub Releases for updates once in the background after
+startup. When a newer signed version is available, an in-app banner can download
+and install it, show progress, and restart VSParallel. Choose **Later** to defer
+it for the current session, or use **Check for updates** in **Setup &
+diagnostics**. Development builds, an unpublished release endpoint, and
+temporary updater failures do not interrupt the local monitor.
+
 ### Installed components
 
 The VS Code companion is embedded in the desktop application and installed

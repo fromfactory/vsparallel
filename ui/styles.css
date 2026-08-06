@@ -686,6 +686,79 @@ dialog:focus-visible {
   color: var(--amber-text);
 }
 
+.update-banner {
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  margin: 8px 12px 0;
+  padding: 9px 10px;
+  border: 1px solid var(--accent-border);
+  border-radius: 9px;
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+
+.update-banner[hidden] {
+  display: none;
+}
+
+.update-banner[data-state="failed"] {
+  border-color: var(--red-border);
+  background: var(--red-soft);
+  color: var(--red-text);
+}
+
+.update-banner__icon {
+  width: 20px;
+  height: 20px;
+  fill: none;
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 1.5;
+}
+
+.update-banner__body {
+  display: grid;
+  min-width: 0;
+  gap: 2px;
+}
+
+.update-banner__body strong {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.update-banner__status {
+  overflow: hidden;
+  color: currentColor;
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.update-banner__progress {
+  width: 100%;
+  height: 4px;
+  margin-top: 3px;
+  overflow: hidden;
+  border: 0;
+  border-radius: 999px;
+  accent-color: var(--accent);
+}
+
+.update-banner__progress[hidden] {
+  display: none;
+}
+
+.update-banner__actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
 .workspace-list {
   display: grid;
   gap: 2px;
@@ -1311,6 +1384,25 @@ html[data-workspace-opening="true"] .app-shell {
   border-radius: 0;
   background: transparent;
   color: var(--text-muted);
+}
+
+.update-settings {
+  margin-bottom: 14px;
+  padding: 0 0 13px;
+  border-bottom: 1px solid var(--border);
+}
+
+.update-settings .subsection-heading {
+  margin: 0;
+}
+
+#checkForUpdatesButton {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.update-settings .has-error {
+  color: var(--red);
 }
 
 .privacy-note__icon {
@@ -1957,6 +2049,37 @@ html[data-workspace-opening="true"] .app-shell {
   padding: 5px 6px 6px;
   border-color: var(--floating-border);
   background: transparent;
+}
+
+:root[data-window-mode="floating"] .update-banner {
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 6px;
+  margin: 5px 6px 0;
+  padding: 6px 7px;
+  border-color: var(--floating-border);
+  background: var(--floating-list);
+}
+
+:root[data-window-mode="floating"] .update-banner__icon {
+  display: none;
+}
+
+:root[data-window-mode="floating"] .update-banner__body strong {
+  font-size: 10px;
+}
+
+:root[data-window-mode="floating"] .update-banner__status {
+  font-size: 8px;
+}
+
+:root[data-window-mode="floating"] .update-banner__actions {
+  gap: 4px;
+}
+
+:root[data-window-mode="floating"] .update-banner__actions .setup-button {
+  min-height: 26px;
+  padding: 3px 7px;
+  font-size: 9px;
 }
 
 :root[data-window-mode="floating"] .usage-grid {

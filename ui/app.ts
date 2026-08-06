@@ -13,6 +13,15 @@
   type UsageState = "available" | "stale" | "unavailable";
   type NoticeKind = "error" | "warning";
   type IntegrationMessageKind = "neutral" | "error" | "success";
+  type UpdatePhase =
+    | "idle"
+    | "checking"
+    | "available"
+    | "downloading"
+    | "installing"
+    | "restarting"
+    | "restart-ready"
+    | "failed";
   type TauriCommand =
     | "close_window"
     | "get_diagnostics"
@@ -24,6 +33,7 @@
     | "install_claude_hooks"
     | "install_codex_hooks"
     | "install_companion"
+    | "is_release_build"
     | "open_workspace"
     | "restore_full_window"
     | "set_window_chrome_theme"
@@ -135,6 +145,33 @@
     floating: boolean;
   }
 
+  interface UpdateDownloadEvent {
+    event: "Started" | "Progress" | "Finished";
+    data?: {
+      contentLength?: number;
+      chunkLength?: number;
+    };
+  }
+
+  interface AvailableUpdate {
+    version: string;
+    currentVersion: string;
+    body?: string;
+    date?: string;
+    downloadAndInstall: (
+      onEvent?: (event: UpdateDownloadEvent) => void,
+      options?: { timeout?: number },
+    ) => Promise<void>;
+  }
+
+  interface TauriUpdaterApi {
+    check: (options?: { timeout?: number }) => Promise<AvailableUpdate | null>;
+  }
+
+  interface TauriProcessApi {
+    relaunch: () => Promise<void>;
+  }
+
   interface AppState {
     refreshPending: boolean;
     usagePending: boolean;
@@ -157,6 +194,14 @@
     windowChromeRequestId: number;
     windowChromeRefreshTimer: number | null;
     themePreference: ThemePreference;
+    updatePhase: UpdatePhase;
+    availableUpdate: AvailableUpdate | null;
+    dismissedUpdateVersion: string | null;
+    updateDownloadedBytes: number;
+    updateContentLength: number | null;
+    updateMessage: string;
+    updateError: string;
+    updateChecksEnabled: boolean | null;
   }
 
   interface TauriWindow extends Window {
@@ -164,6 +209,8 @@
       core?: {
         invoke?: (command: string, args?: JsonObject) => Promise<unknown>;
       };
+      updater?: TauriUpdaterApi;
+      process?: TauriProcessApi;
     };
   }
 
@@ -188,11 +235,17 @@
   const USAGE_REFRESH_INTERVAL_MS = 60_000;
   const USAGE_LAST_KNOWN_MAX_AGE_MS = 15 * 60_000;
   const LAUNCH_TRANSITION_MIN_MS = 750;
+  const UPDATE_CHECK_DELAY_MS = 1_500;
+  const UPDATE_CHECK_TIMEOUT_MS = 15_000;
+  const UPDATE_DOWNLOAD_TIMEOUT_MS = 5 * 60_000;
   const THEME_STORAGE_KEY = "vsparallel.appearance";
   const THEME_PREFERENCES: ReadonlySet<string> = new Set(["system", "light", "dark"]);
   const INTEGRATION_KINDS = ["companion", "codex", "claude"] as const;
   const MAX_JAVASCRIPT_TIMESTAMP_MS = 8_640_000_000_000_000;
-  const tauriInvoke = (window as TauriWindow).__TAURI__?.core?.invoke;
+  const tauriApi = (window as TauriWindow).__TAURI__;
+  const tauriInvoke = tauriApi?.core?.invoke;
+  const tauriUpdater = tauriApi?.updater;
+  const tauriProcess = tauriApi?.process;
   const lightThemeQuery = window.matchMedia("(prefers-color-scheme: light)");
 
   const elements = {
@@ -224,6 +277,12 @@
     workspaceList: requiredElement<HTMLUListElement>("#workspaceList"),
     errorBanner: requiredElement<HTMLDivElement>("#errorBanner"),
     errorText: requiredElement<HTMLSpanElement>("#errorText"),
+    updateBanner: requiredElement<HTMLElement>("#updateBanner"),
+    updateVersion: requiredElement<HTMLSpanElement>("#updateVersion"),
+    updateStatus: requiredElement<HTMLSpanElement>("#updateStatus"),
+    updateProgress: requiredElement<HTMLProgressElement>("#updateProgress"),
+    updateNowButton: requiredElement<HTMLButtonElement>("#updateNowButton"),
+    updateLaterButton: requiredElement<HTMLButtonElement>("#updateLaterButton"),
     emptyState: requiredElement<HTMLDivElement>("#emptyState"),
     emptyRefreshButton: requiredElement<HTMLButtonElement>("#emptyRefreshButton"),
     launchOverlay: requiredElement<HTMLDivElement>("#launchOverlay"),
@@ -231,6 +290,8 @@
     settingsButton: requiredElement<HTMLButtonElement>("#settingsButton"),
     settingsDialog: requiredElement<HTMLDialogElement>("#settingsDialog"),
     settingsCloseButton: requiredElement<HTMLButtonElement>("#settingsCloseButton"),
+    checkForUpdatesButton: requiredElement<HTMLButtonElement>("#checkForUpdatesButton"),
+    updateCheckStatus: requiredElement<HTMLParagraphElement>("#updateCheckStatus"),
     diagnosticsSummary: requiredElement<HTMLSpanElement>("#diagnosticsSummary"),
     diagnosticsList: requiredElement<HTMLDListElement>("#diagnosticsList"),
     diagnosticsStatus: requiredElement<HTMLParagraphElement>("#diagnosticsStatus"),
@@ -296,6 +357,14 @@
     windowChromeRequestId: 0,
     windowChromeRefreshTimer: null,
     themePreference: initialThemePreference,
+    updatePhase: "idle",
+    availableUpdate: null,
+    dismissedUpdateVersion: null,
+    updateDownloadedBytes: 0,
+    updateContentLength: null,
+    updateMessage: "Updates are checked quietly after VSParallel starts.",
+    updateError: "",
+    updateChecksEnabled: null,
   };
 
   const dialogReturnFocus = new WeakMap<HTMLDialogElement, HTMLElement>();
@@ -1197,6 +1266,267 @@
       return error.trim();
     }
     return fallback;
+  }
+
+  function formatUpdateVersion(version: string): string {
+    const normalized = version.trim();
+    return normalized.startsWith("v") ? normalized : `v${normalized}`;
+  }
+
+  function formatByteCount(bytes: number): string {
+    const normalized = Math.max(0, bytes);
+    if (normalized < 1_024) {
+      return `${Math.round(normalized)} B`;
+    }
+    if (normalized < 1_048_576) {
+      return `${(normalized / 1_024).toFixed(1)} KB`;
+    }
+    return `${(normalized / 1_048_576).toFixed(1)} MB`;
+  }
+
+  function updateProgressPercent(downloaded: number, contentLength: number | null): number | null {
+    if (contentLength === null || contentLength <= 0) {
+      return null;
+    }
+    return Math.min(100, Math.max(0, (downloaded / contentLength) * 100));
+  }
+
+  function updatePhaseIsBusy(phase: UpdatePhase): boolean {
+    return ["checking", "downloading", "installing", "restarting"].includes(phase);
+  }
+
+  function renderUpdateState(): void {
+    const update = state.availableUpdate;
+    const busy = updatePhaseIsBusy(state.updatePhase);
+    const dismissed = Boolean(
+      update && state.dismissedUpdateVersion === update.version,
+    );
+    const bannerVisible = Boolean(
+      update && (!dismissed || busy || state.updatePhase === "restart-ready"),
+    );
+
+    elements.updateBanner.hidden = !bannerVisible;
+    elements.updateBanner.dataset.state = state.updatePhase;
+    elements.updateBanner.setAttribute("aria-busy", String(busy));
+    elements.checkForUpdatesButton.disabled = busy;
+    elements.checkForUpdatesButton.classList.toggle(
+      "is-loading",
+      state.updatePhase === "checking",
+    );
+    elements.checkForUpdatesButton.setAttribute(
+      "aria-busy",
+      String(state.updatePhase === "checking"),
+    );
+    elements.updateCheckStatus.classList.toggle(
+      "has-error",
+      state.updatePhase === "failed",
+    );
+
+    if (!update) {
+      elements.updateCheckStatus.textContent = state.updatePhase === "checking"
+        ? "Checking for a newer version…"
+        : state.updateMessage;
+      return;
+    }
+
+    const version = formatUpdateVersion(update.version);
+    elements.updateVersion.textContent = version;
+    elements.updateNowButton.disabled = busy;
+    elements.updateLaterButton.hidden = state.updatePhase === "restart-ready";
+    elements.updateLaterButton.disabled = busy || state.updatePhase === "restart-ready";
+    elements.updateProgress.hidden = state.updatePhase !== "downloading";
+
+    let status = "Ready to download and install.";
+    let settingsStatus = `Version ${version} is available.`;
+    let actionLabel = "Update now";
+    if (state.updatePhase === "downloading") {
+      const percent = updateProgressPercent(
+        state.updateDownloadedBytes,
+        state.updateContentLength,
+      );
+      if (percent === null) {
+        elements.updateProgress.removeAttribute("value");
+        status = `Downloading… ${formatByteCount(state.updateDownloadedBytes)}`;
+      } else {
+        elements.updateProgress.value = percent;
+        status = `Downloading… ${Math.round(percent)}%`;
+      }
+      settingsStatus = `Downloading version ${version}…`;
+      actionLabel = "Downloading…";
+    } else if (state.updatePhase === "installing") {
+      status = "Download complete. Installing update…";
+      settingsStatus = `Installing version ${version}…`;
+      actionLabel = "Installing…";
+    } else if (state.updatePhase === "restarting") {
+      status = "Update installed. Restarting VSParallel…";
+      settingsStatus = `Version ${version} is installed. Restarting…`;
+      actionLabel = "Restarting…";
+    } else if (state.updatePhase === "restart-ready") {
+      status = "Update installed. Restart VSParallel to finish.";
+      settingsStatus = `Version ${version} is installed and ready to restart.`;
+      actionLabel = "Restart now";
+    } else if (state.updatePhase === "failed") {
+      status = state.updateError || "The update could not be installed.";
+      settingsStatus = status;
+      actionLabel = "Try again";
+    }
+
+    elements.updateStatus.textContent = status;
+    elements.updateCheckStatus.textContent = settingsStatus;
+    elements.updateNowButton.textContent = actionLabel;
+  }
+
+  async function checkForUpdates(manual = false): Promise<void> {
+    if (updatePhaseIsBusy(state.updatePhase)) {
+      return;
+    }
+
+    if (state.availableUpdate) {
+      state.dismissedUpdateVersion = null;
+      if (state.updatePhase === "failed") {
+        state.updatePhase = "available";
+        state.updateError = "";
+      }
+      renderUpdateState();
+      if (manual) {
+        closeSettingsDialog();
+      }
+      return;
+    }
+
+    if (!tauriUpdater?.check) {
+      if (manual) {
+        state.updatePhase = "failed";
+        state.updateMessage = "Update checking is unavailable in this build.";
+        renderUpdateState();
+      }
+      return;
+    }
+
+    if (state.updateChecksEnabled === null) {
+      try {
+        state.updateChecksEnabled = await invoke("is_release_build", {}) === true;
+      } catch (_error) {
+        state.updateChecksEnabled = false;
+      }
+    }
+    if (!state.updateChecksEnabled) {
+      if (manual) {
+        state.updatePhase = "idle";
+        state.updateMessage = "Update checks are available in installed release builds.";
+        renderUpdateState();
+      }
+      return;
+    }
+
+    state.updatePhase = "checking";
+    state.updateMessage = "Checking for a newer version…";
+    state.updateError = "";
+    renderUpdateState();
+
+    try {
+      const update = await tauriUpdater.check({ timeout: UPDATE_CHECK_TIMEOUT_MS });
+      if (!update) {
+        state.updatePhase = "idle";
+        state.updateMessage = manual
+          ? "VSParallel is up to date."
+          : "Updates are checked quietly after VSParallel starts.";
+        renderUpdateState();
+        return;
+      }
+      if (!asString(update.version) || typeof update.downloadAndInstall !== "function") {
+        throw new Error("The update service returned invalid metadata.");
+      }
+
+      state.availableUpdate = update;
+      state.dismissedUpdateVersion = null;
+      state.updateDownloadedBytes = 0;
+      state.updateContentLength = null;
+      state.updatePhase = "available";
+      state.updateMessage = `Version ${formatUpdateVersion(update.version)} is available.`;
+      renderUpdateState();
+      if (manual) {
+        closeSettingsDialog();
+      }
+    } catch (_error) {
+      state.updatePhase = manual ? "failed" : "idle";
+      state.updateMessage = manual
+        ? "Could not check for updates right now."
+        : "Updates are checked quietly after VSParallel starts.";
+      renderUpdateState();
+    }
+  }
+
+  function handleUpdateDownloadEvent(event: UpdateDownloadEvent): void {
+    if (event.event === "Started") {
+      const contentLength = asFiniteNumber(event.data?.contentLength);
+      state.updateContentLength = contentLength !== null && contentLength > 0
+        ? contentLength
+        : null;
+      state.updateDownloadedBytes = 0;
+      state.updatePhase = "downloading";
+    } else if (event.event === "Progress") {
+      const chunkLength = asFiniteNumber(event.data?.chunkLength, 0) ?? 0;
+      state.updateDownloadedBytes += Math.max(0, chunkLength);
+      state.updatePhase = "downloading";
+    } else if (event.event === "Finished") {
+      state.updatePhase = "installing";
+    }
+    renderUpdateState();
+  }
+
+  async function restartAfterUpdate(): Promise<void> {
+    if (!tauriProcess?.relaunch) {
+      state.updatePhase = "restart-ready";
+      renderUpdateState();
+      return;
+    }
+
+    state.updatePhase = "restarting";
+    renderUpdateState();
+    try {
+      await tauriProcess.relaunch();
+    } catch (_error) {
+      state.updatePhase = "restart-ready";
+      renderUpdateState();
+    }
+  }
+
+  async function installAvailableUpdate(): Promise<void> {
+    if (state.updatePhase === "restart-ready") {
+      await restartAfterUpdate();
+      return;
+    }
+    if (!state.availableUpdate || updatePhaseIsBusy(state.updatePhase)) {
+      return;
+    }
+
+    state.updatePhase = "downloading";
+    state.updateDownloadedBytes = 0;
+    state.updateContentLength = null;
+    state.updateError = "";
+    renderUpdateState();
+
+    try {
+      await state.availableUpdate.downloadAndInstall(handleUpdateDownloadEvent, {
+        timeout: UPDATE_DOWNLOAD_TIMEOUT_MS,
+      });
+    } catch (_error) {
+      state.updatePhase = "failed";
+      state.updateError = "Could not download or install the update. Try again later.";
+      renderUpdateState();
+      return;
+    }
+
+    await restartAfterUpdate();
+  }
+
+  function deferAvailableUpdate(): void {
+    if (!state.availableUpdate || updatePhaseIsBusy(state.updatePhase)) {
+      return;
+    }
+    state.dismissedUpdateVersion = state.availableUpdate.version;
+    renderUpdateState();
   }
 
   function isDialogOpen(dialog: HTMLDialogElement): boolean {
@@ -2261,6 +2591,9 @@
   elements.closeButton.addEventListener("click", closeWindow);
   elements.settingsButton.addEventListener("click", openSettingsDialog);
   elements.settingsCloseButton.addEventListener("click", closeSettingsDialog);
+  elements.checkForUpdatesButton.addEventListener("click", () => checkForUpdates(true));
+  elements.updateNowButton.addEventListener("click", installAvailableUpdate);
+  elements.updateLaterButton.addEventListener("click", deferAvailableUpdate);
   elements.appearanceInputs.forEach((input) => {
     input.addEventListener("change", () => {
       if (input.checked) {
@@ -2331,8 +2664,12 @@
   renderWindowChromeState(fallbackWindowChromeState());
   refreshWindowChromeState();
   applyThemePreference(state.themePreference, false);
+  renderUpdateState();
   refreshIntegrationStatus();
   refreshAll();
+  window.setTimeout(() => {
+    void checkForUpdates(false);
+  }, UPDATE_CHECK_DELAY_MS);
   window.setInterval(refreshSnapshot, REFRESH_INTERVAL_MS);
   window.setInterval(refreshUsage, USAGE_REFRESH_INTERVAL_MS);
 })();

@@ -67,5 +67,13 @@
     },
     "shortDescription": "VS Code workspace and AI activity overview",
     "longDescription": "A privacy-preserving local workspace switcher for multiple VS Code windows."
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "",
+      "endpoints": [
+        "https://github.com/fromfactory/vsparallel/releases/latest/download/latest.json"
+      ]
+    }
   }
 }

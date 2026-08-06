@@ -29,6 +29,7 @@ jobs:
         run: |
           config_version=$(python3 -c 'import json; print(json.load(open("src-tauri/tauri.conf.json", encoding="utf-8"))["version"])')
           cargo_version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' src-tauri/Cargo.toml)
+          updater_pubkey=$(python3 -c 'import json; print(json.load(open("src-tauri/tauri.conf.json", encoding="utf-8")).get("plugins", {}).get("updater", {}).get("pubkey", ""))')
 
           if [[ "$GITHUB_REF_NAME" != "v$config_version" ]]; then
             echo "::error::Tag $GITHUB_REF_NAME does not match Tauri version $config_version"
@@ -36,6 +37,10 @@ jobs:
           fi
           if [[ "$cargo_version" != "$config_version" ]]; then
             echo "::error::src-tauri/Cargo.toml ($cargo_version) and tauri.conf.json ($config_version) disagree"
+            exit 1
+          fi
+          if [[ -z "$updater_pubkey" ]]; then
+            echo "::error::Configure plugins.updater.pubkey before creating the first release"
             exit 1
           fi
 
@@ -128,7 +133,13 @@ jobs:
       - name: Build release packages
         if: runner.os != 'macOS'
         shell: bash
-        run: ./scripts/build-bundles.sh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -o pipefail
+          ./scripts/build-bundles.sh --config src-tauri/tauri.release.conf.json \
+            2>&1 | tee "$RUNNER_TEMP/tauri-build.log"
 
       - name: Build universal macOS packages
         if: runner.os == 'macOS'
@@ -136,7 +147,21 @@ jobs:
         env:
           # Ad-hoc signing is sufficient for the initial, unnotarized builds.
           APPLE_SIGNING_IDENTITY: "-"
-        run: ./scripts/build-bundles.sh --target universal-apple-darwin
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -o pipefail
+          ./scripts/build-bundles.sh --config src-tauri/tauri.release.conf.json \
+            --target universal-apple-darwin \
+            2>&1 | tee "$RUNNER_TEMP/tauri-build.log"
+
+      - name: Verify updater signing key
+        shell: bash
+        run: |
+          if grep -Fq 'does not match the public key' "$RUNNER_TEMP/tauri-build.log"; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY does not match plugins.updater.pubkey"
+            exit 1
+          fi
 
       - name: Collect Linux packages
         if: runner.os == 'Linux'
@@ -144,7 +169,9 @@ jobs:
         run: |
           mkdir -p dist/release
           cp target/release/bundle/deb/*.deb dist/release/
+          cp target/release/bundle/deb/*.deb.sig dist/release/
           cp target/release/bundle/appimage/*.AppImage dist/release/
+          cp target/release/bundle/appimage/*.AppImage.sig dist/release/
 
       - name: Collect macOS package
         if: runner.os == 'macOS'
@@ -152,6 +179,8 @@ jobs:
         run: |
           mkdir -p dist/release
           cp target/universal-apple-darwin/release/bundle/dmg/*.dmg dist/release/
+          cp target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz dist/release/
+          cp target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz.sig dist/release/
 
       - name: Collect Windows package
         if: runner.os == 'Windows'
@@ -159,6 +188,7 @@ jobs:
         run: |
           mkdir -p dist/release
           cp target/release/bundle/nsis/*-setup.exe dist/release/
+          cp target/release/bundle/nsis/*-setup.exe.sig dist/release/
 
       - name: Stage release packages
         uses: actions/upload-artifact@v7
@@ -177,6 +207,9 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
       - name: Download release packages
         uses: actions/download-artifact@v8
         with:
@@ -184,10 +217,24 @@ jobs:
           path: release-assets
           merge-multiple: true
 
+      - name: Create updater manifest
+        shell: bash
+        run: |
+          python3 scripts/create-update-manifest.py \
+            --assets release-assets \
+            --repository "$GITHUB_REPOSITORY" \
+            --tag "$GITHUB_REF_NAME" \
+            --output release-assets/latest.json
+
       - name: Verify release packages
         shell: bash
         run: |
-          for pattern in '*.deb' '*.AppImage' '*.dmg' '*-setup.exe' '*.vsix'; do
+          for pattern in \
+            '*.deb' '*.deb.sig' \
+            '*.AppImage' '*.AppImage.sig' \
+            '*.dmg' '*.app.tar.gz' '*.app.tar.gz.sig' \
+            '*-setup.exe' '*-setup.exe.sig' \
+            '*.vsix' 'latest.json'; do
             if ! compgen -G "release-assets/$pattern" > /dev/null; then
               echo "::error::Missing release asset matching $pattern"
               exit 1

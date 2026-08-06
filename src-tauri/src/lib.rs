@@ -157,6 +157,11 @@ async fn get_snapshot() -> Result<Snapshot, String> {
 }
 
 #[tauri::command]
+fn is_release_build() -> bool {
+    !cfg!(debug_assertions)
+}
+
+#[tauri::command]
 async fn get_usage() -> Result<usage::UsageSnapshot, String> {
     run_background(|| Ok(usage::get_usage_snapshot())).await
 }
@@ -1846,6 +1851,8 @@ pub fn run() {
                 }
             },
         ))
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             app.manage(WindowPresentationState::default());
             if let Some(window) = app.get_webview_window("main") {
@@ -1910,6 +1917,7 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            is_release_build,
             get_snapshot,
             get_usage,
             get_diagnostics,
