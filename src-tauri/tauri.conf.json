@@ -70,7 +70,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEM5Nzg5ODVBRUIwRENEMzQKUldRMHpRM3JXcGg0eVNLL1BDSTJnVFc4UzhVWE9KdG82dDI3UHFFN2FjMVRrSG43SEp6eWt5TXcK",
       "endpoints": [
         "https://github.com/fromfactory/vsparallel/releases/latest/download/latest.json"
       ]
