@@ -362,6 +362,45 @@ test("Codex setup keeps review guidance separate from installed status", () => {
   }, "codex").reviewRequired, true);
 });
 
+test("setup separates activity hooks from provider usage requirements", () => {
+  const html = read("ui/index.html");
+  const css = read("ui/styles.css");
+  const javascript = read("ui/generated/app.js");
+  const integrationSection = html.match(
+    /<section\b(?=[^>]*class="[^"]*\bintegration-section\b[^"]*")[^>]*>[\s\S]*?<\/section>/i,
+  )?.[0];
+  assert.ok(integrationSection, "the integrations section should exist");
+  const integrationText = integrationSection.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ");
+
+  assert.match(integrationText, /Activity hooks and usage are separate\./i);
+  assert.match(integrationText, /Hooks report lifecycle status/i);
+  assert.doesNotMatch(integrationText, /VS Code extension is required/i);
+  assert.match(integrationText, /Codex activity hooks/i);
+  assert.match(integrationText, /Claude Code activity hooks/i);
+  assert.match(
+    integrationText,
+    /compatible, signed-in Codex CLI available to this app, either from a standalone installation or the locally installed Codex VS Code extension/i,
+  );
+  assert.match(
+    integrationText,
+    /compatible, signed-in Claude Code CLI available to this app, either from a standalone installation or the locally installed Claude Code VS Code extension/i,
+  );
+  assert.match(integrationText, /recent terminal status-line capture can also provide fallback usage/i);
+  assert.equal(
+    Array.from(integrationSection.matchAll(/<p\b(?=[^>]*class="integration-usage-requirement")(?=[^>]*role="note")[^>]*>/gi)).length,
+    2,
+    "each provider should have a separate usage requirement",
+  );
+  assert.match(css, /\.integration-usage-requirement\s*\{/);
+  assert.match(integrationText, /Set up monitoring/i);
+  assert.doesNotMatch(integrationText, /Set up all/i);
+  assert.match(javascript, /:\s*"Set up monitoring"/);
+  assert.match(javascript, /Codex activity hooks installed\. Usage remaining is separate/);
+  assert.match(javascript, /Claude Code activity hooks installed\. Usage remaining is separate/);
+  assert.match(javascript, /The VS Code companion and activity hooks are installed\. Usage remaining is separate/);
+  assert.doesNotMatch(javascript, /All integrations are installed|still needs/i);
+});
+
 test("the interface uses the reference icon on every in-app brand surface", () => {
   const html = read("ui/index.html");
   assert.match(html, /<link\b(?=[^>]*rel="icon")(?=[^>]*href="vsparallel-icon\.png")[^>]*>/i);

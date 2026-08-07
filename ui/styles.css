@@ -1608,6 +1608,24 @@ html[data-workspace-opening="true"] .app-shell {
   font-size: 9px;
 }
 
+.integration-usage-requirement {
+  margin-top: 8px;
+  padding: 7px 8px;
+  border: 1px solid var(--divider-subtle);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--text-muted);
+  font-size: 10px;
+  line-height: 1.4;
+}
+
+.integration-usage-requirement strong {
+  display: block;
+  margin-bottom: 2px;
+  color: var(--text);
+  font-weight: 650;
+}
+
 .trust-guidance {
   margin-top: 10px;
   padding: 8px 9px;

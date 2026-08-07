@@ -390,16 +390,26 @@
             </div>
           </section>
 
-          <section class="integration-section" aria-labelledby="integrationHeading">
+          <section
+            class="integration-section"
+            aria-labelledby="integrationHeading"
+            aria-describedby="integrationDescription"
+          >
               <div class="subsection-heading">
-                <h3 id="integrationHeading">Integrations</h3>
+                <div>
+                  <h3 id="integrationHeading">Integrations</h3>
+                  <p id="integrationDescription">
+                    Activity hooks and usage are separate. Hooks report lifecycle status; usage
+                    comes from the provider sources described below.
+                  </p>
+                </div>
                 <button
                   class="setup-button setup-button--primary setup-all-button"
                   id="setupAllButton"
                   type="button"
                   disabled
                 >
-                  Set up all
+                  Set up monitoring
                 </button>
               </div>
 
@@ -453,7 +463,7 @@
                       </svg>
                       <div>
                         <h4>
-                          Codex hooks
+                          Codex activity hooks
                           <span class="optional-label">Optional</span>
                         </h4>
                         <p class="integration-detail" id="codexDetail">
@@ -466,6 +476,12 @@
                     </span>
                   </div>
                   <p class="integration-meta" id="codexMeta" hidden></p>
+                  <p class="integration-usage-requirement" role="note">
+                    <strong>Usage remaining is separate.</strong>
+                    For live usage, VSParallel needs a compatible, signed-in Codex CLI available
+                    to this app, either from a standalone installation or the locally installed
+                    Codex VS Code extension.
+                  </p>
                   <div class="trust-guidance" id="codexTrustGuidance" role="note" hidden>
                     <strong>Review required</strong>
                     Run <code>/hooks</code> in Codex, then review and trust or re-enable the
@@ -500,7 +516,7 @@
                       </svg>
                       <div>
                         <h4>
-                          Claude Code hooks
+                          Claude Code activity hooks
                           <span class="optional-label">Optional</span>
                         </h4>
                         <p class="integration-detail" id="claudeDetail">
@@ -513,6 +529,13 @@
                     </span>
                   </div>
                   <p class="integration-meta" id="claudeMeta" hidden></p>
+                  <p class="integration-usage-requirement" role="note">
+                    <strong>Usage remaining is separate.</strong>
+                    For live usage, VSParallel needs a compatible, signed-in Claude Code CLI
+                    available to this app, either from a standalone installation or the locally
+                    installed Claude Code VS Code extension. A recent terminal status-line capture
+                    can also provide fallback usage.
+                  </p>
                   <div class="integration-actions">
                     <button
                       class="setup-button setup-button--primary"

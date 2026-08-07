@@ -1980,7 +1980,7 @@
     elements.setupAllButton.disabled = busy || !status;
     elements.setupAllButton.textContent = state.integrationAction?.kind === "all"
       ? "Setting up…"
-      : "Set up all";
+      : "Set up monitoring";
 
     INTEGRATION_KINDS.forEach((kind) => {
       const component = status?.[kind];
@@ -2128,8 +2128,8 @@
       return "VS Code companion installed. Reload open VS Code windows to start reporting heartbeats.";
     }
     return kind === "codex"
-      ? "Codex hooks installed. In Codex, run /hooks and complete the required security review."
-      : "Claude Code hooks installed. Restart affected Claude Code sessions to load the new lifecycle handlers.";
+      ? "Codex activity hooks installed. Usage remaining is separate; see the requirement above. In Codex, run /hooks and complete the required security review."
+      : "Claude Code activity hooks installed. Usage remaining is separate; see the requirement above. Restart affected Claude Code sessions to load the new lifecycle handlers.";
   }
 
   async function runIntegrationAction(
@@ -2250,7 +2250,7 @@
 
     if (unconfirmed.length === 0) {
       setIntegrationMessage(
-        "All integrations are installed. Reload VS Code, restart affected provider sessions, then run /hooks in Codex and complete its required security review.",
+        "The VS Code companion and activity hooks are installed. Usage remaining is separate; see each provider's requirement above. Reload VS Code, restart affected provider sessions, then run /hooks in Codex and complete its required security review.",
         "success",
       );
     } else if (completed.length) {
