@@ -1,0 +1,20 @@
+{
+  "name": "vsparallel-website",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "GitHub Pages website for VSParallel",
+  "scripts": {
+    "dev": "vite",
+    "check": "tsc --project tsconfig.json",
+    "build": "npm run check && vite build",
+    "preview": "vite preview"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "devDependencies": {
+    "typescript": "6.0.3",
+    "vite": "8.1.5"
+  }
+}

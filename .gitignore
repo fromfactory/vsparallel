@@ -2,6 +2,8 @@
 /dist/
 /src-tauri/gen/schemas/
 /node_modules/
+/website/node_modules/
+/website/dist/
 /ui/generated/
 /.ui-test-build/
 *.vsix

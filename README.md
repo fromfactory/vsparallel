@@ -298,6 +298,31 @@ This compiles and strictly type-checks the TypeScript UI, runs its interface
 tests, checks Rust formatting, runs Clippy with warnings denied, executes the
 Rust test suite, and runs the JavaScript companion tests.
 
+### Website
+
+The GitHub Pages website is a lightweight Vite and Vanilla TypeScript project
+in `website/`. Its dependencies and lockfile are separate from the desktop
+application tooling. To start the development server from the repository root:
+
+```bash
+npm --prefix website ci
+npm --prefix website run dev
+```
+
+Open `http://localhost:5173/vsparallel/` and stop the server with `Ctrl+C`. To
+build and preview the production output under the same repository base path:
+
+```bash
+npm --prefix website run build
+npm --prefix website run preview
+```
+
+Open `http://localhost:4173/vsparallel/`. Pushes to `main` that change the
+website run the separate Pages workflow in `.github/workflows/pages.yml`; the
+tag-triggered desktop release workflow is unchanged. Before the first
+deployment, select **GitHub Actions** as the publishing source under the
+repository's **Settings > Pages**.
+
 ### Build release packages
 
 Install the pinned Tauri CLI and use the release wrapper:
