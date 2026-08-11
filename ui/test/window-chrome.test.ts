@@ -276,6 +276,56 @@ test("native panel recovery follows delayed desktop activation without taking ed
   );
 });
 
+test("macOS compact chrome preserves native minimization", () => {
+  const library = read("src-tauri/src/lib.rs");
+  const floatingPresentation = library.match(
+    /fn apply_floating_panel_presentation[\s\S]*?\nasync fn enter_floating_panel/,
+  )?.[0];
+  assert.ok(floatingPresentation, "the floating presentation should remain inspectable");
+
+  const decorations = floatingPresentation.indexOf("set_decorations(false)");
+  const resizing = floatingPresentation.indexOf("set_resizable(false)");
+  const minimization = floatingPresentation.indexOf("set_minimizable(true)");
+  assert.ok(decorations >= 0, "the compact panel should remove native decorations");
+  assert.ok(
+    resizing > decorations,
+    "the compact panel should fix its size after going borderless",
+  );
+  assert.ok(
+    minimization > resizing,
+    "macOS minimizability must be restored after Tao replaces the borderless style mask",
+  );
+
+  const readiness = library.match(
+    /async fn wait_for_floating_panel_ready[\s\S]*?\nfn apply_floating_panel_presentation/,
+  )?.[0];
+  assert.ok(readiness, "the floating readiness check should remain inspectable");
+  assert.match(readiness, /is_minimizable\(\)/);
+  assert.match(readiness, /if !minimizable[\s\S]*?set_minimizable\(true\)/);
+
+  assert.match(
+    library,
+    /struct NormalWindowState[\s\S]*?minimizable:\s*bool[\s\S]*?macos_behavior/,
+  );
+  assert.match(
+    library,
+    /could not restore VSParallel minimization[\s\S]*?set_minimizable\(normal\.minimizable\)/,
+  );
+
+  const reconciliation = library.match(
+    /fn reconcile_floating_panel[\s\S]*?\nfn schedule_floating_panel_watchdog/,
+  )?.[0];
+  assert.ok(reconciliation, "the native reconciliation path should remain inspectable");
+  assert.match(
+    reconciliation,
+    /cfg\(target_os = "macos"\)[\s\S]*?is_minimized\(\)[\s\S]*?panel_hidden = true[\s\S]*?advance_window_generation/,
+  );
+  assert.match(
+    reconciliation,
+    /cfg\(not\(target_os = "macos"\)\)[\s\S]*?window[\s\S]*?\.unminimize\(\)/,
+  );
+});
+
 test("GTK monitor geometry is captured on the native main thread", () => {
   const library = read("src-tauri/src/lib.rs");
   const placementCapture = library.match(

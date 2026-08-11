@@ -71,6 +71,8 @@ struct NormalWindowState {
     decorated: bool,
     always_on_top: bool,
     #[cfg(target_os = "macos")]
+    minimizable: bool,
+    #[cfg(target_os = "macos")]
     macos_behavior: MacosWindowBehavior,
 }
 
@@ -673,6 +675,10 @@ fn capture_normal_window(
             .is_always_on_top()
             .map_err(|error| format!("could not read the VSParallel stacking state: {error}"))?,
         #[cfg(target_os = "macos")]
+        minimizable: window
+            .is_minimizable()
+            .map_err(|error| format!("could not read the VSParallel minimize state: {error}"))?,
+        #[cfg(target_os = "macos")]
         macos_behavior,
     })
 }
@@ -1162,10 +1168,17 @@ async fn wait_for_floating_panel_ready(window: &tauri::WebviewWindow) -> Result<
             let size = window
                 .inner_size()
                 .map_err(|error| format!("could not read the VSParallel panel size: {error}"))?;
+            #[cfg(target_os = "macos")]
+            let minimizable = window.is_minimizable().map_err(|error| {
+                format!("could not read the VSParallel panel minimize state: {error}")
+            })?;
+            #[cfg(not(target_os = "macos"))]
+            let minimizable = true;
 
             if visible
                 && !minimized
                 && always_on_top
+                && minimizable
                 && floating_panel_size_is_ready(size, scale_factor)
             {
                 // Keep a small compositor turn between the sticky-window request and VS Code's
@@ -1187,6 +1200,12 @@ async fn wait_for_floating_panel_ready(window: &tauri::WebviewWindow) -> Result<
                     format!("could not keep the VSParallel panel above VS Code: {error}")
                 })?;
             }
+            #[cfg(target_os = "macos")]
+            if !minimizable {
+                window.set_minimizable(true).map_err(|error| {
+                    format!("could not make the VSParallel panel minimizable: {error}")
+                })?;
+            }
             std::thread::sleep(FLOATING_PANEL_READY_INTERVAL);
         }
 
@@ -1196,15 +1215,22 @@ async fn wait_for_floating_panel_ready(window: &tauri::WebviewWindow) -> Result<
         let minimized = window
             .is_minimized()
             .map_err(|error| format!("could not read the VSParallel minimized state: {error}"))?;
-        if !visible || minimized {
+        #[cfg(target_os = "macos")]
+        let minimizable = window.is_minimizable().map_err(|error| {
+            format!("could not read the VSParallel panel minimize state: {error}")
+        })?;
+        #[cfg(not(target_os = "macos"))]
+        let minimizable = true;
+        if !visible || minimized || !minimizable {
             return Err(
-                "VSParallel could not make the floating panel visible before opening VS Code"
+                "VSParallel could not make the floating panel visible and minimizable before opening VS Code"
                     .to_string(),
             );
         }
 
-        // Some compositors do not report or honor topmost/size hints. Visibility is the hard
-        // requirement; the watchdog below continues to repair best-effort stacking afterward.
+        // Some compositors do not report or honor topmost/size hints. Visibility, plus native
+        // minimization on macOS, is the hard requirement; the watchdog continues best-effort
+        // stacking repair afterward.
         Ok(())
     })
     .await
@@ -1227,6 +1253,12 @@ fn apply_floating_panel_presentation(
     window
         .set_resizable(false)
         .map_err(|error| format!("could not fix the floating panel size: {error}"))?;
+    #[cfg(target_os = "macos")]
+    // Tao's runtime borderless mask drops AppKit's Miniaturizable bit. The readiness loop also
+    // verifies this after the asynchronous decoration update has settled.
+    window
+        .set_minimizable(true)
+        .map_err(|error| format!("could not make the floating panel minimizable: {error}"))?;
     let panel_size = LogicalSize::new(FLOATING_PANEL_WIDTH, FLOATING_PANEL_HEIGHT);
     window
         .set_size(panel_size)
@@ -1457,6 +1489,12 @@ fn restore_full_window_state(
             "could not restore VSParallel resizing",
             window.set_resizable(normal.resizable),
         );
+        #[cfg(target_os = "macos")]
+        record_first_window_error(
+            &mut first_error,
+            "could not restore VSParallel minimization",
+            window.set_minimizable(normal.minimizable),
+        );
         record_first_window_error(
             &mut first_error,
             "could not restore the VSParallel size limit",
@@ -1545,11 +1583,29 @@ fn reconcile_floating_panel(
     } else {
         Ok(true)
     };
+    #[cfg(target_os = "macos")]
+    let native_minimized = window
+        .is_minimized()
+        .map_err(|error| format!("could not read the VSParallel panel minimize state: {error}"))?;
+    #[cfg(target_os = "macos")]
+    let mut presentation = window_presentation(&presentation)?;
+    #[cfg(not(target_os = "macos"))]
     let presentation = window_presentation(&presentation)?;
     if presentation.mode != WindowPresentationMode::Floating
         || presentation.generation != generation
         || presentation.panel_hidden
     {
+        return Ok(FloatingPanelReconcileResult {
+            active: false,
+            desktop_move: Ok(false),
+        });
+    }
+    #[cfg(target_os = "macos")]
+    if native_minimized {
+        // Cmd-M and native AppKit minimize actions bypass the frontend Hide command. Treat the
+        // native state as newer user intent so this visibility watchdog cannot undo it.
+        presentation.panel_hidden = true;
+        advance_window_generation(&mut presentation);
         return Ok(FloatingPanelReconcileResult {
             active: false,
             desktop_move: Ok(false),
@@ -1566,6 +1622,7 @@ fn reconcile_floating_panel(
         .map_err(|error| format!("could not repair the floating panel stacking: {error}"))?;
     let _ = window.set_visible_on_all_workspaces(true);
     set_macos_floating_behavior(&window)?;
+    #[cfg(not(target_os = "macos"))]
     window
         .unminimize()
         .map_err(|error| format!("could not repair the floating panel minimized state: {error}"))?;
@@ -1997,6 +2054,8 @@ mod tests {
             resizable: true,
             decorated: false,
             always_on_top: false,
+            #[cfg(target_os = "macos")]
+            minimizable: true,
             #[cfg(target_os = "macos")]
             macos_behavior: MacosWindowBehavior {
                 collection_behavior: objc2_app_kit::NSWindowCollectionBehavior::Default,
