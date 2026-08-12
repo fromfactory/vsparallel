@@ -11,7 +11,6 @@
   --panel-hover: #1c1c21;
   --control-bg: #1f1f24;
   --control-hover: #26262c;
-  --status-mark-bg: #1c1c20;
   --border: #27272d;
   --border-strong: #3a3a43;
   --divider-subtle: rgba(58, 58, 67, 0.56);
@@ -84,7 +83,6 @@
     --panel-hover: #e8e8ec;
     --control-bg: #f0f0f3;
     --control-hover: #e5e5e9;
-    --status-mark-bg: #f0f0f3;
     --border: #dedee3;
     --border-strong: #c6c6ce;
     --divider-subtle: rgba(91, 91, 103, 0.2);
@@ -805,7 +803,7 @@ main {
 .workspace-row {
   position: relative;
   display: grid;
-  grid-template-columns: 28px minmax(160px, 0.7fr) minmax(300px, 1.3fr);
+  grid-template-columns: minmax(160px, 0.7fr) minmax(300px, 1.3fr);
   align-items: center;
   gap: 9px;
   min-height: 74px;
@@ -858,7 +856,6 @@ main {
   opacity: 1;
 }
 
-.workspace-row.is-inactive .status-mark,
 .workspace-row.is-inactive .workspace-title-line,
 .workspace-row.is-inactive .workspace-meta,
 .workspace-row.is-inactive .activity-providers {
@@ -881,45 +878,6 @@ main {
   box-shadow:
     inset 0 0 0 2px var(--focus-ring),
     0 8px 24px var(--brand-shadow);
-}
-
-.status-mark {
-  position: relative;
-  display: inline-flex;
-  width: 24px;
-  height: 24px;
-  align-items: center;
-  justify-content: center;
-  border: 1px solid var(--border-strong);
-  border-radius: 50%;
-  background: var(--status-mark-bg);
-  color: var(--text-muted);
-  font-size: 12px;
-  font-weight: 800;
-}
-
-.status-mark[data-state="activity"] {
-  border-color: var(--accent-border-strong);
-  background: var(--accent-soft);
-  color: var(--accent);
-}
-
-.status-mark[data-state="finished"] {
-  border-color: var(--green-border);
-  background: var(--green-soft);
-  color: var(--green);
-}
-
-.status-mark[data-state="failure"] {
-  border-color: var(--red-border);
-  background: var(--red-soft);
-  color: var(--red);
-}
-
-.status-mark[data-state="unknown"] {
-  border-color: var(--border-strong);
-  background: var(--control-bg);
-  color: var(--text-muted);
 }
 
 .workspace-primary {
@@ -2267,7 +2225,7 @@ html[data-workspace-opening="true"] .app-shell {
 }
 
 :root[data-window-mode="floating"] .workspace-row {
-  grid-template-columns: 23px minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
   gap: 7px;
   min-height: 58px;
   padding: 4px 7px;
@@ -2289,12 +2247,6 @@ html[data-workspace-opening="true"] .app-shell {
   background:
     linear-gradient(100deg, var(--accent-soft-strong), transparent 72%),
     var(--floating-row-active);
-}
-
-:root[data-window-mode="floating"] .status-mark {
-  width: 21px;
-  height: 21px;
-  font-size: 10px;
 }
 
 :root[data-window-mode="floating"] .workspace-meta {
@@ -2425,11 +2377,11 @@ html[data-workspace-opening="true"] .app-shell {
   }
 
   .workspace-row {
-    grid-template-columns: 28px minmax(0, 1fr);
+    grid-template-columns: minmax(0, 1fr);
   }
 
   .activity-providers {
-    grid-column: 2;
+    grid-column: 1;
     padding-top: 5px;
     padding-left: 0;
     border-top: 1px solid var(--border);

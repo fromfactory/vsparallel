@@ -67,7 +67,6 @@
 
   interface ActivityView {
     kind: ActivityKind;
-    mark: string;
     label: string;
     changedAtMs: number | null;
     detail: string;
@@ -599,11 +598,10 @@
     };
   }
 
-  function describeActivityState(token: string): Pick<ActivityView, "kind" | "mark" | "label"> {
+  function describeActivityState(token: string): Pick<ActivityView, "kind" | "label"> {
     if (token === "activity_detected") {
       return {
         kind: "activity",
-        mark: "●",
         label: "Activity detected",
       };
     }
@@ -611,7 +609,6 @@
     if (token === "turn_finished") {
       return {
         kind: "finished",
-        mark: "✓",
         label: "Turn finished",
       };
     }
@@ -619,14 +616,12 @@
     if (["failed_or_interrupted", "failed/interrupted", "failed", "interrupted"].includes(token)) {
       return {
         kind: "failure",
-        mark: "!",
         label: "Failed/interrupted",
       };
     }
 
     return {
       kind: "unknown",
-      mark: "?",
       label: "Unknown",
     };
   }
@@ -1035,20 +1030,6 @@
     return element;
   }
 
-  function aggregateActivity(workspace: Workspace): ActivityView {
-    const priority: Record<ActivityKind, number> = {
-      activity: 4,
-      failure: 3,
-      finished: 2,
-      unknown: 1,
-    };
-    return [workspace.codex, workspace.claude, workspace.antigravity]
-      .filter((activity): activity is ActivityView => activity !== null)
-      .reduce((current, candidate) =>
-      priority[candidate.kind] > priority[current.kind] ? candidate : current,
-    );
-  }
-
   function describeExtensionPresence(
     activity: ActivityView,
     remoteWindow = false,
@@ -1182,12 +1163,6 @@
     row.classList.toggle("is-inactive", !workspace.active);
     row.classList.toggle("is-opening", opening);
     row.dataset.openable = String(openable);
-
-    const aggregate = aggregateActivity(workspace);
-    const statusMark = createElement("span", "status-mark", aggregate.mark);
-    statusMark.dataset.state = aggregate.kind;
-    statusMark.setAttribute("aria-hidden", "true");
-    row.append(statusMark);
 
     const primary = createElement("div", "workspace-primary");
     const application = createElement(

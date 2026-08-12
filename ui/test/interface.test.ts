@@ -676,9 +676,15 @@ test("the primary palette is VS Code blue in dark and light themes", () => {
   );
 });
 
-test("provider model names remain discoverable and the status panel owns most row width", () => {
+test("workspace rows omit redundant leading status icons while keeping provider details", () => {
   const javascript = read("ui/generated/app.js");
   const css = read("ui/styles.css");
+  const createRow = sliceBetween(
+    javascript,
+    /function\s+createWorkspaceRow\s*\(/,
+    /function\s+renderSnapshot\s*\(/,
+    "createWorkspaceRow",
+  );
   assert.match(
     javascript,
     /createProviderState\(\s*"Claude"\s*,\s*workspace\.claude\s*,\s*"Claude Code"\s*,\s*workspace\.editorName\s*,\s*workspace\.remoteWindow\s*\)/,
@@ -687,9 +693,11 @@ test("provider model names remain discoverable and the status panel owns most ro
   assert.match(javascript, /modelLabel\s*\|\|\s*"Antigravity"/);
   assert.match(javascript, /latest model reported by Antigravity/);
   assert.doesNotMatch(javascript, /createProviderState\(\s*"Claude Code"\s*,/);
+  assert.doesNotMatch(createRow, /status-mark/);
+  assert.doesNotMatch(css, /\.status-mark\b/);
   assert.match(
     css,
-    /\.workspace-row\s*\{[^}]*grid-template-columns\s*:\s*28px\s+minmax\(160px,\s*0\.7fr\)\s+minmax\(300px,\s*1\.3fr\)/i,
+    /\.workspace-row\s*\{[^}]*grid-template-columns\s*:\s*minmax\(160px,\s*0\.7fr\)\s+minmax\(300px,\s*1\.3fr\)/i,
   );
   assert.match(
     css,
