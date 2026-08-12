@@ -104,7 +104,7 @@ an open target.
 ## Lifecycle records (schema version 1)
 
 Codex records are stored as `codex/<sha256-of-session-id>.json`; Claude records
-use the same five-field structure at
+use the same five-core-field structure at
 `claude/<sha256-of-session-id>.json`. Antigravity 2.0 records are stored under
 `antigravity/` and Antigravity IDE records under `antigravity-ide/`, each using
 `<sha256-of-conversation-id-NUL-normalized-workspace-path>.json`:
@@ -118,6 +118,24 @@ use the same five-field structure at
   "changedAtMs": 1785800000000
 }
 ```
+
+Antigravity records may add an optional `modelKind` field derived from the
+documented hook `modelName`, for example
+`"modelKind": "gemini_3_6_flash_medium"`.
+
+The allowed values are `automatic`, `gemini`,
+`gemini_3_6_flash_medium`, `gemini_3_5_flash`,
+`gemini_3_1_pro_high`, `gemini_3_1_pro_low`, `gemini_3_flash`, `claude`,
+`claude_sonnet_4_6_thinking`, `claude_opus_4_6_thinking`, `gpt_oss`, and
+`gpt_oss_120b`. Specific recognized names use their specific token; other
+recognized Gemini, Claude, or GPT-OSS family names use the corresponding family
+token. `auto` is stored as `automatic` and displayed honestly as **Auto model**
+rather than guessing the routed model. Unrecognized, invalid, and oversized
+model names are omitted. The raw `modelName` is never stored.
+
+This optional field is an additive, backward-compatible part of schema version
+1. Codex and Claude records, older Antigravity records, and Antigravity events
+without a recognized model continue to contain only the five core fields.
 
 Allowed on-disk states across the three adapters are `activity_detected`,
 `turn_finished`, `session_ended`, `failed_or_interrupted`, `failed`, and
@@ -149,15 +167,17 @@ The adapters map only documented lifecycle events:
 
 Codex and Claude hash the provider session ID and do not retain the raw session
 or turn ID. The Antigravity adapter selects documented `conversationId`,
-`workspacePaths`, `transcriptPath`, and `artifactDirectoryPath` fields, plus
-`error` for `PostToolUse`/`Stop` and `terminationReason`/`fullyIdle` for `Stop`.
-It reduces the transcript path, or the artifact directory as a fallback, to the
-bounded surface `antigravity` or `antigravity-ide` and immediately discards
-both paths; CLI, conflicting, and unrecognized surfaces are not recorded. It
-hashes `conversationId`, writes one record for each distinct valid local path
-in `workspacePaths`, and discards all other payload fields. Its `sessionKey` is
-the conversation hash; including the normalized path in the filename prevents
-one multi-folder project path from replacing another.
+`workspacePaths`, `transcriptPath`, `artifactDirectoryPath`, and `modelName`
+fields, plus `error` for `PostToolUse`/`Stop` and
+`terminationReason`/`fullyIdle` for `Stop`. It reduces the transcript path, or
+the artifact directory as a fallback, to the bounded surface `antigravity` or
+`antigravity-ide` and immediately discards both paths; CLI, conflicting, and
+unrecognized surfaces are not recorded. It independently reduces a recognized
+model name to the closed `modelKind` token above and immediately discards the
+raw value. It hashes `conversationId`, writes one record for each distinct
+valid local path in `workspacePaths`, and discards all other payload fields.
+Its `sessionKey` is the conversation hash; including the normalized path in the
+filename prevents one multi-folder project path from replacing another.
 
 Antigravity 2.0, Antigravity IDE, and the Antigravity CLI share the documented
 global hook configuration at `~/.gemini/config/hooks.json`. Their documented
@@ -167,7 +187,9 @@ without a matching companion heartbeat is therefore presented as recent and
 non-openable under its identified Antigravity product. These events start in
 the agent execution loop: opening or selecting an Antigravity 2.0 Project alone
 does not produce a record. A workspace `.agents/hooks.json` can take precedence
-over the global configuration.
+over the global configuration. Any model label is the latest model reported on
+the lifecycle record currently selected for display; it is not proof that the
+model is actively inferring at that moment.
 
 ### Antigravity hook installation
 
@@ -207,11 +229,11 @@ each invocation also atomically replaces one product-specific record in
 The fixed outcomes are `recorded`, `invalid_payload`, `unsupported_surface`,
 `missing_conversation`, `no_workspace`, and `persist_failed`. Health records
 never contain a conversation identifier, workspace path, transcript or
-artifact path, model name, error text, prompt, or response. Setup and
-diagnostics use this record to distinguish **awaiting agent turn** from a hook
-that executed but could not produce an activity row. If the shared state root
-itself is unavailable, the hook remains fail-open and cannot write either the
-activity or health record.
+artifact path, model name or `modelKind`, error text, prompt, or response.
+Setup and diagnostics use this record to distinguish **awaiting agent turn**
+from a hook that executed but could not produce an activity row. If the shared
+state root itself is unavailable, the hook remains fail-open and cannot write
+either the activity or health record.
 
 ## Claude Code status-line fallback record (schema version 1)
 
@@ -348,11 +370,13 @@ content, Git diffs, tool inputs/output, transcript paths/content, credentials,
 or machine identifiers. The companion records only the public extension status
 and placement fields shown above; it never reads extension exports or private
 state. The lifecycle adapters receive richer documented hook payloads but
-create new five-field objects and discard the input before writing. The Claude
-status-line adapter likewise creates the minimal usage record shown above and
-does not represent or persist the accompanying session ID, working directory,
-model, cost, repository data, or transcript path. Live Codex and Claude usage
-remains in memory only, and VSParallel never reads or stores provider
-credentials. Of the usage responses, only the minimal Claude status-line
-fallback record is persisted; live usage responses remain memory-only.
+create new objects with the five core fields and discard the input before
+writing. Antigravity may add only the optional closed `modelKind` described
+above; it never writes the raw model identifier. The Claude status-line adapter
+likewise creates the minimal usage record shown above and does not represent or
+persist the accompanying session ID, working directory, model, cost,
+repository data, or transcript path. Live Codex and Claude usage remains in
+memory only, and VSParallel never reads or stores provider credentials. Of the
+usage responses, only the minimal Claude status-line fallback record is
+persisted; live usage responses remain memory-only.
 Automated Rust and JavaScript tests assert these boundaries.

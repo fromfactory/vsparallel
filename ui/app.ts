@@ -15,6 +15,19 @@
   type IntegrationOperation = "install" | "uninstall";
   type IntegrationVisualState = "missing" | "ready" | "warning" | "error";
   type ActivityKind = "activity" | "finished" | "failure" | "unknown";
+  type AntigravityModelKind =
+    | "automatic"
+    | "gemini"
+    | "gemini_3_6_flash_medium"
+    | "gemini_3_5_flash"
+    | "gemini_3_1_pro_high"
+    | "gemini_3_1_pro_low"
+    | "gemini_3_flash"
+    | "claude"
+    | "claude_sonnet_4_6_thinking"
+    | "claude_opus_4_6_thinking"
+    | "gpt_oss"
+    | "gpt_oss_120b";
   type UsageKind = "codex" | "claude";
   type UsageState = "available" | "stale" | "unavailable";
   type NoticeKind = "error" | "warning";
@@ -58,6 +71,7 @@
     label: string;
     changedAtMs: number | null;
     detail: string;
+    modelKind: AntigravityModelKind | null;
     extensionDetectionAvailable: boolean | null;
     extensionInstalled: boolean | null;
     extensionActive: boolean | null;
@@ -617,6 +631,58 @@
     };
   }
 
+  function normalizeAntigravityModelKind(value: unknown): AntigravityModelKind | null {
+    const token = normalizeStateToken(value);
+    switch (token) {
+      case "automatic":
+      case "gemini":
+      case "gemini_3_6_flash_medium":
+      case "gemini_3_5_flash":
+      case "gemini_3_1_pro_high":
+      case "gemini_3_1_pro_low":
+      case "gemini_3_flash":
+      case "claude":
+      case "claude_sonnet_4_6_thinking":
+      case "claude_opus_4_6_thinking":
+      case "gpt_oss":
+      case "gpt_oss_120b":
+        return token;
+      default:
+        return null;
+    }
+  }
+
+  function antigravityModelLabel(kind: AntigravityModelKind | null): string {
+    switch (kind) {
+      case "automatic":
+        return "Auto model";
+      case "gemini_3_6_flash_medium":
+        return "Gemini 3.6 Flash (Medium)";
+      case "gemini_3_5_flash":
+        return "Gemini 3.5 Flash";
+      case "gemini_3_1_pro_high":
+        return "Gemini 3.1 Pro (High)";
+      case "gemini_3_1_pro_low":
+        return "Gemini 3.1 Pro (Low)";
+      case "gemini_3_flash":
+        return "Gemini 3 Flash";
+      case "claude_sonnet_4_6_thinking":
+        return "Claude Sonnet 4.6 (Thinking)";
+      case "claude_opus_4_6_thinking":
+        return "Claude Opus 4.6 (Thinking)";
+      case "gpt_oss_120b":
+        return "GPT-OSS-120b";
+      case "gemini":
+        return "Gemini";
+      case "claude":
+        return "Claude";
+      case "gpt_oss":
+        return "GPT-OSS";
+      default:
+        return "";
+    }
+  }
+
   function normalizeActivityView(rawValue: unknown): ActivityView {
     const raw = isObject(rawValue) ? rawValue : {};
     const description = describeActivityState(normalizeStateToken(raw.state));
@@ -625,6 +691,7 @@
       label: asString(raw.label, description.label),
       changedAtMs: asTimestamp(raw.changedAtMs),
       detail: asString(raw.detail),
+      modelKind: normalizeAntigravityModelKind(raw.modelKind),
       extensionDetectionAvailable: asNullableBoolean(raw.extensionDetectionAvailable),
       extensionInstalled: asNullableBoolean(raw.extensionInstalled),
       extensionActive: asNullableBoolean(raw.extensionActive),
@@ -1159,11 +1226,14 @@
     const providers = createElement("div", "activity-providers");
     providers.setAttribute("aria-label", "Agent lifecycle and IDE extension status");
     if (workspace.antigravity) {
+      const modelLabel = antigravityModelLabel(workspace.antigravity.modelKind);
       providers.append(
         createProviderState(
-          "Antigravity",
+          modelLabel || "Antigravity",
           workspace.antigravity,
-          "Antigravity",
+          modelLabel
+            ? `${modelLabel}, latest model reported by Antigravity`
+            : "Antigravity",
           workspace.editorName,
           false,
           false,

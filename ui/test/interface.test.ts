@@ -249,10 +249,11 @@ test("workspace activity preserves the backend's distinct no-activity label", ()
     "asNullableBoolean",
     "normalizeStateToken",
     "describeActivityState",
+    "normalizeAntigravityModelKind",
     "normalizeActivityView",
   ].map((name) => appFunction(javascript, name)).join("\n");
   const context = {} as {
-    normalizeActivityView(value: unknown): { label: string; kind: string };
+    normalizeActivityView(value: unknown): { label: string; kind: string; modelKind: string | null };
   };
   vm.runInNewContext(
     `const MAX_JAVASCRIPT_TIMESTAMP_MS = 8_640_000_000_000_000; ${functions}`,
@@ -266,6 +267,7 @@ test("workspace activity preserves the backend's distinct no-activity label", ()
   });
   assert.equal(initial.kind, "unknown");
   assert.equal(initial.label, "No activity yet");
+  assert.equal(context.normalizeActivityView({ state: "unknown" }).modelKind, null);
   assert.equal(context.normalizeActivityView({ state: "unknown" }).label, "Unknown");
 });
 
@@ -279,6 +281,7 @@ test("workspace normalization preserves Antigravity source and recent hook activ
     "asNullableBoolean",
     "normalizeStateToken",
     "describeActivityState",
+    "normalizeAntigravityModelKind",
     "normalizeActivityView",
     "deriveName",
     "normalizeWorkspace",
@@ -289,7 +292,7 @@ test("workspace normalization preserves Antigravity source and recent hook activ
       editorName: string;
       recentlyActive: boolean;
       openable: boolean;
-      antigravity: { kind: string; label: string } | null;
+      antigravity: { kind: string; label: string; modelKind: string | null } | null;
     };
   };
   vm.runInNewContext(
@@ -311,6 +314,7 @@ test("workspace normalization preserves Antigravity source and recent hook activ
       state: "turn_finished",
       label: "Turn finished",
       changedAtMs: 123,
+      modelKind: "gemini_3_6_flash_medium",
     },
   }, 0);
 
@@ -320,6 +324,29 @@ test("workspace normalization preserves Antigravity source and recent hook activ
   assert.equal(workspace.openable, false);
   assert.equal(workspace.antigravity?.kind, "finished");
   assert.equal(workspace.antigravity?.label, "Turn finished");
+  assert.equal(workspace.antigravity?.modelKind, "gemini_3_6_flash_medium");
+});
+
+test("Antigravity model labels accept only the public closed model set", () => {
+  const javascript = read("ui/generated/app.js");
+  const functions = [
+    "asString",
+    "normalizeStateToken",
+    "normalizeAntigravityModelKind",
+    "antigravityModelLabel",
+  ].map((name) => appFunction(javascript, name)).join("\n");
+  const context = {} as {
+    normalizeAntigravityModelKind(value: unknown): string | null;
+    antigravityModelLabel(value: string | null): string;
+  };
+  vm.runInNewContext(functions, context);
+
+  const gemini = context.normalizeAntigravityModelKind("gemini_3_6_flash_medium");
+  assert.equal(context.antigravityModelLabel(gemini), "Gemini 3.6 Flash (Medium)");
+  const automatic = context.normalizeAntigravityModelKind("automatic");
+  assert.equal(context.antigravityModelLabel(automatic), "Auto model");
+  assert.equal(context.normalizeAntigravityModelKind("private-future-model"), null);
+  assert.equal(context.antigravityModelLabel(null), "");
 });
 
 test("legacy companion heartbeats give an actionable IDE extension status", () => {
@@ -583,14 +610,16 @@ test("the primary palette is VS Code blue in dark and light themes", () => {
   );
 });
 
-test("provider names stay complete and the status panel owns most row width", () => {
+test("provider model names remain discoverable and the status panel owns most row width", () => {
   const javascript = read("ui/generated/app.js");
   const css = read("ui/styles.css");
   assert.match(
     javascript,
     /createProviderState\(\s*"Claude"\s*,\s*workspace\.claude\s*,\s*"Claude Code"\s*,\s*workspace\.editorName\s*,\s*workspace\.remoteWindow\s*\)/,
   );
-  assert.match(javascript, /createProviderState\(\s*"Antigravity"/);
+  assert.match(javascript, /antigravityModelLabel\(workspace\.antigravity\.modelKind\)/);
+  assert.match(javascript, /modelLabel\s*\|\|\s*"Antigravity"/);
+  assert.match(javascript, /latest model reported by Antigravity/);
   assert.doesNotMatch(javascript, /createProviderState\(\s*"Claude Code"\s*,/);
   assert.match(
     css,
@@ -598,11 +627,11 @@ test("provider names stay complete and the status panel owns most row width", ()
   );
   assert.match(
     css,
-    /\.provider-state\s*\{[^}]*grid-template-columns\s*:\s*72px\s+minmax\(0,\s*1fr\)/i,
+    /\.provider-state\s*\{[^}]*grid-template-columns\s*:\s*112px\s+minmax\(0,\s*1fr\)/i,
   );
   const providerName = css.match(/\.provider-name\s*\{([^}]*)\}/i)?.[1];
   assert.ok(providerName, "provider names should have dedicated styling");
-  assert.doesNotMatch(providerName, /text-overflow\s*:\s*ellipsis/i);
+  assert.match(providerName, /text-overflow\s*:\s*ellipsis/i);
 });
 
 test("platform, tray, UI, and companion icon assets use the complete size set", () => {

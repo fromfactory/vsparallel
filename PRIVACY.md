@@ -23,15 +23,17 @@ The temporary directory is removed when the query ends.
 
 VSParallel does not extract, log, store, or transmit prompts, responses, source
 files, terminal contents, transcripts, or Git data. Optional lifecycle hooks
-receive documented provider event payloads and construct new five-field records
-containing only a schema version, one-way session/conversation key, local
-workspace path, coarse state, and timestamp. Unselected fields are immediately
-discarded. Antigravity hooks additionally replace a product-specific execution
-health record containing only fixed event/surface/outcome values, a timestamp,
-and the number of workspace records written. The live Claude response parser
-and status-line receiver represent only percentage and reset fields; account,
-session, behavior-attribution, and other unselected response fields are
-discarded and never reach the UI or storage.
+receive documented provider event payloads and construct new records containing
+only five core fields: a schema version, one-way session/conversation key,
+local workspace path, coarse state, and timestamp. Antigravity activity records
+may add one optional closed `modelKind` classification derived from documented
+`modelName`; the raw model identifier and unrecognized values are immediately
+discarded. Antigravity hooks additionally replace a product-specific,
+model-free execution-health record containing only fixed event/surface/outcome
+values, a timestamp, and the number of workspace records written. The live
+Claude response parser and status-line receiver represent only percentage and
+reset fields; account, session, behavior-attribution, and other unselected
+response fields are discarded and never reach the UI or storage.
 Provider stderr and raw failure messages are also discarded. When usage is
 unavailable, the UI receives only a fixed source/category explanation such as
 could not start, timed out, rejected, or incompatible response.
@@ -50,11 +52,12 @@ current device:
   session identifier, working directory, and timestamp when optional lifecycle
   hooks are installed;
 - Antigravity hook-derived activity records under `antigravity/` or
-  `antigravity-ide/`, containing only the five fields above, with one record per
-  documented local `workspacePaths` entry;
+  `antigravity-ide/`, containing the five core fields above and, when
+  recognized, an optional closed `modelKind`, with one record per documented
+  local `workspacePaths` entry;
 - Antigravity hook execution health under `antigravity-hook-health/`, containing
   only schema version, fixed event/surface/outcome values, timestamp, and
-  workspace count; and
+  workspace count—never a model name or classification; and
 - the Claude Code five-hour and weekly percentages used, optional reset times,
   and a local capture timestamp in `usage/claude.json` only when managed
   status-line fallback capture is available.
@@ -88,13 +91,16 @@ rather than claiming a live window. A Project-level `.agents/hooks.json` can
 take precedence over the global hook.
 
 The Antigravity adapter admits documented `conversationId`, `workspacePaths`,
-`transcriptPath`, and `artifactDirectoryPath` values, plus the minimum `error`,
-`terminationReason`, and `fullyIdle` fields needed to select a coarse state for
-applicable events. It retains neither product path nor those error/reason
-values. The stored `sessionKey` is a SHA-256 hash of `conversationId`; the
-filename additionally hashes the normalized workspace path so a multi-folder
-project gets one independent record per path. Its execution-health record does
-not contain either identifier or any workspace path.
+`transcriptPath`, `artifactDirectoryPath`, and `modelName` values, plus the
+minimum `error`, `terminationReason`, and `fullyIdle` fields needed to select a
+coarse state for applicable events. It reduces a recognized model to one of the
+closed `modelKind` values documented in the
+[metadata protocol](docs/protocol.md), and retains neither the raw model value,
+product path, nor those error/reason values. The stored `sessionKey` is a
+SHA-256 hash of `conversationId`; the filename additionally hashes the
+normalized workspace path so a multi-folder project gets one independent
+record per path. Its execution-health record does not contain either
+identifier, any workspace path, or model information.
 
 Graphical Claude sessions in VS Code-compatible editors do not run the terminal
 `statusLine`, so the active query supplies usage independently of those sessions

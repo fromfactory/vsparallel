@@ -1002,7 +1002,7 @@ main {
 .provider-state {
   display: grid;
   min-width: 0;
-  grid-template-columns: 72px minmax(0, 1fr);
+  grid-template-columns: 112px minmax(0, 1fr);
   align-items: start;
   gap: 6px;
 }
@@ -1013,12 +1013,14 @@ main {
 }
 
 .provider-name {
+  overflow: hidden;
   padding-top: 1px;
   color: var(--text-muted);
   font-size: 9px;
   font-weight: 650;
   letter-spacing: 0.035em;
   text-transform: uppercase;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 

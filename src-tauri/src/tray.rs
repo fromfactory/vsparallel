@@ -548,6 +548,7 @@ mod tests {
             label: state.to_string(),
             changed_at_ms: None,
             detail: detail.to_string(),
+            model_kind: None,
             extension_detection_available: None,
             extension_installed: None,
             extension_active: None,

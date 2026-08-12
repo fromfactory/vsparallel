@@ -1,3 +1,4 @@
+use crate::antigravity_integration::AntigravityModelKind;
 use crate::opener::EditorKind;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
@@ -106,6 +107,8 @@ struct ActivityRecord {
     normalized_cwd: PathBuf,
     state: ActivityRecordState,
     changed_at_ms: i64,
+    #[serde(default)]
+    model_kind: Option<AntigravityModelKind>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -126,6 +129,8 @@ pub struct ActivityView {
     pub label: String,
     pub changed_at_ms: Option<i64>,
     pub detail: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_kind: Option<AntigravityModelKind>,
     pub extension_detection_available: Option<bool>,
     pub extension_installed: Option<bool>,
     pub extension_active: Option<bool>,
@@ -598,6 +603,7 @@ impl StateStore {
     }
 
     fn load_activity(&self, provider: &str, now_ms: i64) -> LoadResult<ActivityRecord> {
+        let supports_model = matches!(provider, "antigravity" | "antigravity-ide");
         load_records(&self.root.join(provider), |record: &mut ActivityRecord| {
             if record.schema_version != SCHEMA_VERSION
                 || record.session_key.trim().is_empty()
@@ -612,6 +618,9 @@ impl StateStore {
             };
             record.normalized_cwd = normalized_cwd;
             record.cwd.clear();
+            if !supports_model || record.model_kind == Some(AntigravityModelKind::Unknown) {
+                record.model_kind = None;
+            }
             true
         })
     }
@@ -944,6 +953,7 @@ fn aggregate_activity(
             format!(
                 "A {provider} turn-start hook was observed. This is a lifecycle marker, not live progress."
             ),
+            record.model_kind,
             extension,
         );
     }
@@ -955,6 +965,7 @@ fn aggregate_activity(
             "Unknown",
             Some(newest.changed_at_ms),
             format!("The last {provider} lifecycle signal is stale."),
+            newest.model_kind,
             extension,
         );
     }
@@ -969,6 +980,7 @@ fn aggregate_activity(
             } else {
                 format!("A {provider} Stop hook was observed.")
             },
+            newest.model_kind,
             extension,
         ),
         ActivityRecordState::FailedOrInterrupted
@@ -983,6 +995,7 @@ fn aggregate_activity(
             } else {
                 format!("A {provider} failure or interruption lifecycle signal was observed.")
             },
+            newest.model_kind,
             extension,
         ),
         ActivityRecordState::ActivityDetected => unreachable!("fresh activity returned above"),
@@ -1002,6 +1015,7 @@ fn pathless_activity(
             format!(
                 "Remote workspace paths are omitted for privacy. This release has no remote bridge for associating {provider} lifecycle signals with this window."
             ),
+            None,
             extension,
         );
     }
@@ -1013,6 +1027,7 @@ fn pathless_activity(
         format!(
             "Open a local folder or saved workspace so VSParallel can associate {provider} lifecycle signals with this window."
         ),
+        None,
         extension,
     )
 }
@@ -1041,7 +1056,7 @@ fn unknown_activity(
     detail.push_str(&format!(
         " Start {provider} in this workspace and submit a prompt to create the first lifecycle marker."
     ));
-    activity_view("unknown", "No activity yet", None, detail, extension)
+    activity_view("unknown", "No activity yet", None, detail, None, extension)
 }
 
 fn activity_view(
@@ -1049,6 +1064,7 @@ fn activity_view(
     label: &str,
     changed_at_ms: Option<i64>,
     detail: String,
+    model_kind: Option<AntigravityModelKind>,
     extension: Option<ExtensionPresenceRecord>,
 ) -> ActivityView {
     ActivityView {
@@ -1056,6 +1072,7 @@ fn activity_view(
         label: label.to_string(),
         changed_at_ms,
         detail,
+        model_kind,
         extension_detection_available: extension.map(|value| value.available),
         extension_installed: extension.map(|value| value.installed),
         extension_active: extension.map(|value| value.active),
@@ -1404,7 +1421,8 @@ mod tests {
                 "sessionKey": "hashed-conversation",
                 "cwd": repo,
                 "state": "turn_finished",
-                "changedAtMs": now - 10
+                "changedAtMs": now - 10,
+                "modelKind": "gemini_3_6_flash_medium"
             }),
         );
 
@@ -1422,12 +1440,16 @@ mod tests {
         assert!(!workspace.active);
         assert!(!workspace.focused);
         assert!(workspace.recently_active);
+        let antigravity = workspace.antigravity.as_ref().unwrap();
+        assert_eq!(antigravity.state, "turn_finished");
         assert_eq!(
-            workspace
-                .antigravity
-                .as_ref()
-                .map(|activity| activity.state.as_str()),
-            Some("turn_finished")
+            antigravity.model_kind,
+            Some(AntigravityModelKind::Gemini36FlashMedium)
+        );
+        let serialized = serde_json::to_value(workspace).unwrap();
+        assert_eq!(
+            serialized["antigravity"]["modelKind"],
+            "gemini_3_6_flash_medium"
         );
         assert!(store
             .find_workspace_open_target(&workspace.instance_id, now)
@@ -1474,6 +1496,78 @@ mod tests {
                 .map(|activity| activity.state.as_str()),
             Some("activity_detected")
         );
+        assert_eq!(
+            snapshot.workspaces[0]
+                .antigravity
+                .as_ref()
+                .and_then(|activity| activity.model_kind),
+            None,
+            "legacy records without modelKind remain valid"
+        );
+    }
+
+    #[test]
+    fn antigravity_model_follows_the_lifecycle_record_selected_for_display() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("model-project");
+        fs::create_dir_all(&repo).unwrap();
+        let now = 30_000;
+        write_json(
+            &temp.path().join("antigravity/finished.json"),
+            json!({
+                "schemaVersion": 1,
+                "sessionKey": "finished",
+                "cwd": repo,
+                "state": "turn_finished",
+                "changedAtMs": now - 10,
+                "modelKind": "claude_sonnet_4_6_thinking"
+            }),
+        );
+        write_json(
+            &temp.path().join("antigravity/activity.json"),
+            json!({
+                "schemaVersion": 1,
+                "sessionKey": "activity",
+                "cwd": repo,
+                "state": "activity_detected",
+                "changedAtMs": now - 100,
+                "modelKind": "gemini_3_1_pro_high"
+            }),
+        );
+
+        let snapshot = StateStore::new(temp.path().to_path_buf()).snapshot(now);
+        let activity = snapshot.workspaces[0].antigravity.as_ref().unwrap();
+        assert_eq!(activity.state, "activity_detected");
+        assert_eq!(activity.changed_at_ms, Some(now - 100));
+        assert_eq!(
+            activity.model_kind,
+            Some(AntigravityModelKind::Gemini31ProHigh)
+        );
+    }
+
+    #[test]
+    fn unknown_future_antigravity_model_token_is_omitted() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("future-model-project");
+        fs::create_dir_all(&repo).unwrap();
+        let now = 30_000;
+        write_json(
+            &temp.path().join("antigravity/future.json"),
+            json!({
+                "schemaVersion": 1,
+                "sessionKey": "future",
+                "cwd": repo,
+                "state": "activity_detected",
+                "changedAtMs": now,
+                "modelKind": "private_future_model"
+            }),
+        );
+
+        let snapshot = StateStore::new(temp.path().to_path_buf()).snapshot(now);
+        let activity = snapshot.workspaces[0].antigravity.as_ref().unwrap();
+        assert_eq!(activity.model_kind, None);
+        let serialized = serde_json::to_value(activity).unwrap();
+        assert!(serialized.get("modelKind").is_none());
     }
 
     #[test]

@@ -23,11 +23,14 @@ VSParallel does not extract, log, retain, or transmit prompts, responses,
 source code, terminal contents, transcripts, or Git data. Optional lifecycle
 hooks receive documented provider event payloads and construct new,
 privacy-minimal records containing only a hashed session/conversation key,
-local workspace path, coarse state, and timestamp. Live provider usage handling
-and Claude Code's local status-line fallback similarly retain only rate-limit
-percentages and reset times. Antigravity also writes a path-free hook-health
-receipt containing fixed event/surface/outcome values, a timestamp, and record
-count so Setup can distinguish configured from observed execution. See
+local workspace path, coarse state, and timestamp. Antigravity activity records
+may also include an optional closed model classification derived from the
+documented `modelName`; the raw identifier is discarded and never persisted.
+Live provider usage handling and Claude Code's local status-line fallback
+similarly retain only rate-limit percentages and reset times. Antigravity also
+writes a path- and model-free hook-health receipt containing fixed
+event/surface/outcome values, a timestamp, and record count so Setup can
+distinguish configured from observed execution. See
 [PRIVACY.md](PRIVACY.md) for the complete local-data and cleanup policy.
 
 ## Requirements and platform support
@@ -100,14 +103,20 @@ workspace activity from `workspacePaths`. Antigravity 2.0, Antigravity IDE, and
 the Antigravity CLI share this hook file. VSParallel reduces the documented
 `transcriptPath` or fallback `artifactDirectoryPath` root to a bounded product
 label and immediately discards the path; CLI and unrecognized events are
-ignored. These lifecycle hooks begin with an agent/model invocation—they do not
-run when the standalone app merely opens or selects a Project. Setup therefore
-distinguishes a configured hook that is **awaiting agent turn** from one whose
-execution has been observed. A Project-level `.agents/hooks.json` can override
-the global configuration. A hook-only **Antigravity 2.0** or **Antigravity IDE**
-row is evidence of recent activity only: it is never marked live or focused
-and cannot be opened by VSParallel. If the same IDE path has a companion
-heartbeat, the activity is associated with that exact window.
+ignored. A recognized `modelName` is likewise reduced to a closed label such as
+**Gemini 3.6 Flash (Medium)**, **Claude**, or **GPT-OSS** before the raw value is
+discarded. The workspace row shows the model from the lifecycle record it is
+currently presenting. **Auto model** remains explicit rather than guessing the
+routed model, and a label means only “latest model reported by Antigravity”—it
+does not prove that inference is live. These lifecycle hooks begin with an
+agent/model invocation—they do not run when the standalone app merely opens or
+selects a Project. Setup therefore distinguishes a configured hook that is
+**awaiting agent turn** from one whose execution has been observed. A
+Project-level `.agents/hooks.json` can override the global configuration. A
+hook-only **Antigravity 2.0** or **Antigravity IDE** row is evidence of recent
+activity only: it is never marked live or focused and cannot be opened by
+VSParallel. If the same IDE path has a companion heartbeat, the activity is
+associated with that exact window.
 
 The global usage cards refresh every 60 seconds and when **Refresh** is selected.
 Codex usage is available when a signed-in local `codex` executable—on `PATH`
@@ -250,12 +259,13 @@ VSParallel stores only the metadata required for the workspace overview:
   heartbeat timestamps;
 - whether the configured Codex and Claude Code extensions are installed and
   active in a VS Code or Antigravity IDE window/profile and, when known,
-  whether they run in the local or remote extension host; and
+  whether they run in the local or remote extension host;
 - coarse lifecycle state, a one-way hash of the provider session or
   conversation identifier, working directory, and timestamp when optional
-  hooks are enabled;
+  hooks are enabled, plus an optional closed Antigravity model classification
+  when recognized;
 - Antigravity hook execution health containing fixed event, surface, and
-  outcome values plus timestamp and workspace-record count; and
+  outcome values plus timestamp and workspace-record count, but no model; and
 - Claude Code five-hour and weekly usage percentages, their optional reset
   times, and the local capture timestamp only when the managed status-line
   fallback cache is available.

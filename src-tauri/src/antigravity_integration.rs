@@ -34,6 +34,7 @@ const MAX_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_HOOK_HEALTH_BYTES: u64 = 8 * 1024;
 const MAX_HOOK_INPUT_BYTES: usize = 1024 * 1024;
 const MAX_CONVERSATION_ID_BYTES: usize = 16 * 1024;
+const MAX_MODEL_NAME_BYTES: usize = 128;
 const MAX_WORKSPACE_PATH_BYTES: usize = 32 * 1024;
 const MAX_WORKSPACE_PATHS: usize = 64;
 const MAX_TRANSCRIPT_PATH_BYTES: usize = 64 * 1024;
@@ -148,6 +149,8 @@ struct HookRecord {
     cwd: String,
     state: String,
     changed_at_ms: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model_kind: Option<AntigravityModelKind>,
 }
 
 #[derive(Debug, Default)]
@@ -156,9 +159,39 @@ struct HookPayload {
     workspace_paths: Vec<String>,
     surface: AntigravitySurface,
     surface_conflict: bool,
+    model_kind: Option<AntigravityModelKind>,
     had_error: bool,
     termination_reason: Option<String>,
     fully_idle: Option<bool>,
+}
+
+/// Closed, privacy-safe model classifications derived from Antigravity's raw
+/// `modelName`. Raw identifiers are never written to VSParallel state.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AntigravityModelKind {
+    Automatic,
+    Gemini,
+    #[serde(rename = "gemini_3_6_flash_medium")]
+    Gemini36FlashMedium,
+    #[serde(rename = "gemini_3_5_flash")]
+    Gemini35Flash,
+    #[serde(rename = "gemini_3_1_pro_high")]
+    Gemini31ProHigh,
+    #[serde(rename = "gemini_3_1_pro_low")]
+    Gemini31ProLow,
+    #[serde(rename = "gemini_3_flash")]
+    Gemini3Flash,
+    Claude,
+    #[serde(rename = "claude_sonnet_4_6_thinking")]
+    ClaudeSonnet46Thinking,
+    #[serde(rename = "claude_opus_4_6_thinking")]
+    ClaudeOpus46Thinking,
+    GptOss,
+    #[serde(rename = "gpt_oss_120b")]
+    GptOss120b,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -311,6 +344,7 @@ impl<'de> Visitor<'de> for HookPayloadVisitor<'_> {
         let mut idle_seen = false;
         let mut transcript_seen = false;
         let mut artifact_directory_seen = false;
+        let mut model_seen = false;
 
         while let Some(key) = map.next_key::<String>()? {
             match key.as_str() {
@@ -374,6 +408,15 @@ impl<'de> Visitor<'de> for HookPayloadVisitor<'_> {
                         self.payload
                             .observe_surface(classify_antigravity_surface(value));
                     }
+                }
+                "modelName" => {
+                    if model_seen {
+                        return Err(serde::de::Error::duplicate_field("modelName"));
+                    }
+                    model_seen = true;
+                    let value: Option<String> = map.next_value()?;
+                    self.payload.model_kind =
+                        value.as_deref().and_then(classify_antigravity_model_name);
                 }
                 "error"
                     if matches!(
@@ -669,6 +712,7 @@ fn records_from_payload(
                 cwd,
                 state: state.to_string(),
                 changed_at_ms,
+                model_kind: payload.model_kind,
             };
             (record_key, record)
         })
@@ -828,6 +872,51 @@ fn classify_antigravity_surface(transcript_path: &str) -> AntigravitySurface {
         }
     }
     AntigravitySurface::Unknown
+}
+
+fn classify_antigravity_model_name(value: &str) -> Option<AntigravityModelKind> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > MAX_MODEL_NAME_BYTES || !value.is_ascii() {
+        return None;
+    }
+
+    // Normalize only a small identifier alphabet, then immediately reduce the
+    // value to a closed token. This accepts documented slugs and familiar
+    // display spellings without persisting custom deployment/model names.
+    let mut normalized = String::with_capacity(value.len());
+    let mut separator = false;
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() {
+            if separator && !normalized.is_empty() {
+                normalized.push('-');
+            }
+            normalized.push((byte as char).to_ascii_lowercase());
+            separator = false;
+        } else if matches!(byte, b'-' | b'_' | b'.' | b' ' | b'(' | b')') {
+            separator = true;
+        } else {
+            return None;
+        }
+    }
+
+    match normalized.as_str() {
+        "auto" | "automatic" => Some(AntigravityModelKind::Automatic),
+        "gemini-3-6-flash-medium" => Some(AntigravityModelKind::Gemini36FlashMedium),
+        "gemini-3-5-flash" => Some(AntigravityModelKind::Gemini35Flash),
+        "gemini-3-1-pro-high" => Some(AntigravityModelKind::Gemini31ProHigh),
+        "gemini-3-1-pro-low" => Some(AntigravityModelKind::Gemini31ProLow),
+        "gemini-3-flash" => Some(AntigravityModelKind::Gemini3Flash),
+        "claude-sonnet-4-6-thinking" => Some(AntigravityModelKind::ClaudeSonnet46Thinking),
+        "claude-opus-4-6-thinking" => Some(AntigravityModelKind::ClaudeOpus46Thinking),
+        "gpt-oss-120b" => Some(AntigravityModelKind::GptOss120b),
+        "gemini" => Some(AntigravityModelKind::Gemini),
+        "claude" => Some(AntigravityModelKind::Claude),
+        "gpt-oss" => Some(AntigravityModelKind::GptOss),
+        name if name.starts_with("gemini-") => Some(AntigravityModelKind::Gemini),
+        name if name.starts_with("claude-") => Some(AntigravityModelKind::Claude),
+        name if name.starts_with("gpt-oss-") => Some(AntigravityModelKind::GptOss),
+        _ => None,
+    }
 }
 
 #[derive(Debug)]
@@ -1754,6 +1843,52 @@ mod tests {
     }
 
     #[test]
+    fn model_names_reduce_to_stable_closed_tokens() {
+        let cases = [
+            (
+                "gemini-3.6-flash-medium",
+                AntigravityModelKind::Gemini36FlashMedium,
+                "gemini_3_6_flash_medium",
+            ),
+            (
+                "Gemini 3.1 Pro (High)",
+                AntigravityModelKind::Gemini31ProHigh,
+                "gemini_3_1_pro_high",
+            ),
+            (
+                "claude-sonnet-4.6-thinking",
+                AntigravityModelKind::ClaudeSonnet46Thinking,
+                "claude_sonnet_4_6_thinking",
+            ),
+            (
+                "gpt-oss-120b",
+                AntigravityModelKind::GptOss120b,
+                "gpt_oss_120b",
+            ),
+            ("auto", AntigravityModelKind::Automatic, "automatic"),
+            (
+                "gemini-future-preview",
+                AntigravityModelKind::Gemini,
+                "gemini",
+            ),
+        ];
+
+        for (raw, expected_kind, expected_token) in cases {
+            let kind = classify_antigravity_model_name(raw).unwrap();
+            assert_eq!(kind, expected_kind);
+            assert_eq!(serde_json::to_value(kind).unwrap(), json!(expected_token));
+        }
+
+        assert_eq!(classify_antigravity_model_name("private-model"), None);
+        assert_eq!(classify_antigravity_model_name("gemini/private"), None);
+        assert_eq!(classify_antigravity_model_name("ジェミニ"), None);
+        assert_eq!(
+            classify_antigravity_model_name(&"x".repeat(MAX_MODEL_NAME_BYTES + 1)),
+            None
+        );
+    }
+
+    #[test]
     fn pre_invocation_persists_one_privacy_safe_record_per_workspace() {
         let temp = TempDir::new().unwrap();
         let first = temp.path().join("first");
@@ -1765,7 +1900,7 @@ mod tests {
             "workspacePaths": [&first, &second],
             "transcriptPath": "/home/test/.gemini/antigravity/brain/private-conversation-id/.system_generated/logs/transcript.jsonl",
             "artifactDirectoryPath": "/secret/artifacts",
-            "modelName": "secret-model",
+            "modelName": "gemini-3.6-flash-medium",
             "toolCall": {"args": {"CommandLine": "SECRET COMMAND"}},
         })
         .to_string();
@@ -1782,17 +1917,18 @@ mod tests {
         let records = state_records(temp.path());
         assert_eq!(records.len(), 2);
         for record in records {
-            assert_eq!(record.as_object().unwrap().len(), 5);
+            assert_eq!(record.as_object().unwrap().len(), 6);
             assert_eq!(record["schemaVersion"], 1);
             assert_eq!(record["state"], "activity_detected");
             assert_eq!(record["changedAtMs"], 1_700_000_000_123i64);
+            assert_eq!(record["modelKind"], "gemini_3_6_flash_medium");
             assert_eq!(record["sessionKey"].as_str().unwrap().len(), 64);
             let saved = record.to_string();
             assert!(!saved.contains("private-conversation-id"));
             assert!(!saved.contains("SECRET"));
             assert!(!saved.contains("transcript"));
             assert!(!saved.contains("artifact"));
-            assert!(!saved.contains("model"));
+            assert!(!saved.contains("gemini-3.6-flash-medium"));
         }
         let observation = antigravity_two_hook_observation(temp.path(), 1_700_000_000_123)
             .unwrap()
@@ -1809,8 +1945,40 @@ mod tests {
         .unwrap();
         assert!(!saved_health.contains("private-conversation-id"));
         assert!(!saved_health.contains("SECRET"));
+        assert!(!saved_health.contains("modelKind"));
+        assert!(!saved_health.contains("gemini"));
         assert!(!saved_health.contains(first.to_string_lossy().as_ref()));
         assert!(!saved_health.contains(second.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn unknown_model_identifier_is_never_persisted() {
+        let temp = TempDir::new().unwrap();
+        let workspace = temp.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let private_model = "private-deployment-model";
+        let input = json!({
+            "conversationId": "conversation",
+            "workspacePaths": [workspace],
+            "transcriptPath": "/home/test/.gemini/antigravity/brain/conversation/transcript.jsonl",
+            "modelName": private_model,
+        })
+        .to_string();
+
+        let (code, _) = hook_with_root(
+            AntigravityHookEvent::PreInvocation,
+            &input,
+            temp.path(),
+            1_700_000_000_123,
+        );
+
+        assert_eq!(code, 0);
+        let records = state_records(temp.path());
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].as_object().unwrap().len(), 5);
+        let saved = records[0].to_string();
+        assert!(!saved.contains("modelKind"));
+        assert!(!saved.contains(private_model));
     }
 
     #[test]
