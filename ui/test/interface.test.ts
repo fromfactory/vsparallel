@@ -327,6 +327,72 @@ test("workspace normalization preserves Antigravity source and recent hook activ
   assert.equal(workspace.antigravity?.modelKind, "gemini_3_6_flash_medium");
 });
 
+test("workspace application labels are prominent without theming the entire card", () => {
+  const javascript = read("ui/generated/app.js");
+  const css = read("ui/styles.css");
+  const createRow = sliceBetween(
+    javascript,
+    /function\s+createWorkspaceRow\s*\(/,
+    /function\s+renderSnapshot\s*\(/,
+    "createWorkspaceRow",
+  );
+
+  assert.doesNotMatch(createRow, /row\.dataset\.editor/);
+  assert.match(
+    createRow,
+    /createElement\(\s*["']span["']\s*,\s*["']workspace-application["']\s*,\s*workspace\.editorName\s*\)/,
+  );
+  assert.match(createRow, /application\.dataset\.editor\s*=\s*workspace\.editor/);
+  assert.match(createRow, /primary\.append\(application,\s*titleLine,\s*metaLine\)/);
+  assert.doesNotMatch(createRow, /createElement\(\s*["'](?:img|svg)["']/i);
+  assert.doesNotMatch(css, /\.workspace-application(?:::before|::after)\s*\{/i);
+  assert.doesNotMatch(
+    cssBlocksMatching(css, /\.workspace-application/),
+    /(?:^|[;{])\s*(?:-webkit-)?mask(?:-image)?\s*:|url\s*\(/i,
+  );
+
+  const applicationLabel = css.match(/\.workspace-application\s*\{([^}]*)\}/i)?.[1];
+  assert.ok(applicationLabel, "application labels should have dedicated styling");
+  assert.match(applicationLabel, /font-size\s*:\s*11px/i);
+  assert.match(applicationLabel, /font-weight\s*:\s*720/i);
+  assert.match(css, /\.workspace-row\.is-inactive\s*\{[^}]*opacity\s*:\s*1\s*;/i);
+  assert.doesNotMatch(
+    css,
+    /\.workspace-row\.is-inactive\s+\.workspace-application/,
+  );
+  assert.match(
+    css,
+    /data-window-mode="floating"\][^{}]*\.workspace-application\s*\{[^}]*font-size\s*:\s*10px/i,
+  );
+
+  assert.doesNotMatch(css, /\.workspace-row\[data-editor=/i);
+
+  for (const editor of ["antigravity_2", "antigravity_ide"]) {
+    const antigravityLabel = cssBlocksMatching(
+      css,
+      new RegExp(`\\.workspace-application\\[data-editor=["']${editor}["']\\]`),
+    );
+    assert.match(antigravityLabel, /var\(--antigravity-rainbow\)/i);
+  }
+
+  const antigravityRainbow = css.match(
+    /--antigravity-rainbow\s*:\s*linear-gradient\(([^;]+)\)/i,
+  )?.[1];
+  assert.ok(antigravityRainbow, "Antigravity should define a rainbow theme");
+  assert.ok(
+    new Set(antigravityRainbow.match(/#[0-9a-f]{6}/gi) ?? []).size >= 6,
+    "the Antigravity theme should use at least six distinct rainbow colors",
+  );
+  const lightTheme = css.match(
+    /:root\[data-color-theme="light"\]\s*\{([\s\S]*?)\n\}/i,
+  )?.[1];
+  assert.ok(lightTheme, "the light theme should define its application colors");
+  assert.match(lightTheme, /--antigravity-rainbow\s*:\s*linear-gradient/i);
+
+  const applicationThemes = cssBlocksMatching(css, /\.workspace-application\[data-editor=/);
+  assert.match(applicationThemes, /data-editor=["']vscode["'][^{}]*\{[^}]*var\(--accent/i);
+});
+
 test("Antigravity model labels accept only the public closed model set", () => {
   const javascript = read("ui/generated/app.js");
   const functions = [

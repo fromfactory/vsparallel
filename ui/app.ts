@@ -1190,6 +1190,12 @@
     row.append(statusMark);
 
     const primary = createElement("div", "workspace-primary");
+    const application = createElement(
+      "span",
+      "workspace-application",
+      workspace.editorName,
+    );
+    application.dataset.editor = workspace.editor;
     const titleLine = createElement("div", "workspace-title-line");
     const name = createElement("h3", "workspace-name", workspace.name);
     name.title = workspace.name;
@@ -1207,9 +1213,6 @@
       windowStateToken = "recent";
     }
 
-    const editorBadge = createElement("span", "editor-badge", workspace.editorName);
-    editorBadge.dataset.editor = workspace.editor;
-    editorBadge.title = `Tracked by ${workspace.editorName}`;
     const windowBadge = createElement("span", "window-badge", windowState);
     windowBadge.dataset.state = windowStateToken;
     titleLine.append(name, windowBadge);
@@ -1219,8 +1222,8 @@
       path.title = workspace.path;
     }
     const metaLine = createElement("div", "workspace-meta");
-    metaLine.append(editorBadge, path);
-    primary.append(titleLine, metaLine);
+    metaLine.append(path);
+    primary.append(application, titleLine, metaLine);
     row.append(primary);
 
     const providers = createElement("div", "activity-providers");
