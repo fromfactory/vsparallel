@@ -327,13 +327,97 @@ test("workspace normalization preserves Antigravity source and recent hook activ
   assert.equal(workspace.antigravity?.modelKind, "gemini_3_6_flash_medium");
 });
 
+test("workspaces render as cards in single Open and Recent sections", () => {
+  const html = read("ui/index.html");
+  const javascript = read("ui/generated/app.js");
+  const css = read("ui/styles.css");
+  const grouping = appFunction(javascript, "groupWorkspaces");
+  const context = {} as {
+    groupWorkspaces(
+      workspaces: Array<{ instanceId: string; active: boolean }>,
+    ): Array<{
+      kind: string;
+      label: string;
+      workspaces: Array<{ instanceId: string; active: boolean }>;
+    }>;
+  };
+  vm.runInNewContext(grouping, context);
+
+  const groups = context.groupWorkspaces([
+    { instanceId: "recent-a", active: false },
+    { instanceId: "open-a", active: true },
+    { instanceId: "recent-b", active: false },
+    { instanceId: "open-b", active: true },
+  ]);
+  assert.deepEqual(Array.from(groups, (group) => group.kind), ["open", "recent"]);
+  assert.deepEqual(Array.from(groups, (group) => group.label), ["Open", "Recent"]);
+  assert.deepEqual(
+    Array.from(groups[0].workspaces, (workspace) => workspace.instanceId),
+    ["open-a", "open-b"],
+  );
+  assert.deepEqual(
+    Array.from(groups[1].workspaces, (workspace) => workspace.instanceId),
+    ["recent-a", "recent-b"],
+  );
+  assert.deepEqual(
+    Array.from(
+      context.groupWorkspaces([{ instanceId: "recent-only", active: false }]),
+      (group) => group.kind,
+    ),
+    ["recent"],
+  );
+  assert.deepEqual(
+    Array.from(
+      context.groupWorkspaces([{ instanceId: "open-only", active: true }]),
+      (group) => group.kind,
+    ),
+    ["open"],
+  );
+  assert.equal(context.groupWorkspaces([]).length, 0);
+
+  assert.match(
+    html,
+    /<div\b(?=[^>]*id="workspaceList")(?=[^>]*class="[^"]*\bworkspace-list\b)[^>]*>/i,
+  );
+  assert.match(
+    javascript,
+    /createElement\(\s*["']section["']\s*,\s*["']workspace-group["']\s*\)/,
+  );
+  assert.match(
+    javascript,
+    /createElement\(\s*["']h3["']\s*,\s*["']workspace-group__heading["']\s*,\s*group\.label\s*\)/,
+  );
+  assert.match(
+    javascript,
+    /createElement\(\s*["']ul["']\s*,\s*["']workspace-group__cards["']\s*\)/,
+  );
+  assert.match(javascript, /section\.setAttribute\(\s*["']aria-labelledby["']/);
+  assert.match(
+    javascript,
+    /group\.workspaces\.forEach\(\s*\(workspace\)\s*=>\s*\{\s*cards\.append\(createWorkspaceRow\(workspace\)\)/,
+  );
+  assert.match(javascript, /section\.append\(heading,\s*cards\)/);
+  assert.match(javascript, /groupWorkspaces\(snapshot\.workspaces\)/);
+  assert.doesNotMatch(javascript, /window-badge/);
+  assert.doesNotMatch(css, /\.window-badge\b/);
+  assert.match(css, /\.workspace-group__cards\s*\{[^}]*list-style:\s*none/s);
+  assert.match(
+    css,
+    /\.workspace-row\s*\{[^}]*border:\s*1px solid var\(--border\)[^}]*background:\s*var\(--panel-deep\)/s,
+  );
+  assert.doesNotMatch(
+    css,
+    /\.workspace-row\.is-inactive[^{}]*(?:workspace-title-line|workspace-meta|activity-providers)[^{]*\{[^}]*opacity/s,
+  );
+});
+
 test("workspace application labels are prominent without theming the entire card", () => {
   const javascript = read("ui/generated/app.js");
   const css = read("ui/styles.css");
   const createRow = sliceBetween(
     javascript,
     /function\s+createWorkspaceRow\s*\(/,
-    /function\s+renderSnapshot\s*\(/,
+    /function\s+groupWorkspaces\s*\(/,
     "createWorkspaceRow",
   );
 
@@ -682,7 +766,7 @@ test("workspace rows omit redundant leading status icons while keeping provider 
   const createRow = sliceBetween(
     javascript,
     /function\s+createWorkspaceRow\s*\(/,
-    /function\s+renderSnapshot\s*\(/,
+    /function\s+groupWorkspaces\s*\(/,
     "createWorkspaceRow",
   );
   assert.match(
@@ -879,7 +963,7 @@ test("workspace rows use a transparent native full-card action without visible O
   const createRow = sliceBetween(
     javascript,
     /function\s+createWorkspaceRow\s*\(/,
-    /function\s+renderSnapshot\s*\(/,
+    /function\s+groupWorkspaces\s*\(/,
     "createWorkspaceRow",
   );
 
@@ -894,11 +978,16 @@ test("workspace rows use a transparent native full-card action without visible O
   assert.doesNotMatch(createRow, /\.textContent\s*=\s*["']Open["']/);
   assert.match(createRow, /setAttribute\(\s*["']aria-label["']/);
   assert.match(createRow, /workspace\.active \? "Switch to" : "Open"/);
+  assert.match(createRow, /workspace\.focused \? ", currently focused" : ""/);
   assert.match(
     createRow,
-    /`\$\{actionLabel\} \$\{workspace\.name\} in \$\{workspace\.editorName\}`/,
+    /openable[\s\S]*?`\$\{actionLabel\} \$\{workspace\.name\} in \$\{workspace\.editorName\}\$\{focusContext\}`[\s\S]*?cannot currently be opened/,
   );
-  assert.match(createRow, /workspace\.recentlyActive && !workspace\.openable/);
+  assert.match(
+    createRow,
+    /workspace\.focused[\s\S]*?createElement\(\s*["']span["']\s*,\s*["']workspace-focus["']\s*,\s*["']Focused["']\s*\)/,
+  );
+  assert.match(createRow, /openButton\.title\s*=\s*workspace\.recentlyActive/);
   assert.match(createRow, /hook activity does not identify a live window or exact open target/);
 
   const openButtonCss = cssBlocksMatching(css, /\.open-button\b/);

@@ -94,6 +94,12 @@
     antigravity: ActivityView | null;
   }
 
+  interface WorkspaceGroup {
+    kind: "open" | "recent";
+    label: "Open" | "Recent";
+    workspaces: Workspace[];
+  }
+
   interface Snapshot {
     schemaVersion: number;
     generatedAtMs: number;
@@ -311,7 +317,7 @@
     claudeUsageState: requiredElement<HTMLSpanElement>("#claudeUsageState"),
     claudeUsageMeter: requiredElement<HTMLDivElement>("#claudeUsageMeter"),
     claudeUsageDetail: requiredElement<HTMLSpanElement>("#claudeUsageDetail"),
-    workspaceList: requiredElement<HTMLUListElement>("#workspaceList"),
+    workspaceList: requiredElement<HTMLDivElement>("#workspaceList"),
     errorBanner: requiredElement<HTMLDivElement>("#errorBanner"),
     errorText: requiredElement<HTMLSpanElement>("#errorText"),
     updateBanner: requiredElement<HTMLElement>("#updateBanner"),
@@ -1172,25 +1178,13 @@
     );
     application.dataset.editor = workspace.editor;
     const titleLine = createElement("div", "workspace-title-line");
-    const name = createElement("h3", "workspace-name", workspace.name);
+    const name = createElement("h4", "workspace-name", workspace.name);
     name.title = workspace.name;
-
-    let windowState = "Unavailable";
-    let windowStateToken = "inactive";
+    titleLine.append(name);
     if (workspace.focused) {
-      windowState = "Focused";
-      windowStateToken = "focused";
-    } else if (workspace.active) {
-      windowState = "Open";
-      windowStateToken = "active";
-    } else if (workspace.recentlyActive && !workspace.openable) {
-      windowState = "Recent";
-      windowStateToken = "recent";
+      const focused = createElement("span", "workspace-focus", "Focused");
+      titleLine.append(focused);
     }
-
-    const windowBadge = createElement("span", "window-badge", windowState);
-    windowBadge.dataset.state = windowStateToken;
-    titleLine.append(name, windowBadge);
 
     const path = createElement("span", "workspace-path", formatShortPath(workspace.path));
     if (workspace.path) {
@@ -1240,13 +1234,14 @@
 
     const openButton = createElement("button", "open-button");
     const actionLabel = workspace.active ? "Switch to" : "Open";
+    const focusContext = workspace.focused ? ", currently focused" : "";
+    const accessibleActionLabel = openable
+      ? `${actionLabel} ${workspace.name} in ${workspace.editorName}${focusContext}`
+      : `${workspace.name} in ${workspace.editorName}${focusContext}, cannot currently be opened`;
     openButton.type = "button";
     openButton.dataset.instanceId = workspace.instanceId;
     openButton.disabled = !openable;
-    openButton.setAttribute(
-      "aria-label",
-      `${actionLabel} ${workspace.name} in ${workspace.editorName}`,
-    );
+    openButton.setAttribute("aria-label", accessibleActionLabel);
     openButton.setAttribute("aria-busy", String(opening));
     if (!workspace.openable) {
       openButton.title = workspace.recentlyActive
@@ -1261,6 +1256,33 @@
     return row;
   }
 
+  function groupWorkspaces(workspaces: Workspace[]): WorkspaceGroup[] {
+    const open = workspaces.filter((workspace) => workspace.active);
+    const recent = workspaces.filter((workspace) => !workspace.active);
+    const groups: WorkspaceGroup[] = [
+      { kind: "open", label: "Open", workspaces: open },
+      { kind: "recent", label: "Recent", workspaces: recent },
+    ];
+    return groups.filter((group) => group.workspaces.length > 0);
+  }
+
+  function createWorkspaceGroup(group: WorkspaceGroup): HTMLElement {
+    const section = createElement("section", "workspace-group");
+    const heading = createElement("h3", "workspace-group__heading", group.label);
+    const headingId = `workspaceGroup-${group.kind}`;
+    const cards = createElement("ul", "workspace-group__cards");
+
+    section.dataset.state = group.kind;
+    section.setAttribute("aria-labelledby", headingId);
+    heading.id = headingId;
+    cards.setAttribute("aria-label", `${group.label} workspaces`);
+    group.workspaces.forEach((workspace) => {
+      cards.append(createWorkspaceRow(workspace));
+    });
+    section.append(heading, cards);
+    return section;
+  }
+
   function renderSnapshot(snapshot: Snapshot): void {
     const focusedOpenButton = document.activeElement
       ?.closest<HTMLButtonElement>(".open-button") ?? null;
@@ -1269,8 +1291,8 @@
       ? focusedOpenButton.dataset.instanceId
       : "";
     const fragment = document.createDocumentFragment();
-    snapshot.workspaces.forEach((workspace) => {
-      fragment.append(createWorkspaceRow(workspace));
+    groupWorkspaces(snapshot.workspaces).forEach((group) => {
+      fragment.append(createWorkspaceGroup(group));
     });
 
     elements.workspaceList.replaceChildren(fragment);
