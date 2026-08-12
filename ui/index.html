@@ -6,7 +6,7 @@
     <meta name="color-scheme" content="dark light" />
     <meta
       name="description"
-      content="A compact local overview of active VS Code workspaces and coarse Codex or Claude Code activity."
+      content="A compact local overview of VS Code and Antigravity workspaces with coarse agent activity."
     />
     <title>VSParallel</title>
     <link rel="icon" type="image/png" href="vsparallel-icon.png" />
@@ -270,7 +270,7 @@
           <ul
             class="workspace-list"
             id="workspaceList"
-            aria-label="Active and recently seen VS Code workspaces"
+            aria-label="Active and recently seen editor workspaces"
             aria-busy="true"
           ></ul>
 
@@ -278,8 +278,9 @@
             <span class="empty-state__mark" aria-hidden="true">◇</span>
             <h3>No workspaces detected</h3>
             <p>
-              Open a folder in VS Code with the VSParallel companion enabled. It will appear
-              here after its first heartbeat.
+              Open a folder in VS Code or Antigravity IDE with its VSParallel companion enabled.
+              For Antigravity 2.0, install activity hooks and start an agent turn inside a saved
+              Project; opening the Project alone does not fire a hook.
             </p>
             <button class="quiet-button" id="emptyRefreshButton" type="button">
               <svg class="button-icon" viewBox="0 0 16 16" aria-hidden="true">
@@ -399,8 +400,9 @@
                 <div>
                   <h3 id="integrationHeading">Integrations</h3>
                   <p id="integrationDescription">
-                    Activity hooks and usage are separate. Hooks report lifecycle status; usage
-                    comes from the provider sources described below.
+                    Install at least one editor companion—VS Code or Antigravity IDE—to track
+                    live workspaces. Activity hooks and usage are separate. Hooks report lifecycle
+                    status; usage comes from the provider sources described below.
                   </p>
                 </div>
                 <button
@@ -454,6 +456,104 @@
                   </div>
                 </article>
 
+                <article class="integration-card" id="antigravityIdeCard">
+                  <div class="integration-card__header">
+                    <div class="integration-card__identity">
+                      <svg class="integration-card__icon" viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M4 5.5h16v13H4z" />
+                        <path d="m8 9 3 3-3 3M13 15h4" />
+                      </svg>
+                      <div>
+                        <h4>Antigravity IDE companion</h4>
+                        <p class="integration-detail" id="antigravityIdeDetail">
+                          Checking the Antigravity IDE companion…
+                        </p>
+                      </div>
+                    </div>
+                    <span
+                      class="integration-status"
+                      id="antigravityIdeStatus"
+                      data-state="checking"
+                    >
+                      Checking…
+                    </span>
+                  </div>
+                  <p class="integration-meta" id="antigravityIdeMeta" hidden></p>
+                  <div class="integration-actions">
+                    <button
+                      class="setup-button setup-button--primary"
+                      id="antigravityIdeInstallButton"
+                      type="button"
+                      disabled
+                    >
+                      Install
+                    </button>
+                    <button
+                      class="setup-button setup-button--danger"
+                      id="antigravityIdeUninstallButton"
+                      type="button"
+                      disabled
+                      hidden
+                    >
+                      Uninstall
+                    </button>
+                  </div>
+                </article>
+
+                <article class="integration-card" id="antigravityCard">
+                  <div class="integration-card__header">
+                    <div class="integration-card__identity">
+                      <svg class="integration-card__icon" viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M12 3v18M5 8l7-5 7 5M5 16l7 5 7-5" />
+                        <circle cx="12" cy="12" r="3" />
+                      </svg>
+                      <div>
+                        <h4>
+                          Antigravity activity hooks
+                          <span class="optional-label">Optional</span>
+                        </h4>
+                        <p class="integration-detail" id="antigravityDetail">
+                          Checking documented Antigravity hooks…
+                        </p>
+                      </div>
+                    </div>
+                    <span
+                      class="integration-status"
+                      id="antigravityStatus"
+                      data-state="checking"
+                    >
+                      Checking…
+                    </span>
+                  </div>
+                  <p class="integration-meta" id="antigravityMeta" hidden></p>
+                  <p class="integration-activity-limitation" role="note">
+                    <strong>Recent activity only.</strong>
+                    Start an agent turn after installation. Opening a Project alone does not fire
+                    these hooks, and a Project-level <code>.agents/hooks.json</code> can override
+                    the global hook. Events identify the 2.0 or IDE surface and report project
+                    paths, but not an exact live window, focus, or project-opening controls.
+                  </p>
+                  <div class="integration-actions">
+                    <button
+                      class="setup-button setup-button--primary"
+                      id="antigravityInstallButton"
+                      type="button"
+                      disabled
+                    >
+                      Install
+                    </button>
+                    <button
+                      class="setup-button setup-button--danger"
+                      id="antigravityUninstallButton"
+                      type="button"
+                      disabled
+                      hidden
+                    >
+                      Uninstall
+                    </button>
+                  </div>
+                </article>
+
                 <article class="integration-card" id="codexCard">
                   <div class="integration-card__header">
                     <div class="integration-card__identity">
@@ -480,7 +580,7 @@
                     <strong>Usage remaining is separate.</strong>
                     For live usage, VSParallel needs a compatible, signed-in Codex CLI available
                     to this app, either from a standalone installation or the locally installed
-                    Codex VS Code extension.
+                    Codex extension in VS Code or Antigravity IDE.
                   </p>
                   <div class="trust-guidance" id="codexTrustGuidance" role="note" hidden>
                     <strong>Review required</strong>
@@ -533,7 +633,7 @@
                     <strong>Usage remaining is separate.</strong>
                     For live usage, VSParallel needs a compatible, signed-in Claude Code CLI
                     available to this app, either from a standalone installation or the locally
-                    installed Claude Code VS Code extension. A recent terminal status-line capture
+                    installed Claude Code extension in VS Code or Antigravity IDE. A recent terminal status-line capture
                     can also provide fallback usage.
                   </p>
                   <div class="integration-actions">
@@ -564,7 +664,8 @@
                   <path d="M13.1 2.8v2.7h-2.7" />
                 </svg>
                 <span>
-                  Restart affected VS Code and provider sessions to apply changes.
+                  Reload affected editor windows and restart provider sessions to apply changes.
+                  Antigravity 2.0 reports only after a new agent turn.
                 </span>
               </div>
 

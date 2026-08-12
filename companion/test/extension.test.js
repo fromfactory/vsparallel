@@ -14,11 +14,13 @@ function loadTestInterface() {
   const exposeTestInterface = `
     module.exports.__test = {
       AGENT_EXTENSION_IDS,
+      EDITOR_KINDS,
       SCHEMA_VERSION,
       HEARTBEAT_INTERVAL_MS,
       HeartbeatReporter,
       atomicWriteJson,
       createHeartbeatRecord,
+      detectEditor,
       detectAgentExtensions,
       exactOpenTarget,
       recordPathFor,
@@ -41,10 +43,12 @@ function loadTestInterface() {
 
 const {
   AGENT_EXTENSION_IDS,
+  EDITOR_KINDS,
   SCHEMA_VERSION,
   HeartbeatReporter,
   atomicWriteJson,
   createHeartbeatRecord,
+  detectEditor,
   recordPathFor,
   resolveStateDirectory,
   safeInstanceFileName,
@@ -129,6 +133,72 @@ test("each extension-host activation gets an opaque collision-resistant identity
   assert.match(second.instanceId, /^[0-9a-f-]{32,36}$/);
   assert.notEqual(first.instanceId, second.instanceId);
   assert.equal(first.instanceId.includes("session-1"), false);
+});
+
+test("classifies VS Code and Antigravity IDE using bounded public host signals", () => {
+  assert.equal(
+    detectEditor(fakeVscode({
+      env: { uriScheme: "vscode", appName: "Visual Studio Code" },
+    })),
+    EDITOR_KINDS.vscode,
+  );
+  assert.equal(
+    detectEditor(fakeVscode({
+      env: { uriScheme: "VSCODE-INSIDERS", appName: "Visual Studio Code - Insiders" },
+    })),
+    EDITOR_KINDS.vscode,
+  );
+  assert.equal(
+    detectEditor(fakeVscode({
+      env: { uriScheme: "Antigravity", appName: "Unexpected raw product name" },
+    })),
+    EDITOR_KINDS.antigravityIde,
+  );
+  assert.equal(
+    detectEditor(fakeVscode({
+      env: { uriScheme: "unknown-fork", appName: "Antigravity IDE" },
+    })),
+    EDITOR_KINDS.antigravityIde,
+  );
+  assert.equal(
+    detectEditor(fakeVscode({
+      env: { uriScheme: "unknown-fork", appName: "Antigravity" },
+    })),
+    EDITOR_KINDS.antigravityIde,
+  );
+});
+
+test("legacy and inaccessible host identity defaults to VS Code without leaking raw values", () => {
+  assert.equal(detectEditor(fakeVscode()), EDITOR_KINDS.vscode);
+  assert.equal(
+    detectEditor(fakeVscode({
+      env: { uriScheme: "private-editor-scheme", appName: "Private Editor Name" },
+    })),
+    EDITOR_KINDS.vscode,
+  );
+
+  const environment = {};
+  Object.defineProperties(environment, {
+    uriScheme: {
+      get() {
+        throw new Error("private scheme lookup failed");
+      },
+    },
+    appName: {
+      get() {
+        throw new Error("private app-name lookup failed");
+      },
+    },
+  });
+  assert.equal(detectEditor(fakeVscode({ env: environment })), EDITOR_KINDS.vscode);
+
+  const heartbeat = record(fakeVscode({
+    env: { uriScheme: "private-editor-scheme", appName: "Private Editor Name" },
+  }));
+  const serialized = JSON.stringify(heartbeat);
+  assert.equal(heartbeat.editor, "vscode");
+  assert.equal(serialized.includes("private-editor-scheme"), false);
+  assert.equal(serialized.includes("Private Editor Name"), false);
 });
 
 test("resolves one shared state root on Linux, macOS, and Windows", () => {
@@ -220,6 +290,7 @@ test("a single local folder has an exact folder open target", () => {
   assert.deepEqual(record(vscode), {
     schemaVersion: SCHEMA_VERSION,
     instanceId: "session-1",
+    editor: "vscode",
     workspaceName: "example-workspace",
     workspaceFolders: [
       {

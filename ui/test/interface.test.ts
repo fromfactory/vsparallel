@@ -269,6 +269,59 @@ test("workspace activity preserves the backend's distinct no-activity label", ()
   assert.equal(context.normalizeActivityView({ state: "unknown" }).label, "Unknown");
 });
 
+test("workspace normalization preserves Antigravity source and recent hook activity", () => {
+  const javascript = read("ui/generated/app.js");
+  const functions = [
+    "isObject",
+    "asString",
+    "asFiniteNumber",
+    "asTimestamp",
+    "asNullableBoolean",
+    "normalizeStateToken",
+    "describeActivityState",
+    "normalizeActivityView",
+    "deriveName",
+    "normalizeWorkspace",
+  ].map((name) => appFunction(javascript, name)).join("\n");
+  const context = {} as {
+    normalizeWorkspace(value: unknown, index: number): {
+      editor: string;
+      editorName: string;
+      recentlyActive: boolean;
+      openable: boolean;
+      antigravity: { kind: string; label: string } | null;
+    };
+  };
+  vm.runInNewContext(
+    `const MAX_JAVASCRIPT_TIMESTAMP_MS = 8_640_000_000_000_000; ${functions}`,
+    context,
+  );
+
+  const workspace = context.normalizeWorkspace({
+    instanceId: "antigravity-2:opaque",
+    editor: "antigravity_2",
+    editorName: "Antigravity 2.0",
+    name: "project",
+    path: "/work/project",
+    openable: false,
+    active: false,
+    focused: false,
+    recentlyActive: true,
+    antigravity: {
+      state: "turn_finished",
+      label: "Turn finished",
+      changedAtMs: 123,
+    },
+  }, 0);
+
+  assert.equal(workspace.editor, "antigravity_2");
+  assert.equal(workspace.editorName, "Antigravity 2.0");
+  assert.equal(workspace.recentlyActive, true);
+  assert.equal(workspace.openable, false);
+  assert.equal(workspace.antigravity?.kind, "finished");
+  assert.equal(workspace.antigravity?.label, "Turn finished");
+});
+
 test("legacy companion heartbeats give an actionable IDE extension status", () => {
   const javascript = read("ui/generated/app.js");
   const context = {} as {
@@ -362,6 +415,92 @@ test("Codex setup keeps review guidance separate from installed status", () => {
   }, "codex").reviewRequired, true);
 });
 
+test("setup summary treats VS Code and Antigravity IDE as peer editor choices", () => {
+  const javascript = read("ui/generated/app.js");
+  const functions = [
+    "summarizeEditorCompanions",
+    "describeSetupSummary",
+  ].map((name) => appFunction(javascript, name)).join("\n");
+  const context = {} as {
+    describeSetupSummary(
+      status: unknown,
+      diagnosticsLoaded: boolean,
+      diagnosticsUnavailable: boolean,
+      diagnosticWarningCount: number,
+    ): { summary: string; attention: boolean };
+  };
+  vm.runInNewContext(functions, context);
+
+  const component = (
+    kind: string,
+    visualState: "missing" | "ready" | "warning" | "error",
+    installed: boolean,
+    token: string = visualState,
+  ) => ({ kind, visualState, installed, token });
+  const status = (
+    vscode: ReturnType<typeof component>,
+    antigravityIde: ReturnType<typeof component>,
+    hookState: "missing" | "ready" = "ready",
+  ) => ({
+    companion: vscode,
+    antigravityIde,
+    antigravity: component("antigravity", hookState, hookState === "ready"),
+    codex: component("codex", hookState, hookState === "ready"),
+    claude: component("claude", hookState, hookState === "ready"),
+  });
+
+  const vscodeReady = context.describeSetupSummary(status(
+    component("companion", "ready", true, "installed"),
+    component("antigravityIde", "missing", false, "not_installed"),
+  ), false, false, 0);
+  assert.equal(vscodeReady.summary, "Integrations ready");
+  assert.equal(vscodeReady.attention, false);
+
+  const antigravityReady = context.describeSetupSummary(status(
+    component("companion", "error", false, "unavailable"),
+    component("antigravityIde", "ready", true, "installed"),
+  ), true, false, 0);
+  assert.equal(antigravityReady.summary, "Ready");
+  assert.equal(antigravityReady.attention, false);
+
+  const neitherReady = context.describeSetupSummary(status(
+    component("companion", "missing", false, "not_installed"),
+    component("antigravityIde", "error", false, "unavailable"),
+  ), true, false, 0);
+  assert.equal(neitherReady.summary, "Editor setup needed");
+  assert.equal(neitherReady.attention, true);
+
+  const optionalHooksMissing = context.describeSetupSummary(status(
+    component("companion", "ready", true, "installed"),
+    component("antigravityIde", "missing", false, "not_installed"),
+    "missing",
+  ), true, false, 0);
+  assert.equal(optionalHooksMissing.summary, "Optional setup");
+  assert.equal(optionalHooksMissing.attention, false);
+});
+
+test("setup-all skips either editor whose CLI is unavailable", () => {
+  const javascript = read("ui/generated/app.js");
+  const context = {} as {
+    availableEditorSetupKinds(status: unknown): string[];
+  };
+  vm.runInNewContext(appFunction(javascript, "availableEditorSetupKinds"), context);
+
+  const kinds = (companion: string, antigravityIde: string) => Array.from(
+    context.availableEditorSetupKinds({
+      companion: { token: companion },
+      antigravityIde: { token: antigravityIde },
+    }),
+  );
+  assert.deepEqual(kinds("not_installed", "not_installed"), [
+    "companion",
+    "antigravityIde",
+  ]);
+  assert.deepEqual(kinds("unavailable", "not_installed"), ["antigravityIde"]);
+  assert.deepEqual(kinds("not_installed", "unavailable"), ["companion"]);
+  assert.deepEqual(kinds("unavailable", "unavailable"), []);
+});
+
 test("setup separates activity hooks from provider usage requirements", () => {
   const html = read("ui/index.html");
   const css = read("ui/styles.css");
@@ -377,13 +516,27 @@ test("setup separates activity hooks from provider usage requirements", () => {
   assert.doesNotMatch(integrationText, /VS Code extension is required/i);
   assert.match(integrationText, /Codex activity hooks/i);
   assert.match(integrationText, /Claude Code activity hooks/i);
+  assert.match(integrationText, /Antigravity IDE companion/i);
+  assert.match(integrationText, /Antigravity activity hooks/i);
+  assert.match(integrationText, /Recent activity only/i);
+  assert.match(integrationText, /Start an agent turn after installation/i);
+  assert.match(integrationText, /Project-level \.agents\/hooks\.json can override/i);
   assert.match(
     integrationText,
-    /compatible, signed-in Codex CLI available to this app, either from a standalone installation or the locally installed Codex VS Code extension/i,
+    /Install at least one editor companion—VS Code or Antigravity IDE—to track live workspaces/i,
+  );
+  const antigravityIdeCard = integrationSection.match(
+    /<article\b(?=[^>]*id="antigravityIdeCard")[^>]*>[\s\S]*?<\/article>/i,
+  );
+  assert.ok(antigravityIdeCard, "the Antigravity IDE companion card should exist");
+  assert.doesNotMatch(antigravityIdeCard[0], /optional-label|>\s*Optional\s*</i);
+  assert.match(
+    integrationText,
+    /compatible, signed-in Codex CLI available to this app, either from a standalone installation or the locally installed Codex extension in VS Code or Antigravity IDE/i,
   );
   assert.match(
     integrationText,
-    /compatible, signed-in Claude Code CLI available to this app, either from a standalone installation or the locally installed Claude Code VS Code extension/i,
+    /compatible, signed-in Claude Code CLI available to this app, either from a standalone installation or the locally installed Claude Code extension in VS Code or Antigravity IDE/i,
   );
   assert.match(integrationText, /recent terminal status-line capture can also provide fallback usage/i);
   assert.equal(
@@ -391,13 +544,16 @@ test("setup separates activity hooks from provider usage requirements", () => {
     2,
     "each provider should have a separate usage requirement",
   );
-  assert.match(css, /\.integration-usage-requirement\s*\{/);
+  assert.match(css, /\.integration-usage-requirement[\s,]/);
+  assert.match(css, /\.integration-activity-limitation\s*\{/);
   assert.match(integrationText, /Set up monitoring/i);
   assert.doesNotMatch(integrationText, /Set up all/i);
   assert.match(javascript, /:\s*"Set up monitoring"/);
   assert.match(javascript, /Codex activity hooks installed\. Usage remaining is separate/);
   assert.match(javascript, /Claude Code activity hooks installed\. Usage remaining is separate/);
-  assert.match(javascript, /The VS Code companion and activity hooks are installed\. Usage remaining is separate/);
+  assert.match(javascript, /Antigravity 2\.0 hook execution/);
+  assert.match(javascript, /Opening an Antigravity 2\.0 Project does not fire hooks/);
+  assert.match(javascript, /No available editor companion CLI was detected/);
   assert.doesNotMatch(javascript, /All integrations are installed|still needs/i);
 });
 
@@ -432,8 +588,9 @@ test("provider names stay complete and the status panel owns most row width", ()
   const css = read("ui/styles.css");
   assert.match(
     javascript,
-    /createProviderState\(\s*"Claude"\s*,\s*workspace\.claude\s*,\s*"Claude Code"\s*,\s*workspace\.remoteWindow\s*\)/,
+    /createProviderState\(\s*"Claude"\s*,\s*workspace\.claude\s*,\s*"Claude Code"\s*,\s*workspace\.editorName\s*,\s*workspace\.remoteWindow\s*\)/,
   );
+  assert.match(javascript, /createProviderState\(\s*"Antigravity"/);
   assert.doesNotMatch(javascript, /createProviderState\(\s*"Claude Code"\s*,/);
   assert.match(
     css,
@@ -441,7 +598,7 @@ test("provider names stay complete and the status panel owns most row width", ()
   );
   assert.match(
     css,
-    /\.provider-state\s*\{[^}]*grid-template-columns\s*:\s*48px\s+minmax\(0,\s*1fr\)/i,
+    /\.provider-state\s*\{[^}]*grid-template-columns\s*:\s*72px\s+minmax\(0,\s*1fr\)/i,
   );
   const providerName = css.match(/\.provider-name\s*\{([^}]*)\}/i)?.[1];
   assert.ok(providerName, "provider names should have dedicated styling");
@@ -634,7 +791,12 @@ test("workspace rows use a transparent native full-card action without visible O
   assert.doesNotMatch(createRow, /\.textContent\s*=\s*["']Open["']/);
   assert.match(createRow, /setAttribute\(\s*["']aria-label["']/);
   assert.match(createRow, /workspace\.active \? "Switch to" : "Open"/);
-  assert.match(createRow, /`\$\{actionLabel\} \$\{workspace\.name\} in VS Code`/);
+  assert.match(
+    createRow,
+    /`\$\{actionLabel\} \$\{workspace\.name\} in \$\{workspace\.editorName\}`/,
+  );
+  assert.match(createRow, /workspace\.recentlyActive && !workspace\.openable/);
+  assert.match(createRow, /hook activity does not identify a live window or exact open target/);
 
   const openButtonCss = cssBlocksMatching(css, /\.open-button\b/);
   assert.match(openButtonCss, /position\s*:\s*absolute/i);
@@ -750,9 +912,9 @@ test("workspace switches compact VSParallel without minimizing it", () => {
 
   assert.ok(trayWorkspaceStart >= 0 && trayWorkspaceEnd > trayWorkspaceStart);
   const trayWorkspace = menuHandler.slice(trayWorkspaceStart, trayWorkspaceEnd);
-  assert.match(openWorkspace, /open_with\s*\(/);
+  assert.match(openWorkspace, /open_editor_with\s*\(/);
   assert.match(openWorkspace, /enter_floating_panel\s*\(/);
-  assert.match(openWorkspace, /find_active_open_target\s*\(/);
+  assert.match(openWorkspace, /find_active_workspace_open_target\s*\(/);
   assert.match(openWorkspace, /WorkspaceLaunchMode::PreferExisting/);
   assert.match(openWorkspace, /WorkspaceLaunchMode::NewWindow/);
   assert.match(library, /wait_for_restored_window_state\s*\(/);
@@ -760,8 +922,8 @@ test("workspace switches compact VSParallel without minimizing it", () => {
   assert.match(library, /set_visible_on_all_workspaces\(true\)/);
   assert.match(openWorkspace, /schedule_floating_panel_watchdog\s*\(/);
   assert.ok(
-    openWorkspace.indexOf("enter_floating_panel") < openWorkspace.indexOf("open_with"),
-    "the native panel must be ready before VS Code can switch desktops",
+    openWorkspace.indexOf("enter_floating_panel") < openWorkspace.indexOf("open_editor_with"),
+    "the native panel must be ready before the selected editor can switch desktops",
   );
   assert.doesNotMatch(openWorkspace, /\.minimize\s*\(/);
   assert.doesNotMatch(trayWorkspace, /\.minimize\s*\(/);

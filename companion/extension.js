@@ -7,6 +7,10 @@ const crypto = require("node:crypto");
 
 const SCHEMA_VERSION = 1;
 const HEARTBEAT_INTERVAL_MS = 3_000;
+const EDITOR_KINDS = Object.freeze({
+  vscode: "vscode",
+  antigravityIde: "antigravity_ide",
+});
 const AGENT_EXTENSION_IDS = Object.freeze({
   codex: "openai.chatgpt",
   claude: "anthropic.claude-code",
@@ -18,6 +22,39 @@ function nonEmptyString(value) {
   return typeof value === "string" && value.trim().length > 0
     ? value
     : null;
+}
+
+function environmentString(environment, property) {
+  try {
+    return nonEmptyString(environment && environment[property]);
+  } catch {
+    return null;
+  }
+}
+
+function detectEditor(vscode) {
+  let environment = null;
+  try {
+    environment = vscode && vscode.env;
+  } catch {
+    // Older or partially compatible hosts may not expose `env`. They retain the
+    // historical VS Code classification so existing installations keep working.
+  }
+
+  const uriScheme = environmentString(environment, "uriScheme")?.toLowerCase();
+  if (uriScheme === "antigravity" || uriScheme === "antigravity-ide") {
+    return EDITOR_KINDS.antigravityIde;
+  }
+  if (uriScheme === "vscode" || uriScheme === "vscode-insiders") {
+    return EDITOR_KINDS.vscode;
+  }
+
+  const appName = environmentString(environment, "appName")?.toLowerCase();
+  if (appName === "antigravity" || appName === "antigravity ide") {
+    return EDITOR_KINDS.antigravityIde;
+  }
+
+  return EDITOR_KINDS.vscode;
 }
 
 function resolveStateDirectory(options = {}) {
@@ -236,6 +273,7 @@ function createHeartbeatRecord(vscode, options) {
   return {
     schemaVersion: SCHEMA_VERSION,
     instanceId: options.instanceId,
+    editor: detectEditor(vscode),
     workspaceName: fallbackWorkspaceName(
       vscode.workspace.name,
       workspaceFile,

@@ -1,0 +1,2303 @@
+//! Local Antigravity lifecycle-hook integration for VSParallel.
+//!
+//! Antigravity 2.0, Antigravity IDE, and the Antigravity CLI discover the
+//! same global customization file at `~/.gemini/config/hooks.json`. This
+//! module owns one named entry in that file and records only coarse lifecycle
+//! state plus local workspace paths. It never reads Antigravity's private
+//! project, conversation, transcript, or database storage.
+
+use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::{Map, Value};
+use std::collections::{BTreeMap, BTreeSet};
+use std::env;
+use std::fmt;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::path::{Component, Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+use tempfile::Builder as TempFileBuilder;
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+#[cfg(windows)]
+use std::os::windows::{ffi::OsStrExt, fs::MetadataExt};
+
+const HOOKS_FILENAME: &str = "hooks.json";
+const BACKUP_FILENAME: &str = "hooks.json.vsparallel.bak";
+const MANAGED_HOOK_NAME: &str = "vsparallel";
+const HOOK_ARGUMENT: &str = "antigravity-hook";
+const HOOK_HEALTH_DIRECTORY: &str = "antigravity-hook-health";
+const HOOK_TIMEOUT_SECONDS: u64 = 2;
+const SCHEMA_VERSION: u32 = 1;
+const MAX_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_HOOK_HEALTH_BYTES: u64 = 8 * 1024;
+const MAX_HOOK_INPUT_BYTES: usize = 1024 * 1024;
+const MAX_CONVERSATION_ID_BYTES: usize = 16 * 1024;
+const MAX_WORKSPACE_PATH_BYTES: usize = 32 * 1024;
+const MAX_WORKSPACE_PATHS: usize = 64;
+const MAX_TRANSCRIPT_PATH_BYTES: usize = 64 * 1024;
+const MAX_TERMINATION_REASON_BYTES: usize = 256;
+const MAX_FUTURE_SKEW_MS: i64 = 5 * 60 * 1_000;
+
+const EVENTS: [AntigravityHookEvent; 3] = [
+    AntigravityHookEvent::PreInvocation,
+    AntigravityHookEvent::PostToolUse,
+    AntigravityHookEvent::Stop,
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum AntigravityHookEvent {
+    PreInvocation,
+    PostToolUse,
+    Stop,
+}
+
+impl AntigravityHookEvent {
+    /// Parse the stable subcommand passed after `antigravity-hook`.
+    pub fn from_cli_argument(value: &str) -> Option<Self> {
+        match value {
+            "pre-invocation" => Some(Self::PreInvocation),
+            "post-tool-use" => Some(Self::PostToolUse),
+            "stop" => Some(Self::Stop),
+            _ => None,
+        }
+    }
+
+    fn cli_argument(self) -> &'static str {
+        match self {
+            Self::PreInvocation => "pre-invocation",
+            Self::PostToolUse => "post-tool-use",
+            Self::Stop => "stop",
+        }
+    }
+
+    fn observation_name(self) -> &'static str {
+        self.cli_argument()
+    }
+
+    fn config_name(self) -> &'static str {
+        match self {
+            Self::PreInvocation => "PreInvocation",
+            Self::PostToolUse => "PostToolUse",
+            Self::Stop => "Stop",
+        }
+    }
+
+    fn fail_open_output(self) -> &'static [u8] {
+        match self {
+            // Both fields accepted by PreInvocation are optional. PostToolUse
+            // explicitly expects an empty JSON object.
+            Self::PreInvocation | Self::PostToolUse => b"{}\n",
+            // Stop documents `decision` as required and treats every value
+            // other than `continue` as permission to stop.
+            Self::Stop => b"{\"decision\":\"allow\"}\n",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EventState {
+    Current,
+    Stale,
+    Missing,
+}
+
+impl EventState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Stale => "stale",
+            Self::Missing => "missing",
+        }
+    }
+}
+
+/// Serializable setup status for future Tauri command wiring.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AntigravityIntegrationStatus {
+    pub state: String,
+    pub installed: bool,
+    pub config_path: String,
+    pub backup_path: String,
+    pub event_states: BTreeMap<String, String>,
+    pub hooks_disabled: bool,
+    pub message: String,
+}
+
+/// Result of an install or uninstall request.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AntigravityIntegrationChange {
+    pub changed: bool,
+    pub migrated: bool,
+    pub status: AntigravityIntegrationStatus,
+}
+
+/// The only persisted view of an Antigravity hook payload.
+///
+/// A multi-folder Antigravity project produces one record per workspace path,
+/// keeping the on-disk schema compatible with VSParallel's existing coarse
+/// activity records. The raw conversation ID is replaced with a SHA-256 key.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HookRecord {
+    schema_version: u32,
+    session_key: String,
+    cwd: String,
+    state: String,
+    changed_at_ms: i64,
+}
+
+#[derive(Debug, Default)]
+struct HookPayload {
+    conversation_id: Option<String>,
+    workspace_paths: Vec<String>,
+    surface: AntigravitySurface,
+    surface_conflict: bool,
+    had_error: bool,
+    termination_reason: Option<String>,
+    fully_idle: Option<bool>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum AntigravitySurface {
+    Two,
+    Ide,
+    Cli,
+    #[default]
+    Unknown,
+}
+
+impl AntigravitySurface {
+    fn state_directory(self) -> Option<&'static str> {
+        match self {
+            Self::Two => Some("antigravity"),
+            Self::Ide => Some("antigravity-ide"),
+            // The global hook also runs in the CLI, which is outside this
+            // workspace UI's supported editor surfaces. Do not mislabel it.
+            Self::Cli | Self::Unknown => None,
+        }
+    }
+
+    fn observation_file(self) -> &'static str {
+        match self {
+            Self::Two => "antigravity-2.json",
+            Self::Ide => "antigravity-ide.json",
+            Self::Cli => "antigravity-cli.json",
+            Self::Unknown => "unknown.json",
+        }
+    }
+
+    fn observation_name(self) -> &'static str {
+        match self {
+            Self::Two => "antigravity_2",
+            Self::Ide => "antigravity_ide",
+            Self::Cli => "antigravity_cli",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl HookPayload {
+    fn observe_surface(&mut self, surface: AntigravitySurface) {
+        if surface == AntigravitySurface::Unknown || self.surface_conflict {
+            return;
+        }
+        if self.surface == AntigravitySurface::Unknown {
+            self.surface = surface;
+        } else if self.surface != surface {
+            self.surface = AntigravitySurface::Unknown;
+            self.surface_conflict = true;
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AntigravityHookOutcome {
+    Recorded,
+    InvalidPayload,
+    UnsupportedSurface,
+    MissingConversation,
+    NoWorkspace,
+    PersistFailed,
+}
+
+impl AntigravityHookOutcome {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Recorded => "recorded",
+            Self::InvalidPayload => "invalid_payload",
+            Self::UnsupportedSurface => "unsupported_surface",
+            Self::MissingConversation => "missing_conversation",
+            Self::NoWorkspace => "no_workspace",
+            Self::PersistFailed => "persist_failed",
+        }
+    }
+
+    pub(crate) fn user_message(self) -> &'static str {
+        match self {
+            Self::Recorded => "the latest agent event produced workspace activity",
+            Self::InvalidPayload => "the latest event payload was not valid documented JSON",
+            Self::UnsupportedSurface => {
+                "the latest event did not identify the Antigravity 2.0 surface"
+            }
+            Self::MissingConversation => {
+                "the latest event did not include a conversation identifier"
+            }
+            Self::NoWorkspace => {
+                "the latest event did not include a usable local Project workspace path"
+            }
+            Self::PersistFailed => "VSParallel could not save the latest workspace activity",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct AntigravityHookObservation {
+    schema_version: u32,
+    pub(crate) event: String,
+    pub(crate) surface: String,
+    pub(crate) outcome: AntigravityHookOutcome,
+    pub(crate) observed_at_ms: i64,
+    pub(crate) workspace_count: u32,
+}
+
+/// Streaming payload parser. The transcript path is reduced immediately to a
+/// bounded product enum; its value, model output, and tool arguments are never
+/// represented in the persisted record.
+struct HookPayloadSeed<'a> {
+    event: AntigravityHookEvent,
+    payload: &'a mut HookPayload,
+}
+
+impl<'de> DeserializeSeed<'de> for HookPayloadSeed<'_> {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(HookPayloadVisitor {
+            event: self.event,
+            payload: self.payload,
+        })
+    }
+}
+
+struct HookPayloadVisitor<'a> {
+    event: AntigravityHookEvent,
+    payload: &'a mut HookPayload,
+}
+
+impl<'de> Visitor<'de> for HookPayloadVisitor<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an Antigravity hook JSON object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut conversation_seen = false;
+        let mut workspaces_seen = false;
+        let mut error_seen = false;
+        let mut reason_seen = false;
+        let mut idle_seen = false;
+        let mut transcript_seen = false;
+        let mut artifact_directory_seen = false;
+
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "conversationId" => {
+                    if conversation_seen {
+                        return Err(serde::de::Error::duplicate_field("conversationId"));
+                    }
+                    conversation_seen = true;
+                    let value: Option<String> = map.next_value()?;
+                    if value
+                        .as_ref()
+                        .is_some_and(|value| value.len() > MAX_CONVERSATION_ID_BYTES)
+                    {
+                        return Err(serde::de::Error::custom(
+                            "Antigravity conversation identifier exceeds the safety limit",
+                        ));
+                    }
+                    self.payload.conversation_id = value;
+                }
+                "workspacePaths" => {
+                    if workspaces_seen {
+                        return Err(serde::de::Error::duplicate_field("workspacePaths"));
+                    }
+                    workspaces_seen = true;
+                    self.payload.workspace_paths = map.next_value_seed(WorkspacePathsSeed)?;
+                }
+                "transcriptPath" => {
+                    if transcript_seen {
+                        return Err(serde::de::Error::duplicate_field("transcriptPath"));
+                    }
+                    transcript_seen = true;
+                    let value: Option<String> = map.next_value()?;
+                    if value
+                        .as_ref()
+                        .is_some_and(|value| value.len() > MAX_TRANSCRIPT_PATH_BYTES)
+                    {
+                        return Err(serde::de::Error::custom(
+                            "Antigravity transcript path exceeds the safety limit",
+                        ));
+                    }
+                    if let Some(value) = value.as_deref() {
+                        self.payload
+                            .observe_surface(classify_antigravity_surface(value));
+                    }
+                }
+                "artifactDirectoryPath" => {
+                    if artifact_directory_seen {
+                        return Err(serde::de::Error::duplicate_field("artifactDirectoryPath"));
+                    }
+                    artifact_directory_seen = true;
+                    let value: Option<String> = map.next_value()?;
+                    if value
+                        .as_ref()
+                        .is_some_and(|value| value.len() > MAX_TRANSCRIPT_PATH_BYTES)
+                    {
+                        return Err(serde::de::Error::custom(
+                            "Antigravity artifact directory path exceeds the safety limit",
+                        ));
+                    }
+                    if let Some(value) = value.as_deref() {
+                        self.payload
+                            .observe_surface(classify_antigravity_surface(value));
+                    }
+                }
+                "error"
+                    if matches!(
+                        self.event,
+                        AntigravityHookEvent::PostToolUse | AntigravityHookEvent::Stop
+                    ) =>
+                {
+                    if error_seen {
+                        return Err(serde::de::Error::duplicate_field("error"));
+                    }
+                    error_seen = true;
+                    let value: Option<String> = map.next_value()?;
+                    self.payload.had_error = value.is_some_and(|value| !value.trim().is_empty());
+                }
+                "terminationReason" if self.event == AntigravityHookEvent::Stop => {
+                    if reason_seen {
+                        return Err(serde::de::Error::duplicate_field("terminationReason"));
+                    }
+                    reason_seen = true;
+                    let value: Option<String> = map.next_value()?;
+                    if value
+                        .as_ref()
+                        .is_some_and(|value| value.len() > MAX_TERMINATION_REASON_BYTES)
+                    {
+                        return Err(serde::de::Error::custom(
+                            "Antigravity termination reason exceeds the safety limit",
+                        ));
+                    }
+                    self.payload.termination_reason = value;
+                }
+                "fullyIdle" if self.event == AntigravityHookEvent::Stop => {
+                    if idle_seen {
+                        return Err(serde::de::Error::duplicate_field("fullyIdle"));
+                    }
+                    idle_seen = true;
+                    self.payload.fully_idle = map.next_value()?;
+                }
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+struct WorkspacePathsSeed;
+
+impl<'de> DeserializeSeed<'de> for WorkspacePathsSeed {
+    type Value = Vec<String>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_seq(WorkspacePathsVisitor)
+    }
+}
+
+struct WorkspacePathsVisitor;
+
+impl<'de> Visitor<'de> for WorkspacePathsVisitor {
+    type Value = Vec<String>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an array of Antigravity workspace paths")
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        let mut paths = Vec::new();
+        while let Some(path) = sequence.next_element::<String>()? {
+            if paths.len() == MAX_WORKSPACE_PATHS {
+                return Err(serde::de::Error::custom(
+                    "Antigravity workspace path count exceeds the safety limit",
+                ));
+            }
+            if path.len() > MAX_WORKSPACE_PATH_BYTES {
+                return Err(serde::de::Error::custom(
+                    "Antigravity workspace path exceeds the safety limit",
+                ));
+            }
+            paths.push(path);
+        }
+        Ok(paths)
+    }
+}
+
+/// Resolve Antigravity's documented global customization directory.
+pub fn antigravity_config_dir_from_environment() -> Result<PathBuf, String> {
+    home_directory()
+        .map(|path| path.join(".gemini").join("config"))
+        .map_err(|_| "could not determine the Antigravity global configuration directory".into())
+}
+
+/// Inspect VSParallel's named Antigravity hook without changing it.
+pub fn antigravity_integration_status(
+    config_dir: &Path,
+    executable: &Path,
+) -> Result<AntigravityIntegrationStatus, String> {
+    let paths = IntegrationPaths::new(config_dir)?;
+    let handlers = managed_handlers(executable)?;
+    let (config, _) = read_config(&paths.config)?;
+    status_from_config(&paths, &config, &handlers)
+}
+
+/// Install or repair VSParallel's named global Antigravity hook entry.
+pub fn install_antigravity_integration(
+    config_dir: &Path,
+    executable: &Path,
+) -> Result<AntigravityIntegrationChange, String> {
+    let paths = IntegrationPaths::new(config_dir)?;
+    validate_install_executable(executable)?;
+    let handlers = managed_handlers(executable)?;
+    let (mut config, original) = read_config(&paths.config)?;
+    let states = event_states(&config, &handlers);
+    let disabled = hooks_disabled(&config);
+    if !disabled && states.values().all(|state| *state == EventState::Current) {
+        return Ok(AntigravityIntegrationChange {
+            changed: false,
+            migrated: false,
+            status: status_from_states(&paths, states, false, false),
+        });
+    }
+
+    let migrated = match config.get(MANAGED_HOOK_NAME) {
+        Some(entry) if managed_entry_is_owned(entry, &handlers) => true,
+        Some(_) => {
+            return Err(format!(
+                "the Antigravity hook name '{MANAGED_HOOK_NAME}' is already used by an entry VSParallel does not own; it was left unchanged"
+            ));
+        }
+        None => false,
+    };
+    config.insert(
+        MANAGED_HOOK_NAME.to_string(),
+        canonical_managed_entry(&handlers),
+    );
+    ensure_backup(&paths.backup, &original)?;
+    atomic_write_json(&paths.config, &config)?;
+
+    Ok(AntigravityIntegrationChange {
+        changed: true,
+        migrated,
+        status: status_from_config(&paths, &config, &handlers)?,
+    })
+}
+
+/// Remove only VSParallel's named global Antigravity hook entry.
+pub fn uninstall_antigravity_integration(
+    config_dir: &Path,
+    executable: &Path,
+) -> Result<AntigravityIntegrationChange, String> {
+    let paths = IntegrationPaths::new(config_dir)?;
+    let handlers = managed_handlers(executable)?;
+    let (mut config, original) = read_config(&paths.config)?;
+    let changed = config
+        .get(MANAGED_HOOK_NAME)
+        .is_some_and(|entry| managed_entry_is_owned(entry, &handlers));
+    if changed {
+        config.remove(MANAGED_HOOK_NAME);
+        ensure_backup(&paths.backup, &original)?;
+        atomic_write_json(&paths.config, &config)?;
+    }
+
+    Ok(AntigravityIntegrationChange {
+        changed,
+        migrated: false,
+        status: status_from_config(&paths, &config, &handlers)?,
+    })
+}
+
+/// Fail-open stdio entry point used by the installed executable.
+pub fn run_antigravity_hook_stdio(event: AntigravityHookEvent) -> i32 {
+    run_antigravity_hook(event, io::stdin().lock(), io::stdout().lock())
+}
+
+/// Testable hook entry point. It always exits successfully and always emits a
+/// valid event-specific JSON response, even if parsing or persistence fails.
+pub fn run_antigravity_hook<R: Read, W: Write>(
+    event: AntigravityHookEvent,
+    reader: R,
+    writer: W,
+) -> i32 {
+    let root = crate::state::state_dir_from_environment();
+    run_antigravity_hook_with(event, reader, writer, root.as_deref(), unix_time_ms())
+}
+
+fn run_antigravity_hook_with<R: Read, W: Write>(
+    event: AntigravityHookEvent,
+    reader: R,
+    mut writer: W,
+    state_root: Result<&Path, &String>,
+    changed_at_ms: i64,
+) -> i32 {
+    let capped = CappedReader::new(reader, MAX_HOOK_INPUT_BYTES);
+    let mut deserializer = serde_json::Deserializer::from_reader(capped);
+    let mut payload = HookPayload::default();
+    let parsed = HookPayloadSeed {
+        event,
+        payload: &mut payload,
+    }
+    .deserialize(&mut deserializer)
+    .and_then(|()| deserializer.end());
+
+    let surface = payload.surface;
+    let (outcome, workspace_count) = if parsed.is_err() {
+        (AntigravityHookOutcome::InvalidPayload, 0)
+    } else if surface.state_directory().is_none() {
+        (AntigravityHookOutcome::UnsupportedSurface, 0)
+    } else if payload
+        .conversation_id
+        .as_deref()
+        .is_none_or(|value| value.is_empty())
+    {
+        (AntigravityHookOutcome::MissingConversation, 0)
+    } else {
+        let records = records_from_payload(event, &payload, changed_at_ms);
+        if records.is_empty() {
+            (AntigravityHookOutcome::NoWorkspace, 0)
+        } else if let (Ok(root), Some(directory)) = (state_root, surface.state_directory()) {
+            let attempted = records.len();
+            let recorded = records
+                .into_iter()
+                .filter(|(record_key, record)| {
+                    persist_record(root, directory, record_key, record).is_ok()
+                })
+                .count();
+            if recorded == attempted {
+                (AntigravityHookOutcome::Recorded, recorded as u32)
+            } else {
+                (AntigravityHookOutcome::PersistFailed, recorded as u32)
+            }
+        } else {
+            (AntigravityHookOutcome::PersistFailed, 0)
+        }
+    };
+
+    if let Ok(root) = state_root {
+        let observation = AntigravityHookObservation {
+            schema_version: SCHEMA_VERSION,
+            event: event.observation_name().to_string(),
+            surface: surface.observation_name().to_string(),
+            outcome,
+            observed_at_ms: changed_at_ms,
+            workspace_count,
+        };
+        // Hook execution health contains fixed enums, a count, and a timestamp
+        // only. Its own write remains fail-open like activity persistence.
+        let _ = persist_hook_observation(root, surface, &observation);
+    }
+
+    let _ = writer.write_all(event.fail_open_output());
+    let _ = writer.flush();
+    0
+}
+
+fn records_from_payload(
+    event: AntigravityHookEvent,
+    payload: &HookPayload,
+    changed_at_ms: i64,
+) -> Vec<(String, HookRecord)> {
+    let Some(conversation_id) = payload
+        .conversation_id
+        .as_deref()
+        .filter(|value| !value.is_empty() && value.len() <= MAX_CONVERSATION_ID_BYTES)
+    else {
+        return Vec::new();
+    };
+    let state = activity_state(event, payload);
+    let session_key = sha256_hex(conversation_id.as_bytes());
+    let mut normalized = BTreeSet::new();
+    for raw in &payload.workspace_paths {
+        if let Some(path) = normalize_workspace_path(raw) {
+            normalized.insert(path);
+        }
+    }
+
+    normalized
+        .into_iter()
+        .map(|cwd| {
+            let cwd = cwd.to_string_lossy().into_owned();
+            let mut identity = Vec::with_capacity(conversation_id.len() + cwd.len() + 1);
+            identity.extend_from_slice(conversation_id.as_bytes());
+            identity.push(0);
+            identity.extend_from_slice(cwd.as_bytes());
+            let record_key = sha256_hex(&identity);
+            let record = HookRecord {
+                schema_version: SCHEMA_VERSION,
+                session_key: session_key.clone(),
+                cwd,
+                state: state.to_string(),
+                changed_at_ms,
+            };
+            (record_key, record)
+        })
+        .collect()
+}
+
+fn activity_state(event: AntigravityHookEvent, payload: &HookPayload) -> &'static str {
+    match event {
+        AntigravityHookEvent::PreInvocation => "activity_detected",
+        AntigravityHookEvent::PostToolUse if payload.had_error => "failed",
+        AntigravityHookEvent::PostToolUse => "activity_detected",
+        AntigravityHookEvent::Stop if payload.had_error => "failed",
+        AntigravityHookEvent::Stop => {
+            let reason = payload
+                .termination_reason
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if reason == "error" || reason.ends_with("_error") {
+                "failed"
+            } else if reason.contains("interrupt") || reason.contains("cancel") {
+                "interrupted"
+            } else if payload.fully_idle == Some(false) {
+                "activity_detected"
+            } else {
+                "turn_finished"
+            }
+        }
+    }
+}
+
+fn persist_record(
+    root: &Path,
+    directory_name: &str,
+    record_key: &str,
+    record: &HookRecord,
+) -> Result<(), String> {
+    if !is_sha256_key(record_key) || !is_sha256_key(&record.session_key) {
+        return Err("invalid Antigravity record key".to_string());
+    }
+    if !matches!(directory_name, "antigravity" | "antigravity-ide") {
+        return Err("invalid Antigravity state directory".to_string());
+    }
+    ensure_private_directory(root)?;
+    let directory = root.join(directory_name);
+    ensure_private_directory(&directory)?;
+
+    let target = directory.join(format!("{record_key}.json"));
+    let mut bytes = serde_json::to_vec(record)
+        .map_err(|error| format!("could not serialize Antigravity state: {error}"))?;
+    bytes.push(b'\n');
+    atomic_write_bytes(&target, &bytes, Some(0o600))
+}
+
+fn persist_hook_observation(
+    root: &Path,
+    surface: AntigravitySurface,
+    observation: &AntigravityHookObservation,
+) -> Result<(), String> {
+    ensure_private_directory(root)?;
+    let directory = root.join(HOOK_HEALTH_DIRECTORY);
+    ensure_private_directory(&directory)?;
+    let target = directory.join(surface.observation_file());
+    let mut bytes = serde_json::to_vec(observation)
+        .map_err(|error| format!("could not serialize Antigravity hook health: {error}"))?;
+    bytes.push(b'\n');
+    atomic_write_bytes(&target, &bytes, Some(0o600))
+}
+
+pub(crate) fn antigravity_two_hook_observation(
+    root: &Path,
+    now_ms: i64,
+) -> Result<Option<AntigravityHookObservation>, String> {
+    read_hook_observation(root, AntigravitySurface::Two, now_ms)
+}
+
+fn read_hook_observation(
+    root: &Path,
+    surface: AntigravitySurface,
+    now_ms: i64,
+) -> Result<Option<AntigravityHookObservation>, String> {
+    let directory = root.join(HOOK_HEALTH_DIRECTORY);
+    match fs::symlink_metadata(&directory) {
+        Ok(metadata) if is_link_or_reparse_point(&metadata) || !metadata.is_dir() => {
+            return Err(format!("{} is not a safe directory", directory.display()));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "could not inspect {}: {error}",
+                directory.display()
+            ));
+        }
+    }
+
+    let path = directory.join(surface.observation_file());
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("could not inspect {}: {error}", path.display())),
+    };
+    if is_link_or_reparse_point(&metadata) || !metadata.is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    if metadata.len() > MAX_HOOK_HEALTH_BYTES {
+        return Err(format!(
+            "{} exceeds the Antigravity hook health safety limit",
+            path.display()
+        ));
+    }
+    let file =
+        File::open(&path).map_err(|error| format!("could not open {}: {error}", path.display()))?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_HOOK_HEALTH_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    if bytes.len() as u64 > MAX_HOOK_HEALTH_BYTES {
+        return Err(format!(
+            "{} exceeds the Antigravity hook health safety limit",
+            path.display()
+        ));
+    }
+    let observation: AntigravityHookObservation = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("{} is not valid hook health JSON: {error}", path.display()))?;
+    if observation.schema_version != SCHEMA_VERSION
+        || observation.surface != surface.observation_name()
+        || !EVENTS
+            .iter()
+            .any(|event| event.observation_name() == observation.event)
+        || observation.observed_at_ms < 0
+        || observation.observed_at_ms > now_ms.saturating_add(MAX_FUTURE_SKEW_MS)
+        || observation.workspace_count > MAX_WORKSPACE_PATHS as u32
+        || (observation.outcome == AntigravityHookOutcome::Recorded
+            && observation.workspace_count == 0)
+    {
+        return Err(format!(
+            "{} contains invalid hook health data",
+            path.display()
+        ));
+    }
+    Ok(Some(observation))
+}
+
+fn classify_antigravity_surface(transcript_path: &str) -> AntigravitySurface {
+    let mut components = transcript_path
+        .split(['/', '\\'])
+        .filter(|component| !component.is_empty());
+    while let Some(component) = components.next() {
+        if component == ".gemini" {
+            return match components.next() {
+                Some("antigravity") => AntigravitySurface::Two,
+                Some("antigravity-ide") => AntigravitySurface::Ide,
+                Some("antigravity-cli") => AntigravitySurface::Cli,
+                _ => AntigravitySurface::Unknown,
+            };
+        }
+    }
+    AntigravitySurface::Unknown
+}
+
+#[derive(Debug)]
+struct IntegrationPaths {
+    config: PathBuf,
+    backup: PathBuf,
+}
+
+impl IntegrationPaths {
+    fn new(config_dir: &Path) -> Result<Self, String> {
+        if !config_dir.is_absolute() {
+            return Err(
+                "the Antigravity global configuration directory must be an absolute path"
+                    .to_string(),
+            );
+        }
+        Ok(Self {
+            config: config_dir.join(HOOKS_FILENAME),
+            backup: config_dir.join(BACKUP_FILENAME),
+        })
+    }
+}
+
+fn managed_handlers(executable: &Path) -> Result<BTreeMap<AntigravityHookEvent, Value>, String> {
+    EVENTS
+        .into_iter()
+        .map(|event| managed_handler(executable, event).map(|handler| (event, handler)))
+        .collect()
+}
+
+fn managed_handler(executable: &Path, event: AntigravityHookEvent) -> Result<Value, String> {
+    if !executable.is_absolute() {
+        return Err("the VSParallel hook executable must be an absolute path".to_string());
+    }
+    let executable = executable
+        .to_str()
+        .ok_or_else(|| "the VSParallel hook executable path is not valid Unicode".to_string())?;
+    if executable.contains(['\0', '\n', '\r']) {
+        return Err("the VSParallel hook executable path contains unsafe characters".to_string());
+    }
+
+    #[cfg(windows)]
+    let command = format!(
+        "{} {HOOK_ARGUMENT} {}",
+        quote_windows(executable),
+        event.cli_argument()
+    );
+    #[cfg(not(windows))]
+    let command = format!(
+        "{} {HOOK_ARGUMENT} {}",
+        quote_posix(executable),
+        event.cli_argument()
+    );
+
+    Ok(serde_json::json!({
+        "type": "command",
+        "command": command,
+        "timeout": HOOK_TIMEOUT_SECONDS,
+    }))
+}
+
+#[cfg(not(windows))]
+fn quote_posix(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+#[cfg(windows)]
+fn quote_windows(value: &str) -> String {
+    let mut result = String::with_capacity(value.len() + 2);
+    result.push('"');
+    let mut backslashes = 0usize;
+    for character in value.chars() {
+        if character == '\\' {
+            backslashes += 1;
+            continue;
+        }
+        if character == '"' {
+            result.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+            result.push('"');
+        } else {
+            result.extend(std::iter::repeat_n('\\', backslashes));
+            result.push(character);
+        }
+        backslashes = 0;
+    }
+    result.extend(std::iter::repeat_n('\\', backslashes * 2));
+    result.push('"');
+    result
+}
+
+fn canonical_managed_entry(handlers: &BTreeMap<AntigravityHookEvent, Value>) -> Value {
+    serde_json::json!({
+        "enabled": true,
+        "PreInvocation": [handlers[&AntigravityHookEvent::PreInvocation].clone()],
+        "PostToolUse": [{
+            "matcher": "*",
+            "hooks": [handlers[&AntigravityHookEvent::PostToolUse].clone()],
+        }],
+        "Stop": [handlers[&AntigravityHookEvent::Stop].clone()],
+    })
+}
+
+fn validate_install_executable(executable: &Path) -> Result<(), String> {
+    let metadata = fs::metadata(executable).map_err(|error| {
+        format!(
+            "the VSParallel hook executable is unavailable at {}: {error}",
+            executable.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "the VSParallel hook executable is not a regular file: {}",
+            executable.display()
+        ));
+    }
+    Ok(())
+}
+
+fn read_config(path: &Path) -> Result<(Map<String, Value>, Vec<u8>), String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok((Map::new(), b"{}\n".to_vec()));
+        }
+        Err(error) => return Err(format!("could not inspect {}: {error}", path.display())),
+    };
+    if is_link_or_reparse_point(&metadata) || !metadata.is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    if metadata.len() > MAX_CONFIG_BYTES {
+        return Err(format!(
+            "{} exceeds the {} byte safety limit; it was left unchanged",
+            path.display(),
+            MAX_CONFIG_BYTES
+        ));
+    }
+    let raw =
+        fs::read(path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    let json_bytes = raw.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&raw);
+    let value: Value = serde_json::from_slice(json_bytes).map_err(|error| {
+        format!(
+            "{} is not valid UTF-8 JSON; it was left unchanged: {error}",
+            path.display()
+        )
+    })?;
+    let object = value.as_object().cloned().ok_or_else(|| {
+        format!(
+            "{} must contain a JSON object; it was left unchanged",
+            path.display()
+        )
+    })?;
+    Ok((object, raw))
+}
+
+fn event_states(
+    config: &Map<String, Value>,
+    handlers: &BTreeMap<AntigravityHookEvent, Value>,
+) -> BTreeMap<AntigravityHookEvent, EventState> {
+    let entry = config.get(MANAGED_HOOK_NAME).and_then(Value::as_object);
+    EVENTS
+        .into_iter()
+        .map(|event| {
+            let state = match entry.and_then(|entry| entry.get(event.config_name())) {
+                None => EventState::Missing,
+                Some(value) if event_value_is_current(event, value, &handlers[&event]) => {
+                    EventState::Current
+                }
+                Some(_) => EventState::Stale,
+            };
+            (event, state)
+        })
+        .collect()
+}
+
+fn event_value_is_current(event: AntigravityHookEvent, value: &Value, handler: &Value) -> bool {
+    match event {
+        AntigravityHookEvent::PreInvocation | AntigravityHookEvent::Stop => {
+            value == &Value::Array(vec![handler.clone()])
+        }
+        AntigravityHookEvent::PostToolUse => {
+            value
+                == &serde_json::json!([{
+                    "matcher": "*",
+                    "hooks": [handler.clone()],
+                }])
+        }
+    }
+}
+
+fn hooks_disabled(config: &Map<String, Value>) -> bool {
+    config
+        .get(MANAGED_HOOK_NAME)
+        .and_then(Value::as_object)
+        .and_then(|entry| entry.get("enabled"))
+        .and_then(Value::as_bool)
+        == Some(false)
+}
+
+fn managed_entry_is_owned(entry: &Value, handlers: &BTreeMap<AntigravityHookEvent, Value>) -> bool {
+    let Some(entry) = entry.as_object() else {
+        return false;
+    };
+
+    // Installation repairs and uninstallation replace/remove the whole named
+    // entry, so ownership must cover the whole entry. Merely finding one
+    // command with a familiar suffix is insufficient: a user may have added
+    // another handler to this entry, and that handler must never be discarded.
+    if entry.is_empty()
+        || entry
+            .keys()
+            .any(|key| key != "enabled" && !EVENTS.iter().any(|event| event.config_name() == key))
+        || entry
+            .get("enabled")
+            .is_some_and(|value| !value.is_boolean())
+    {
+        return false;
+    }
+
+    let mut managed_event_count = 0;
+    for event in EVENTS {
+        let Some(value) = entry.get(event.config_name()) else {
+            continue;
+        };
+        if !managed_event_value_is_owned(event, value, &handlers[&event]) {
+            return false;
+        }
+        managed_event_count += 1;
+    }
+    managed_event_count > 0
+}
+
+fn managed_event_value_is_owned(
+    event: AntigravityHookEvent,
+    value: &Value,
+    expected_handler: &Value,
+) -> bool {
+    let Some(groups) = value.as_array() else {
+        return false;
+    };
+    if groups.len() != 1 {
+        return false;
+    }
+
+    match event {
+        AntigravityHookEvent::PreInvocation | AntigravityHookEvent::Stop => {
+            managed_handler_is_owned(&groups[0], event, expected_handler)
+        }
+        AntigravityHookEvent::PostToolUse => {
+            let Some(group) = groups[0].as_object() else {
+                return false;
+            };
+            if group.keys().any(|key| key != "matcher" && key != "hooks")
+                || group.get("matcher").and_then(Value::as_str) != Some("*")
+            {
+                return false;
+            }
+            let Some(handlers) = group.get("hooks").and_then(Value::as_array) else {
+                return false;
+            };
+            handlers.len() == 1 && managed_handler_is_owned(&handlers[0], event, expected_handler)
+        }
+    }
+}
+
+fn managed_handler_is_owned(
+    handler: &Value,
+    event: AntigravityHookEvent,
+    expected_handler: &Value,
+) -> bool {
+    let Some(handler) = handler.as_object() else {
+        return false;
+    };
+    if handler
+        .keys()
+        .any(|key| key != "type" && key != "command" && key != "timeout")
+        || handler
+            .get("type")
+            .is_some_and(|value| value.as_str() != Some("command"))
+        || handler.get("timeout").is_some_and(|value| !value.is_u64())
+    {
+        return false;
+    }
+    let handler = Value::Object(handler.clone());
+    &handler == expected_handler || historical_vsparallel_handler(&handler, event)
+}
+
+fn historical_vsparallel_handler(handler: &Value, event: AntigravityHookEvent) -> bool {
+    let Some(command) = handler
+        .as_object()
+        .and_then(|handler| handler.get("command"))
+        .and_then(Value::as_str)
+    else {
+        return false;
+    };
+    let suffix = format!(" {HOOK_ARGUMENT} {}", event.cli_argument());
+    let Some(prefix) = command.trim().strip_suffix(&suffix) else {
+        return false;
+    };
+    let prefix = prefix.trim();
+    let executable = if prefix.len() >= 2 && prefix.starts_with('\'') && prefix.ends_with('\'') {
+        let inner = &prefix[1..prefix.len() - 1];
+        (!inner.contains('\'')).then_some(inner)
+    } else if prefix.len() >= 2 && prefix.starts_with('"') && prefix.ends_with('"') {
+        let inner = &prefix[1..prefix.len() - 1];
+        (!inner.contains('"')).then_some(inner)
+    } else if !prefix.chars().any(char::is_whitespace)
+        && !prefix.contains([';', '&', '|', '`', '$', '<', '>', '(', ')'])
+    {
+        Some(prefix)
+    } else {
+        None
+    };
+    executable.is_some_and(historical_vsparallel_executable)
+}
+
+fn historical_vsparallel_executable(executable: &str) -> bool {
+    let path = Path::new(executable);
+    if !path.is_absolute() {
+        return false;
+    }
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let name = name.to_ascii_lowercase();
+    name == "vsparallel"
+        || name == "vsparallel.exe"
+        || (name.starts_with("vsparallel") && name.ends_with(".appimage"))
+}
+
+fn status_from_config(
+    paths: &IntegrationPaths,
+    config: &Map<String, Value>,
+    handlers: &BTreeMap<AntigravityHookEvent, Value>,
+) -> Result<AntigravityIntegrationStatus, String> {
+    let conflict = config
+        .get(MANAGED_HOOK_NAME)
+        .is_some_and(|entry| !managed_entry_is_owned(entry, handlers));
+    Ok(status_from_states(
+        paths,
+        event_states(config, handlers),
+        hooks_disabled(config),
+        conflict,
+    ))
+}
+
+fn status_from_states(
+    paths: &IntegrationPaths,
+    states: BTreeMap<AntigravityHookEvent, EventState>,
+    disabled: bool,
+    conflict: bool,
+) -> AntigravityIntegrationStatus {
+    let current = states
+        .values()
+        .filter(|state| **state == EventState::Current)
+        .count();
+    let stale = states
+        .values()
+        .filter(|state| **state == EventState::Stale)
+        .count();
+    let state = if conflict {
+        "conflict"
+    } else if disabled && current == EVENTS.len() {
+        "disabled"
+    } else if !disabled && current == EVENTS.len() {
+        "installed"
+    } else if current == 0 && stale == 0 {
+        "not_installed"
+    } else if stale > 0 && current == 0 {
+        "stale"
+    } else {
+        "partial"
+    };
+    let message = match state {
+        "installed" => {
+            "Antigravity activity monitoring is configured; it records after an agent turn, not when a Project is merely opened."
+        }
+        "disabled" => "The VSParallel Antigravity hook entry is disabled.",
+        "conflict" => {
+            "The Antigravity hook name reserved for VSParallel is already used by another entry. Rename or remove that entry before installing."
+        }
+        "not_installed" => "Antigravity activity monitoring is not installed.",
+        "stale" => "An older VSParallel Antigravity integration can be repaired.",
+        _ => "Antigravity activity monitoring is only partially installed.",
+    };
+
+    AntigravityIntegrationStatus {
+        state: state.to_string(),
+        installed: state == "installed",
+        config_path: paths.config.to_string_lossy().into_owned(),
+        backup_path: paths.backup.to_string_lossy().into_owned(),
+        event_states: states
+            .into_iter()
+            .map(|(event, state)| (event.config_name().to_string(), state.as_str().to_string()))
+            .collect(),
+        hooks_disabled: disabled,
+        message: message.to_string(),
+    }
+}
+
+fn ensure_backup(path: &Path, original: &[u8]) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if is_link_or_reparse_point(&metadata) || !metadata.is_file() {
+                return Err(format!("{} is not a regular file", path.display()));
+            }
+            return Ok(false);
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("could not inspect {}: {error}", path.display())),
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
+    ensure_private_directory(parent)?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    match options.open(path) {
+        Ok(mut file) => {
+            if let Err(error) = file.write_all(original).and_then(|_| file.sync_all()) {
+                drop(file);
+                let _ = fs::remove_file(path);
+                return Err(format!("could not write {}: {error}", path.display()));
+            }
+            set_private_file_permissions(path, 0o600);
+            sync_parent(parent);
+            Ok(true)
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(path)
+                .map_err(|inspect| format!("could not inspect {}: {inspect}", path.display()))?;
+            if is_link_or_reparse_point(&metadata) || !metadata.is_file() {
+                Err(format!("{} is not a regular file", path.display()))
+            } else {
+                Ok(false)
+            }
+        }
+        Err(error) => Err(format!("could not create {}: {error}", path.display())),
+    }
+}
+
+fn atomic_write_json(path: &Path, config: &Map<String, Value>) -> Result<(), String> {
+    let mut bytes = serde_json::to_vec_pretty(config)
+        .map_err(|error| format!("could not serialize Antigravity hooks: {error}"))?;
+    bytes.push(b'\n');
+    let mode = existing_mode(path).unwrap_or(0o600);
+    atomic_write_bytes(path, &bytes, Some(mode))
+}
+
+fn atomic_write_bytes(path: &Path, content: &[u8], mode: Option<u32>) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
+    ensure_private_directory(parent)?;
+    reject_unsafe_existing_target(path)?;
+
+    let target_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("vsparallel");
+    let prefix = format!(".{target_name}.");
+    let mut temporary = TempFileBuilder::new()
+        .prefix(&prefix)
+        .suffix(".tmp")
+        .tempfile_in(parent)
+        .map_err(|error| {
+            format!(
+                "could not create a temporary file in {}: {error}",
+                parent.display()
+            )
+        })?;
+    if let Some(mode) = mode {
+        set_private_file_permissions(temporary.path(), mode);
+    }
+    temporary
+        .write_all(content)
+        .and_then(|_| temporary.as_file().sync_all())
+        .map_err(|error| {
+            format!(
+                "could not write temporary file {}: {error}",
+                temporary.path().display()
+            )
+        })?;
+    replace_temporary_file(temporary, path)?;
+    if let Some(mode) = mode {
+        set_private_file_permissions(path, mode);
+    }
+    sync_parent(parent);
+    Ok(())
+}
+
+fn ensure_private_directory(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if is_link_or_reparse_point(&metadata) => {
+            return Err(format!("refusing to use symbolic link {}", path.display()));
+        }
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err(format!("{} is not a directory", path.display()));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(path)
+                .map_err(|create| format!("could not create {}: {create}", path.display()))?;
+            let metadata = fs::symlink_metadata(path)
+                .map_err(|inspect| format!("could not inspect {}: {inspect}", path.display()))?;
+            if is_link_or_reparse_point(&metadata) || !metadata.is_dir() {
+                return Err(format!("{} is not a safe directory", path.display()));
+            }
+        }
+        Err(error) => return Err(format!("could not inspect {}: {error}", path.display())),
+    }
+    set_private_directory_permissions(path);
+    Ok(())
+}
+
+fn reject_unsafe_existing_target(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if is_link_or_reparse_point(&metadata) => Err(format!(
+            "refusing to replace symbolic link {}",
+            path.display()
+        )),
+        Ok(metadata) if !metadata.is_file() => {
+            Err(format!("{} is not a regular file", path.display()))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("could not inspect {}: {error}", path.display())),
+    }
+}
+
+fn is_link_or_reparse_point(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_temporary_file(temporary: tempfile::NamedTempFile, target: &Path) -> Result<(), String> {
+    temporary.persist(target).map_err(|error| {
+        format!(
+            "could not atomically replace {}: {}",
+            target.display(),
+            error.error
+        )
+    })?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn replace_temporary_file(temporary: tempfile::NamedTempFile, target: &Path) -> Result<(), String> {
+    const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn MoveFileExW(
+            existing_file_name: *const u16,
+            new_file_name: *const u16,
+            flags: u32,
+        ) -> i32;
+    }
+
+    let temporary = temporary.into_temp_path();
+    let source_wide = nul_terminated_wide_path(temporary.as_ref())?;
+    let target_wide = nul_terminated_wide_path(target)?;
+    let replaced = unsafe {
+        MoveFileExW(
+            source_wide.as_ptr(),
+            target_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if replaced == 0 {
+        return Err(format!(
+            "could not atomically replace {}: {}",
+            target.display(),
+            io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn nul_terminated_wide_path(path: &Path) -> Result<Vec<u16>, String> {
+    let mut encoded: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if encoded.contains(&0) {
+        return Err(format!("{} contains an embedded NUL", path.display()));
+    }
+    encoded.push(0);
+    Ok(encoded)
+}
+
+fn existing_mode(path: &Path) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        fs::metadata(path)
+            .ok()
+            .map(|metadata| metadata.permissions().mode() & 0o777)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+fn set_private_file_permissions(path: &Path, mode: u32) {
+    #[cfg(unix)]
+    {
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+    }
+}
+
+fn set_private_directory_permissions(path: &Path) {
+    #[cfg(unix)]
+    {
+        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
+
+fn sync_parent(path: &Path) {
+    #[cfg(unix)]
+    {
+        if let Ok(directory) = File::open(path) {
+            let _ = directory.sync_all();
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
+
+fn nonempty_env_path(key: &str) -> Option<PathBuf> {
+    env::var_os(key)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn home_directory() -> Result<PathBuf, String> {
+    #[cfg(target_os = "windows")]
+    let home = nonempty_env_path("USERPROFILE").or_else(|| {
+        let drive = env::var_os("HOMEDRIVE")?;
+        let path = env::var_os("HOMEPATH")?;
+        Some(PathBuf::from(drive).join(path))
+    });
+    #[cfg(not(target_os = "windows"))]
+    let home = nonempty_env_path("HOME");
+    home.ok_or_else(|| "the home directory is unavailable".to_string())
+}
+
+fn normalize_workspace_path(raw: &str) -> Option<PathBuf> {
+    if raw.trim().is_empty() || raw.len() > MAX_WORKSPACE_PATH_BYTES || raw.contains('\0') {
+        return None;
+    }
+    let path = PathBuf::from(raw.trim());
+    if !path.is_absolute() {
+        return None;
+    }
+    if let Ok(canonical) = fs::canonicalize(&path) {
+        return Some(canonical);
+    }
+    lexical_normalize_absolute(&path)
+}
+
+fn lexical_normalize_absolute(path: &Path) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    Some(normalized)
+}
+
+fn unix_time_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
+}
+
+fn is_sha256_key(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// A streaming adapter that consumes at most the limit plus one probe byte.
+struct CappedReader<R> {
+    inner: R,
+    remaining: usize,
+    exceeded: bool,
+}
+
+impl<R> CappedReader<R> {
+    fn new(inner: R, limit: usize) -> Self {
+        Self {
+            inner,
+            remaining: limit,
+            exceeded: false,
+        }
+    }
+}
+
+impl<R: Read> Read for CappedReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        if self.exceeded {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Antigravity hook payload exceeds the safety limit",
+            ));
+        }
+        if self.remaining == 0 {
+            let mut probe = [0u8; 1];
+            return match self.inner.read(&mut probe)? {
+                0 => Ok(0),
+                _ => {
+                    self.exceeded = true;
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Antigravity hook payload exceeds the safety limit",
+                    ))
+                }
+            };
+        }
+        let allowed = buffer.len().min(self.remaining);
+        let read = self.inner.read(&mut buffer[..allowed])?;
+        self.remaining -= read;
+        Ok(read)
+    }
+}
+
+// Dependency-free SHA-256 used only to pseudonymize conversation identities.
+fn sha256_hex(input: &[u8]) -> String {
+    const INITIAL: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+
+    let bit_len = (input.len() as u64).wrapping_mul(8);
+    let mut padded = Vec::with_capacity((input.len() + 72) & !63);
+    padded.extend_from_slice(input);
+    padded.push(0x80);
+    while padded.len() % 64 != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+
+    let mut hash = INITIAL;
+    for chunk in padded.chunks_exact(64) {
+        let mut schedule = [0u32; 64];
+        for (index, word) in chunk.chunks_exact(4).enumerate() {
+            schedule[index] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        }
+        for index in 16..64 {
+            let s0 = schedule[index - 15].rotate_right(7)
+                ^ schedule[index - 15].rotate_right(18)
+                ^ (schedule[index - 15] >> 3);
+            let s1 = schedule[index - 2].rotate_right(17)
+                ^ schedule[index - 2].rotate_right(19)
+                ^ (schedule[index - 2] >> 10);
+            schedule[index] = schedule[index - 16]
+                .wrapping_add(s0)
+                .wrapping_add(schedule[index - 7])
+                .wrapping_add(s1);
+        }
+
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = hash;
+        for index in 0..64 {
+            let big_s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let choose = (e & f) ^ ((!e) & g);
+            let temp1 = h
+                .wrapping_add(big_s1)
+                .wrapping_add(choose)
+                .wrapping_add(K[index])
+                .wrapping_add(schedule[index]);
+            let big_s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let majority = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = big_s0.wrapping_add(majority);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+        hash[0] = hash[0].wrapping_add(a);
+        hash[1] = hash[1].wrapping_add(b);
+        hash[2] = hash[2].wrapping_add(c);
+        hash[3] = hash[3].wrapping_add(d);
+        hash[4] = hash[4].wrapping_add(e);
+        hash[5] = hash[5].wrapping_add(f);
+        hash[6] = hash[6].wrapping_add(g);
+        hash[7] = hash[7].wrapping_add(h);
+    }
+
+    let mut output = String::with_capacity(64);
+    for word in hash {
+        use std::fmt::Write as _;
+        let _ = write!(output, "{word:08x}");
+    }
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use tempfile::TempDir;
+
+    struct MeteredReader<'a> {
+        input: &'a [u8],
+        position: usize,
+        consumed: Rc<Cell<usize>>,
+    }
+
+    impl Read for MeteredReader<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let remaining = &self.input[self.position..];
+            let count = remaining.len().min(buffer.len());
+            buffer[..count].copy_from_slice(&remaining[..count]);
+            self.position += count;
+            self.consumed.set(self.position);
+            Ok(count)
+        }
+    }
+
+    fn executable(root: &Path) -> PathBuf {
+        let executable = root.join("VSParallel app").join("vsparallel");
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        fs::write(&executable, b"test executable").unwrap();
+        executable
+    }
+
+    fn write_json(path: &Path, value: &Value) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
+    }
+
+    fn parse_config(config_dir: &Path) -> Value {
+        serde_json::from_slice(&fs::read(config_dir.join(HOOKS_FILENAME)).unwrap()).unwrap()
+    }
+
+    fn hook_with_root(
+        event: AntigravityHookEvent,
+        input: &str,
+        root: &Path,
+        now: i64,
+    ) -> (i32, String) {
+        let mut output = Vec::new();
+        let code = run_antigravity_hook_with(event, input.as_bytes(), &mut output, Ok(root), now);
+        (code, String::from_utf8(output).unwrap())
+    }
+
+    fn state_records(root: &Path) -> Vec<Value> {
+        let mut paths: Vec<_> = fs::read_dir(root.join("antigravity"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        paths.sort();
+        paths
+            .into_iter()
+            .map(|path| serde_json::from_slice(&fs::read(path).unwrap()).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn cli_event_arguments_are_stable() {
+        for event in EVENTS {
+            assert_eq!(
+                AntigravityHookEvent::from_cli_argument(event.cli_argument()),
+                Some(event)
+            );
+        }
+        assert_eq!(AntigravityHookEvent::from_cli_argument("unknown"), None);
+    }
+
+    #[test]
+    fn pre_invocation_persists_one_privacy_safe_record_per_workspace() {
+        let temp = TempDir::new().unwrap();
+        let first = temp.path().join("first");
+        let second = temp.path().join("second");
+        fs::create_dir(&first).unwrap();
+        fs::create_dir(&second).unwrap();
+        let input = json!({
+            "conversationId": "private-conversation-id",
+            "workspacePaths": [&first, &second],
+            "transcriptPath": "/home/test/.gemini/antigravity/brain/private-conversation-id/.system_generated/logs/transcript.jsonl",
+            "artifactDirectoryPath": "/secret/artifacts",
+            "modelName": "secret-model",
+            "toolCall": {"args": {"CommandLine": "SECRET COMMAND"}},
+        })
+        .to_string();
+
+        let (code, output) = hook_with_root(
+            AntigravityHookEvent::PreInvocation,
+            &input,
+            temp.path(),
+            1_700_000_000_123,
+        );
+
+        assert_eq!(code, 0);
+        assert_eq!(output, "{}\n");
+        let records = state_records(temp.path());
+        assert_eq!(records.len(), 2);
+        for record in records {
+            assert_eq!(record.as_object().unwrap().len(), 5);
+            assert_eq!(record["schemaVersion"], 1);
+            assert_eq!(record["state"], "activity_detected");
+            assert_eq!(record["changedAtMs"], 1_700_000_000_123i64);
+            assert_eq!(record["sessionKey"].as_str().unwrap().len(), 64);
+            let saved = record.to_string();
+            assert!(!saved.contains("private-conversation-id"));
+            assert!(!saved.contains("SECRET"));
+            assert!(!saved.contains("transcript"));
+            assert!(!saved.contains("artifact"));
+            assert!(!saved.contains("model"));
+        }
+        let observation = antigravity_two_hook_observation(temp.path(), 1_700_000_000_123)
+            .unwrap()
+            .unwrap();
+        assert_eq!(observation.event, "pre-invocation");
+        assert_eq!(observation.surface, "antigravity_2");
+        assert_eq!(observation.outcome, AntigravityHookOutcome::Recorded);
+        assert_eq!(observation.workspace_count, 2);
+        let saved_health = fs::read_to_string(
+            temp.path()
+                .join(HOOK_HEALTH_DIRECTORY)
+                .join("antigravity-2.json"),
+        )
+        .unwrap();
+        assert!(!saved_health.contains("private-conversation-id"));
+        assert!(!saved_health.contains("SECRET"));
+        assert!(!saved_health.contains(first.to_string_lossy().as_ref()));
+        assert!(!saved_health.contains(second.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn documented_transcript_roots_select_only_supported_surfaces() {
+        let cases = [
+            ("antigravity", Some("antigravity")),
+            ("antigravity-ide", Some("antigravity-ide")),
+            ("antigravity-cli", None),
+            ("future-surface", None),
+        ];
+
+        for (surface, expected_directory) in cases {
+            let temp = TempDir::new().unwrap();
+            let workspace = temp.path().join("workspace");
+            fs::create_dir(&workspace).unwrap();
+            let payload = json!({
+                "conversationId": format!("conversation-{surface}"),
+                "workspacePaths": [workspace],
+                "transcriptPath": format!(
+                    "/home/test/.gemini/{surface}/brain/conversation/.system_generated/logs/transcript.jsonl"
+                )
+            });
+
+            let (code, output) = hook_with_root(
+                AntigravityHookEvent::PreInvocation,
+                &payload.to_string(),
+                temp.path(),
+                10,
+            );
+            assert_eq!(code, 0);
+            assert_eq!(output, "{}\n");
+            match expected_directory {
+                Some(directory) => assert_eq!(
+                    fs::read_dir(temp.path().join(directory)).unwrap().count(),
+                    1
+                ),
+                None => assert!(
+                    !temp.path().join("antigravity").exists()
+                        && !temp.path().join("antigravity-ide").exists()
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn documented_artifact_path_is_a_surface_fallback() {
+        let temp = TempDir::new().unwrap();
+        let workspace = temp.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let payload = json!({
+            "conversationId": "conversation",
+            "workspacePaths": [workspace],
+            "artifactDirectoryPath": "/home/test/.gemini/antigravity/brain/conversation/artifacts"
+        });
+
+        let (code, output) = hook_with_root(
+            AntigravityHookEvent::PreInvocation,
+            &payload.to_string(),
+            temp.path(),
+            10,
+        );
+
+        assert_eq!(code, 0);
+        assert_eq!(output, "{}\n");
+        assert_eq!(state_records(temp.path()).len(), 1);
+        assert_eq!(
+            antigravity_two_hook_observation(temp.path(), 10)
+                .unwrap()
+                .unwrap()
+                .outcome,
+            AntigravityHookOutcome::Recorded
+        );
+    }
+
+    #[test]
+    fn conflicting_product_paths_are_not_mislabeled() {
+        let temp = TempDir::new().unwrap();
+        let workspace = temp.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let payload = json!({
+            "conversationId": "conversation",
+            "workspacePaths": [workspace],
+            "transcriptPath": "/home/test/.gemini/antigravity/brain/conversation/transcript.jsonl",
+            "artifactDirectoryPath": "/home/test/.gemini/antigravity-cli/conversation/artifacts"
+        });
+
+        hook_with_root(
+            AntigravityHookEvent::PreInvocation,
+            &payload.to_string(),
+            temp.path(),
+            10,
+        );
+
+        assert!(!temp.path().join("antigravity").exists());
+        assert!(antigravity_two_hook_observation(temp.path(), 10)
+            .unwrap()
+            .is_none());
+        let unknown: AntigravityHookObservation = serde_json::from_slice(
+            &fs::read(temp.path().join(HOOK_HEALTH_DIRECTORY).join("unknown.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(unknown.outcome, AntigravityHookOutcome::UnsupportedSurface);
+    }
+
+    #[test]
+    fn lifecycle_fields_map_to_coarse_states_without_being_persisted() {
+        let cases = [
+            (
+                AntigravityHookEvent::PostToolUse,
+                json!({"error":"tool failed"}),
+                "failed",
+                "{}\n",
+            ),
+            (
+                AntigravityHookEvent::Stop,
+                json!({"fullyIdle":false,"terminationReason":"model_stop"}),
+                "activity_detected",
+                "{\"decision\":\"allow\"}\n",
+            ),
+            (
+                AntigravityHookEvent::Stop,
+                json!({"fullyIdle":true,"terminationReason":"user_cancelled"}),
+                "interrupted",
+                "{\"decision\":\"allow\"}\n",
+            ),
+            (
+                AntigravityHookEvent::Stop,
+                json!({"fullyIdle":true,"terminationReason":"error"}),
+                "failed",
+                "{\"decision\":\"allow\"}\n",
+            ),
+            (
+                AntigravityHookEvent::Stop,
+                json!({"fullyIdle":true,"terminationReason":"model_stop"}),
+                "turn_finished",
+                "{\"decision\":\"allow\"}\n",
+            ),
+        ];
+
+        for (index, (event, event_fields, expected_state, expected_output)) in
+            cases.into_iter().enumerate()
+        {
+            let temp = TempDir::new().unwrap();
+            let workspace = temp.path().join("workspace");
+            fs::create_dir(&workspace).unwrap();
+            let mut payload = event_fields.as_object().unwrap().clone();
+            payload.insert("conversationId".into(), json!(format!("c-{index}")));
+            payload.insert("workspacePaths".into(), json!([workspace]));
+            payload.insert(
+                "transcriptPath".into(),
+                json!(format!(
+                    "/home/test/.gemini/antigravity/brain/c-{index}/.system_generated/logs/transcript.jsonl"
+                )),
+            );
+            let (_, output) = hook_with_root(
+                event,
+                &Value::Object(payload).to_string(),
+                temp.path(),
+                index as i64,
+            );
+            assert_eq!(output, expected_output);
+            let records = state_records(temp.path());
+            assert_eq!(records[0]["state"], expected_state);
+            let saved = records[0].to_string();
+            assert!(!saved.contains("tool failed"));
+            assert!(!saved.contains("model_stop"));
+            assert!(!saved.contains("user_cancelled"));
+        }
+    }
+
+    #[test]
+    fn malformed_and_oversized_payloads_are_bounded_and_fail_open() {
+        let temp = TempDir::new().unwrap();
+        for event in EVENTS {
+            let (code, output) = hook_with_root(event, "not json", temp.path(), 10);
+            assert_eq!(code, 0);
+            assert_eq!(output.as_bytes(), event.fail_open_output());
+        }
+
+        let workspace = serde_json::to_string(&temp.path().to_string_lossy()).unwrap();
+        let input = format!(
+            "{{\"conversationId\":\"c\",\"workspacePaths\":[{workspace}],\"transcriptPath\":\"{}\"}}",
+            "sensitive".repeat(MAX_HOOK_INPUT_BYTES / 9 + 1)
+        );
+        assert!(input.len() > MAX_HOOK_INPUT_BYTES);
+        let consumed = Rc::new(Cell::new(0));
+        let reader = MeteredReader {
+            input: input.as_bytes(),
+            position: 0,
+            consumed: Rc::clone(&consumed),
+        };
+        let mut output = Vec::new();
+        let code = run_antigravity_hook_with(
+            AntigravityHookEvent::Stop,
+            reader,
+            &mut output,
+            Ok(temp.path()),
+            20,
+        );
+        assert_eq!(code, 0);
+        assert_eq!(output, AntigravityHookEvent::Stop.fail_open_output());
+        assert!(consumed.get() <= MAX_HOOK_INPUT_BYTES + 1);
+        assert!(!temp.path().join("antigravity").exists());
+    }
+
+    #[test]
+    fn invalid_identity_or_workspace_paths_do_not_create_state() {
+        let temp = TempDir::new().unwrap();
+        let inputs = [
+            json!({"workspacePaths":[temp.path()]}),
+            json!({"conversationId":"", "workspacePaths":[temp.path()]}),
+            json!({"conversationId":"c", "workspacePaths":["relative/path"]}),
+            json!({"conversationId":"c", "workspacePaths":[]}),
+        ];
+        for input in inputs {
+            let (code, output) = hook_with_root(
+                AntigravityHookEvent::PreInvocation,
+                &input.to_string(),
+                temp.path(),
+                10,
+            );
+            assert_eq!(code, 0);
+            assert_eq!(output, "{}\n");
+        }
+        assert!(!temp.path().join("antigravity").exists());
+    }
+
+    #[test]
+    fn install_merges_named_entry_and_preserves_a_one_time_backup() {
+        let temp = TempDir::new().unwrap();
+        let config_dir = temp.path().join(".gemini").join("config");
+        let config = config_dir.join(HOOKS_FILENAME);
+        write_json(
+            &config,
+            &json!({
+                "team-linter": {
+                    "PostToolUse": [{"matcher":"run_command","hooks":[{"command":"lint"}]}]
+                }
+            }),
+        );
+        let original = fs::read(&config).unwrap();
+        let executable = executable(temp.path());
+
+        let result = install_antigravity_integration(&config_dir, &executable).unwrap();
+        assert!(result.changed);
+        assert!(!result.migrated);
+        assert!(result.status.installed);
+        assert_eq!(
+            fs::read(config_dir.join(BACKUP_FILENAME)).unwrap(),
+            original
+        );
+
+        let installed = parse_config(&config_dir);
+        assert_eq!(
+            installed["team-linter"]["PostToolUse"][0]["hooks"][0]["command"],
+            "lint"
+        );
+        let managed = &installed[MANAGED_HOOK_NAME];
+        assert_eq!(managed["enabled"], true);
+        assert!(managed["PreInvocation"][0]["command"]
+            .as_str()
+            .unwrap()
+            .ends_with(" antigravity-hook pre-invocation"));
+        assert_eq!(managed["PostToolUse"][0]["matcher"], "*");
+        assert!(managed["PostToolUse"][0]["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .ends_with(" antigravity-hook post-tool-use"));
+        assert!(managed["Stop"][0]["command"]
+            .as_str()
+            .unwrap()
+            .ends_with(" antigravity-hook stop"));
+
+        let backup = fs::read(config_dir.join(BACKUP_FILENAME)).unwrap();
+        let second = install_antigravity_integration(&config_dir, &executable).unwrap();
+        assert!(!second.changed);
+        assert_eq!(fs::read(config_dir.join(BACKUP_FILENAME)).unwrap(), backup);
+    }
+
+    #[test]
+    fn stale_entry_is_repaired_and_uninstall_preserves_other_named_hooks() {
+        let temp = TempDir::new().unwrap();
+        let config_dir = temp.path().join("config");
+        let executable = executable(temp.path());
+        let stale_command = if cfg!(windows) {
+            r#""C:\old\vsparallel.exe" antigravity-hook pre-invocation"#
+        } else {
+            "/old/vsparallel antigravity-hook pre-invocation"
+        };
+        write_json(
+            &config_dir.join(HOOKS_FILENAME),
+            &json!({
+                MANAGED_HOOK_NAME: {
+                    "PreInvocation": [{"command":stale_command}]
+                },
+                "keep": {"Stop":[{"command":"keep"}]}
+            }),
+        );
+
+        let before = antigravity_integration_status(&config_dir, &executable).unwrap();
+        assert_eq!(before.state, "stale");
+        let installed = install_antigravity_integration(&config_dir, &executable).unwrap();
+        assert!(installed.changed);
+        assert!(installed.migrated);
+        assert!(installed.status.installed);
+
+        let removed = uninstall_antigravity_integration(&config_dir, &executable).unwrap();
+        assert!(removed.changed);
+        assert!(!removed.status.installed);
+        let remaining = parse_config(&config_dir);
+        assert!(remaining.get(MANAGED_HOOK_NAME).is_none());
+        assert_eq!(remaining["keep"]["Stop"][0]["command"], "keep");
+    }
+
+    #[test]
+    fn disabled_entry_is_reported_and_reenabled_on_install() {
+        let temp = TempDir::new().unwrap();
+        let config_dir = temp.path().join("config");
+        let executable = executable(temp.path());
+        let handlers = managed_handlers(&executable).unwrap();
+        let mut entry = canonical_managed_entry(&handlers);
+        entry["enabled"] = json!(false);
+        write_json(
+            &config_dir.join(HOOKS_FILENAME),
+            &json!({MANAGED_HOOK_NAME: entry}),
+        );
+
+        let status = antigravity_integration_status(&config_dir, &executable).unwrap();
+        assert_eq!(status.state, "disabled");
+        assert!(status.hooks_disabled);
+        let repaired = install_antigravity_integration(&config_dir, &executable).unwrap();
+        assert!(repaired.changed);
+        assert!(repaired.migrated);
+        assert!(repaired.status.installed);
+    }
+
+    #[test]
+    fn malformed_config_is_never_modified() {
+        let temp = TempDir::new().unwrap();
+        let config_dir = temp.path().join("config");
+        fs::create_dir_all(&config_dir).unwrap();
+        let config = config_dir.join(HOOKS_FILENAME);
+        fs::write(&config, b"{not json").unwrap();
+        let before = fs::read(&config).unwrap();
+
+        assert!(install_antigravity_integration(&config_dir, &executable(temp.path())).is_err());
+        assert_eq!(fs::read(&config).unwrap(), before);
+        assert!(!config_dir.join(BACKUP_FILENAME).exists());
+    }
+
+    #[test]
+    fn same_name_collision_is_reported_and_never_modified_or_removed() {
+        let temp = TempDir::new().unwrap();
+        let config_dir = temp.path().join("config");
+        let config = config_dir.join(HOOKS_FILENAME);
+        write_json(
+            &config,
+            &json!({
+                MANAGED_HOOK_NAME: {
+                    "PreInvocation": [{"type":"command", "command":"run-my-own-hook"}]
+                },
+                "keep": {"Stop":[{"command":"keep"}]}
+            }),
+        );
+        let original = fs::read(&config).unwrap();
+        let executable = executable(temp.path());
+
+        let status = antigravity_integration_status(&config_dir, &executable).unwrap();
+        assert_eq!(status.state, "conflict");
+        assert!(!status.installed);
+        assert!(status.message.contains("Rename or remove"));
+
+        let error = install_antigravity_integration(&config_dir, &executable).unwrap_err();
+        assert!(error.contains("does not own"));
+        assert_eq!(fs::read(&config).unwrap(), original);
+        assert!(!config_dir.join(BACKUP_FILENAME).exists());
+
+        let removed = uninstall_antigravity_integration(&config_dir, &executable).unwrap();
+        assert!(!removed.changed);
+        assert_eq!(removed.status.state, "conflict");
+        assert_eq!(fs::read(&config).unwrap(), original);
+    }
+
+    #[test]
+    fn user_handlers_inside_the_named_entry_are_never_claimed_or_removed() {
+        let temp = TempDir::new().unwrap();
+        let config_dir = temp.path().join("config");
+        let config = config_dir.join(HOOKS_FILENAME);
+        write_json(
+            &config,
+            &json!({
+                MANAGED_HOOK_NAME: {
+                    "PreInvocation": [
+                        {"command":"/old/vsparallel antigravity-hook pre-invocation"},
+                        {"command":"keep-my-handler"}
+                    ],
+                    "Stop": [{"command":"/old/vsparallel antigravity-hook stop"}]
+                }
+            }),
+        );
+        let original = fs::read(&config).unwrap();
+        let executable = executable(temp.path());
+
+        let status = antigravity_integration_status(&config_dir, &executable).unwrap();
+        assert_eq!(status.state, "conflict");
+        assert!(install_antigravity_integration(&config_dir, &executable).is_err());
+
+        let removed = uninstall_antigravity_integration(&config_dir, &executable).unwrap();
+        assert!(!removed.changed);
+        assert_eq!(removed.status.state, "conflict");
+        assert_eq!(fs::read(&config).unwrap(), original);
+        assert!(!config_dir.join(BACKUP_FILENAME).exists());
+    }
+
+    #[test]
+    fn foreign_command_with_managed_argument_suffix_is_not_owned() {
+        let temp = TempDir::new().unwrap();
+        let config_dir = temp.path().join("config");
+        let config = config_dir.join(HOOKS_FILENAME);
+        write_json(
+            &config,
+            &json!({
+                MANAGED_HOOK_NAME: {
+                    "PreInvocation": [{
+                        "type": "command",
+                        "command": "echo antigravity-hook pre-invocation",
+                        "timeout": HOOK_TIMEOUT_SECONDS
+                    }]
+                }
+            }),
+        );
+        let original = fs::read(&config).unwrap();
+        let executable = executable(temp.path());
+
+        assert_eq!(
+            antigravity_integration_status(&config_dir, &executable)
+                .unwrap()
+                .state,
+            "conflict"
+        );
+        assert!(install_antigravity_integration(&config_dir, &executable).is_err());
+        let removal = uninstall_antigravity_integration(&config_dir, &executable).unwrap();
+        assert!(!removal.changed);
+        assert_eq!(removal.status.state, "conflict");
+        assert_eq!(fs::read(&config).unwrap(), original);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn state_writer_refuses_a_symbolic_link_subdirectory() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let state_root = temp.path().join("state");
+        let victim = temp.path().join("victim");
+        fs::create_dir(&state_root).unwrap();
+        fs::create_dir(&victim).unwrap();
+        symlink(&victim, state_root.join("antigravity")).unwrap();
+        let workspace = temp.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let input = json!({
+            "conversationId":"c",
+            "workspacePaths":[workspace],
+            "transcriptPath":"/home/test/.gemini/antigravity/brain/c/transcript.jsonl",
+        })
+        .to_string();
+
+        let (code, output) =
+            hook_with_root(AntigravityHookEvent::PreInvocation, &input, &state_root, 10);
+        assert_eq!(code, 0);
+        assert_eq!(output, "{}\n");
+        assert!(fs::read_dir(&victim).unwrap().next().is_none());
+        let observation = antigravity_two_hook_observation(&state_root, 10)
+            .unwrap()
+            .unwrap();
+        assert_eq!(observation.outcome, AntigravityHookOutcome::PersistFailed);
+    }
+
+    #[test]
+    fn sha256_matches_standard_vectors() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+}

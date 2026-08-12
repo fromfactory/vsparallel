@@ -1,7 +1,7 @@
 [package]
 name = "vsparallel"
 version = "0.1.2"
-description = "A compact local monitor for VS Code workspaces and coarse Codex or Claude Code activity"
+description = "A compact local monitor for VS Code and Antigravity workspaces and agent activity"
 authors = ["VSParallel contributors"]
 edition = "2021"
 license = "MIT"

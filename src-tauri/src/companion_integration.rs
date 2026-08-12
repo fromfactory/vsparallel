@@ -22,6 +22,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::os::unix::fs::OpenOptionsExt;
 
 pub const EXTENSION_ID: &str = "vsparallel.vsparallel-companion";
+pub const VSCODE_PROFILE_ENV: &str = "VSPARALLEL_VSCODE_PROFILE";
+pub const ANTIGRAVITY_IDE_PROFILE_ENV: &str = "VSPARALLEL_ANTIGRAVITY_IDE_PROFILE";
 
 const CONTENT_TYPES: &[u8] = include_bytes!("../../companion/[Content_Types].xml");
 const VSIX_MANIFEST: &[u8] = include_bytes!("../../companion/extension.vsixmanifest");
@@ -304,17 +306,110 @@ pub fn bundled_vsix_bytes() -> Result<&'static [u8], String> {
 /// Operational failures are represented as `Unavailable`, rather than making a
 /// setup screen fail to render.
 pub fn companion_status(executable: &OsStr) -> CompanionStatus {
-    companion_status_with(&ProcessCodeCliRunner, executable)
+    companion_status_with(
+        &ProcessCodeCliRunner,
+        executable,
+        profile_from_environment(VSCODE_PROFILE_ENV).as_deref(),
+    )
+}
+
+/// Queries a VS Code-compatible editor while keeping operational diagnostics
+/// specific to the product whose CLI was invoked.
+pub fn companion_status_for_editor(
+    executable: &OsStr,
+    editor_name: &str,
+    profile_environment: &str,
+) -> CompanionStatus {
+    relabel_status(
+        companion_status_with(
+            &ProcessCodeCliRunner,
+            executable,
+            profile_from_environment(profile_environment).as_deref(),
+        ),
+        editor_name,
+    )
 }
 
 /// Installs (or updates) the embedded companion using VS Code's supported CLI.
 pub fn install_companion(executable: &OsStr) -> Result<CompanionOperationResult, String> {
-    install_companion_with(&ProcessCodeCliRunner, executable, &env::temp_dir())
+    install_companion_with(
+        &ProcessCodeCliRunner,
+        executable,
+        &env::temp_dir(),
+        profile_from_environment(VSCODE_PROFILE_ENV).as_deref(),
+    )
+}
+
+/// Installs the companion into a VS Code-compatible editor.
+pub fn install_companion_for_editor(
+    executable: &OsStr,
+    editor_name: &str,
+    profile_environment: &str,
+) -> Result<CompanionOperationResult, String> {
+    install_companion_with(
+        &ProcessCodeCliRunner,
+        executable,
+        &env::temp_dir(),
+        profile_from_environment(profile_environment).as_deref(),
+    )
+    .map(|result| relabel_operation(result, editor_name))
+    .map_err(|error| relabel_editor_name(error, editor_name))
 }
 
 /// Uninstalls the companion by its exact extension identifier.
 pub fn uninstall_companion(executable: &OsStr) -> Result<CompanionOperationResult, String> {
-    uninstall_companion_with(&ProcessCodeCliRunner, executable)
+    uninstall_companion_with(
+        &ProcessCodeCliRunner,
+        executable,
+        profile_from_environment(VSCODE_PROFILE_ENV).as_deref(),
+    )
+}
+
+/// Removes the companion from a VS Code-compatible editor.
+pub fn uninstall_companion_for_editor(
+    executable: &OsStr,
+    editor_name: &str,
+    profile_environment: &str,
+) -> Result<CompanionOperationResult, String> {
+    uninstall_companion_with(
+        &ProcessCodeCliRunner,
+        executable,
+        profile_from_environment(profile_environment).as_deref(),
+    )
+    .map(|result| relabel_operation(result, editor_name))
+    .map_err(|error| relabel_editor_name(error, editor_name))
+}
+
+fn profile_from_environment(key: &str) -> Option<OsString> {
+    env::var_os(key).filter(|value| !value.is_empty())
+}
+
+fn with_profile(mut arguments: Vec<OsString>, profile: Option<&OsStr>) -> Vec<OsString> {
+    if let Some(profile) = profile.filter(|profile| !profile.is_empty()) {
+        arguments.push(OsString::from("--profile"));
+        arguments.push(profile.to_owned());
+    }
+    arguments
+}
+
+fn relabel_operation(
+    mut result: CompanionOperationResult,
+    editor_name: &str,
+) -> CompanionOperationResult {
+    result.message = relabel_editor_name(result.message, editor_name);
+    result.status = relabel_status(result.status, editor_name);
+    result
+}
+
+fn relabel_status(mut status: CompanionStatus, editor_name: &str) -> CompanionStatus {
+    status.detail = status
+        .detail
+        .map(|detail| relabel_editor_name(detail, editor_name));
+    status
+}
+
+fn relabel_editor_name(message: String, editor_name: &str) -> String {
+    message.replace("VS Code", editor_name)
 }
 
 fn bundled_manifest() -> Result<&'static BundledManifest, String> {
@@ -358,7 +453,8 @@ fn parse_bundled_manifest() -> Result<BundledManifest, String> {
 
 fn build_bundled_vsix() -> Result<Vec<u8>, String> {
     // Validate the identity and version before exposing an installable package.
-    bundled_manifest()?;
+    let manifest = bundled_manifest()?;
+    validate_vsix_manifest_identity(VSIX_MANIFEST, &manifest.version)?;
 
     let mut archive = Vec::new();
     let mut central_directory = Vec::new();
@@ -430,7 +526,34 @@ fn build_bundled_vsix() -> Result<Vec<u8>, String> {
     Ok(archive)
 }
 
-fn companion_status_with<R: CodeCliRunner>(runner: &R, executable: &OsStr) -> CompanionStatus {
+fn validate_vsix_manifest_identity(bytes: &[u8], expected_version: &str) -> Result<(), String> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|error| format!("the embedded VSIX manifest is not UTF-8: {error}"))?;
+    let identity = text
+        .split_once("<Identity ")
+        .and_then(|(_, rest)| rest.split_once(" />"))
+        .map(|(identity, _)| identity)
+        .ok_or_else(|| "the embedded VSIX manifest has no Identity element".to_string())?;
+    for (attribute, expected) in [
+        ("Id", "vsparallel-companion"),
+        ("Publisher", "vsparallel"),
+        ("Version", expected_version),
+    ] {
+        let needle = format!("{attribute}=\"{expected}\"");
+        if !identity.split_whitespace().any(|part| part == needle) {
+            return Err(format!(
+                "the embedded VSIX manifest {attribute} does not match the companion package"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn companion_status_with<R: CodeCliRunner>(
+    runner: &R,
+    executable: &OsStr,
+    profile: Option<&OsStr>,
+) -> CompanionStatus {
     let bundled_version = match bundled_companion_version() {
         Ok(version) => Some(version.to_string()),
         Err(error) => return unavailable_status(None, error),
@@ -442,10 +565,13 @@ fn companion_status_with<R: CodeCliRunner>(runner: &R, executable: &OsStr) -> Co
         );
     }
 
-    let arguments = [
-        OsString::from("--list-extensions"),
-        OsString::from("--show-versions"),
-    ];
+    let arguments = with_profile(
+        vec![
+            OsString::from("--list-extensions"),
+            OsString::from("--show-versions"),
+        ],
+        profile,
+    );
     let output = match runner.run(executable, &arguments) {
         Ok(output) => output,
         Err(error) => {
@@ -525,14 +651,18 @@ fn install_companion_with<R: CodeCliRunner>(
     runner: &R,
     executable: &OsStr,
     temporary_directory: &Path,
+    profile: Option<&OsStr>,
 ) -> Result<CompanionOperationResult, String> {
     validate_executable(executable)?;
     let package = TemporaryVsix::create(temporary_directory, bundled_vsix_bytes()?)?;
-    let arguments = [
-        OsString::from("--install-extension"),
-        package.path().as_os_str().to_owned(),
-        OsString::from("--force"),
-    ];
+    let arguments = with_profile(
+        vec![
+            OsString::from("--install-extension"),
+            package.path().as_os_str().to_owned(),
+            OsString::from("--force"),
+        ],
+        profile,
+    );
     let output = runner
         .run(executable, &arguments)
         .map_err(|error| format!("could not run the VS Code install command: {error}"))?;
@@ -545,7 +675,7 @@ fn install_companion_with<R: CodeCliRunner>(
 
     // Query only after the CLI has returned and finished reading the VSIX. The
     // TemporaryVsix guard removes the package on every return path.
-    let status = companion_status_with(runner, executable);
+    let status = companion_status_with(runner, executable, profile);
     let verified = status.state == CompanionStatusState::Current;
     let message = if verified {
         "VSParallel Companion is installed and current".to_string()
@@ -564,12 +694,13 @@ fn install_companion_with<R: CodeCliRunner>(
 fn uninstall_companion_with<R: CodeCliRunner>(
     runner: &R,
     executable: &OsStr,
+    profile: Option<&OsStr>,
 ) -> Result<CompanionOperationResult, String> {
     validate_executable(executable)?;
 
     // Make uninstall idempotent. This also avoids presenting VS Code's
     // "extension is not installed" exit code as a user-facing failure.
-    let before = companion_status_with(runner, executable);
+    let before = companion_status_with(runner, executable, profile);
     if before.state == CompanionStatusState::NotInstalled {
         return Ok(CompanionOperationResult {
             action: CompanionAction::Uninstall,
@@ -579,10 +710,13 @@ fn uninstall_companion_with<R: CodeCliRunner>(
         });
     }
 
-    let arguments = [
-        OsString::from("--uninstall-extension"),
-        OsString::from(EXTENSION_ID),
-    ];
+    let arguments = with_profile(
+        vec![
+            OsString::from("--uninstall-extension"),
+            OsString::from(EXTENSION_ID),
+        ],
+        profile,
+    );
     let output = runner
         .run(executable, &arguments)
         .map_err(|error| format!("could not run the VS Code uninstall command: {error}"))?;
@@ -593,7 +727,7 @@ fn uninstall_companion_with<R: CodeCliRunner>(
         ));
     }
 
-    let status = companion_status_with(runner, executable);
+    let status = companion_status_with(runner, executable, profile);
     let verified = status.state == CompanionStatusState::NotInstalled;
     let message = if verified {
         "VSParallel Companion is uninstalled".to_string()
@@ -925,7 +1059,7 @@ mod tests {
 
     #[test]
     fn embedded_identity_and_version_come_from_package_json() {
-        assert_eq!(bundled_companion_version().unwrap(), "0.3.0");
+        assert_eq!(bundled_companion_version().unwrap(), "0.4.0");
         let value: serde_json::Value = serde_json::from_slice(PACKAGE_JSON).unwrap();
         assert_eq!(
             format!(
@@ -935,6 +1069,8 @@ mod tests {
             ),
             EXTENSION_ID
         );
+        assert!(validate_vsix_manifest_identity(VSIX_MANIFEST, "0.4.0").is_ok());
+        assert!(validate_vsix_manifest_identity(VSIX_MANIFEST, "9.9.9").is_err());
     }
 
     #[test]
@@ -971,12 +1107,12 @@ mod tests {
     #[test]
     fn status_reports_current_version_and_uses_exact_cli_arguments() {
         let runner = ScriptedRunner::new(vec![successful(
-            b"unrelated.extension@9.0.0\nvsparallel.vsparallel-companion@0.3.0\n".to_vec(),
+            b"unrelated.extension@9.0.0\nvsparallel.vsparallel-companion@0.4.0\n".to_vec(),
         )]);
-        let status = companion_status_with(&runner, OsStr::new("/opt/code with spaces"));
+        let status = companion_status_with(&runner, OsStr::new("/opt/code with spaces"), None);
 
         assert_eq!(status.state, CompanionStatusState::Current);
-        assert_eq!(status.installed_version.as_deref(), Some("0.3.0"));
+        assert_eq!(status.installed_version.as_deref(), Some("0.4.0"));
         assert_eq!(
             runner.calls(),
             vec![RecordedCall {
@@ -990,11 +1126,59 @@ mod tests {
     }
 
     #[test]
+    fn named_profile_is_applied_to_status_install_and_verification() {
+        let runner = ScriptedRunner::new(vec![
+            successful(b"installed\n".to_vec()),
+            successful(b"vsparallel.vsparallel-companion@0.4.0\n".to_vec()),
+        ]);
+        let temporary_directory = TempDir::new().unwrap();
+        let result = install_companion_with(
+            &runner,
+            OsStr::new("antigravity-ide"),
+            temporary_directory.path(),
+            Some(OsStr::new("Agents & Tools")),
+        )
+        .unwrap();
+
+        assert!(result.verified);
+        let calls = runner.calls();
+        assert_eq!(
+            calls[0].arguments[calls[0].arguments.len() - 2],
+            "--profile"
+        );
+        assert_eq!(calls[0].arguments.last().unwrap(), "Agents & Tools");
+        assert_eq!(
+            calls[1].arguments[calls[1].arguments.len() - 2],
+            "--profile"
+        );
+        assert_eq!(calls[1].arguments.last().unwrap(), "Agents & Tools");
+    }
+
+    #[test]
+    fn named_profile_is_applied_to_uninstall_and_verification() {
+        let runner = ScriptedRunner::new(vec![
+            successful(b"vsparallel.vsparallel-companion@0.4.0\n".to_vec()),
+            successful(b"uninstalled\n".to_vec()),
+            successful(b"other.extension@1.0.0\n".to_vec()),
+        ]);
+
+        let result =
+            uninstall_companion_with(&runner, OsStr::new("code"), Some(OsStr::new("Work")))
+                .unwrap();
+
+        assert!(result.verified);
+        for call in runner.calls() {
+            assert_eq!(call.arguments[call.arguments.len() - 2], "--profile");
+            assert_eq!(call.arguments.last().unwrap(), "Work");
+        }
+    }
+
+    #[test]
     fn status_distinguishes_different_unknown_and_absent_versions() {
         let different = ScriptedRunner::new(vec![successful(
             b"vsparallel.vsparallel-companion@0.0.9\n".to_vec(),
         )]);
-        let status = companion_status_with(&different, OsStr::new("code"));
+        let status = companion_status_with(&different, OsStr::new("code"), None);
         assert_eq!(status.state, CompanionStatusState::DifferentVersion);
         assert_eq!(status.installed_version.as_deref(), Some("0.0.9"));
 
@@ -1002,7 +1186,7 @@ mod tests {
             b"vsparallel.vsparallel-companion\n".to_vec(),
         )]);
         assert_eq!(
-            companion_status_with(&unknown, OsStr::new("code")).state,
+            companion_status_with(&unknown, OsStr::new("code"), None).state,
             CompanionStatusState::VersionUnknown
         );
 
@@ -1010,7 +1194,7 @@ mod tests {
             b"vsparallel.vsparallel-companion-extra@0.1.0\nother.extension@1.0.0\n".to_vec(),
         )]);
         assert_eq!(
-            companion_status_with(&absent, OsStr::new("code")).state,
+            companion_status_with(&absent, OsStr::new("code"), None).state,
             CompanionStatusState::NotInstalled
         );
     }
@@ -1018,17 +1202,17 @@ mod tests {
     #[test]
     fn status_is_unavailable_for_empty_missing_or_failing_cli() {
         let unused = ScriptedRunner::new(Vec::new());
-        let empty = companion_status_with(&unused, OsStr::new(""));
+        let empty = companion_status_with(&unused, OsStr::new(""), None);
         assert_eq!(empty.state, CompanionStatusState::Unavailable);
         assert!(unused.calls().is_empty());
 
         let missing = ScriptedRunner::new(vec![ScriptedResult::IoError(io::ErrorKind::NotFound)]);
-        let status = companion_status_with(&missing, OsStr::new("missing-code"));
+        let status = companion_status_with(&missing, OsStr::new("missing-code"), None);
         assert_eq!(status.state, CompanionStatusState::Unavailable);
         assert!(status.detail.unwrap().contains("injected failure"));
 
         let failure = ScriptedRunner::new(vec![failed(23, b"profile unavailable".to_vec())]);
-        let status = companion_status_with(&failure, OsStr::new("code"));
+        let status = companion_status_with(&failure, OsStr::new("code"), None);
         assert_eq!(status.state, CompanionStatusState::Unavailable);
         let detail = status.detail.unwrap();
         assert!(detail.contains("exit code 23"));
@@ -1036,10 +1220,38 @@ mod tests {
     }
 
     #[test]
+    fn editor_specific_views_never_mislabel_antigravity_as_vs_code() {
+        let status = CompanionStatus {
+            state: CompanionStatusState::Unavailable,
+            extension_id: EXTENSION_ID.to_string(),
+            bundled_version: Some("0.4.0".to_string()),
+            installed_version: None,
+            detail: Some("could not run the VS Code command".to_string()),
+        };
+        let relabeled = relabel_status(status, "Antigravity IDE");
+        assert_eq!(
+            relabeled.detail.as_deref(),
+            Some("could not run the Antigravity IDE command")
+        );
+
+        let result = CompanionOperationResult {
+            action: CompanionAction::Install,
+            verified: false,
+            message: "VS Code accepted the install command".to_string(),
+            status: relabeled,
+        };
+        let relabeled = relabel_operation(result, "Antigravity IDE");
+        assert_eq!(
+            relabeled.message,
+            "Antigravity IDE accepted the install command"
+        );
+    }
+
+    #[test]
     fn install_passes_a_real_embedded_vsix_as_one_argument_and_removes_it() {
         let runner = ScriptedRunner::new(vec![
             successful(b"installed\n".to_vec()),
-            successful(b"vsparallel.vsparallel-companion@0.3.0\n".to_vec()),
+            successful(b"vsparallel.vsparallel-companion@0.4.0\n".to_vec()),
         ]);
         let root = TempDir::new().unwrap();
         let temporary_directory = root.path().join("temporary packages with spaces");
@@ -1049,6 +1261,7 @@ mod tests {
             &runner,
             OsStr::new("/Applications/Visual Studio Code/code"),
             &temporary_directory,
+            None,
         )
         .unwrap();
 
@@ -1076,8 +1289,13 @@ mod tests {
         let runner = ScriptedRunner::new(vec![failed(9, b"cannot install\0details".to_vec())]);
         let temporary_directory = TempDir::new().unwrap();
 
-        let error = install_companion_with(&runner, OsStr::new("code"), temporary_directory.path())
-            .unwrap_err();
+        let error = install_companion_with(
+            &runner,
+            OsStr::new("code"),
+            temporary_directory.path(),
+            None,
+        )
+        .unwrap_err();
 
         assert!(error.contains("exit code 9"));
         assert!(error.contains("cannot install�details"));
@@ -1098,9 +1316,13 @@ mod tests {
         ]);
         let temporary_directory = TempDir::new().unwrap();
 
-        let result =
-            install_companion_with(&runner, OsStr::new("code"), temporary_directory.path())
-                .unwrap();
+        let result = install_companion_with(
+            &runner,
+            OsStr::new("code"),
+            temporary_directory.path(),
+            None,
+        )
+        .unwrap();
 
         assert!(!result.verified);
         assert_eq!(result.status.state, CompanionStatusState::Unavailable);
@@ -1110,12 +1332,12 @@ mod tests {
     #[test]
     fn uninstall_uses_the_exact_extension_id_and_verifies_removal() {
         let runner = ScriptedRunner::new(vec![
-            successful(b"vsparallel.vsparallel-companion@0.3.0\n".to_vec()),
+            successful(b"vsparallel.vsparallel-companion@0.4.0\n".to_vec()),
             successful(b"uninstalled\n".to_vec()),
             successful(b"other.extension@1.0.0\n".to_vec()),
         ]);
 
-        let result = uninstall_companion_with(&runner, OsStr::new("code")).unwrap();
+        let result = uninstall_companion_with(&runner, OsStr::new("code"), None).unwrap();
 
         assert!(result.verified);
         let calls = runner.calls();
@@ -1133,7 +1355,7 @@ mod tests {
     fn uninstall_is_idempotent_when_extension_is_already_absent() {
         let runner = ScriptedRunner::new(vec![successful(b"other.extension@1.0.0\n".to_vec())]);
 
-        let result = uninstall_companion_with(&runner, OsStr::new("code")).unwrap();
+        let result = uninstall_companion_with(&runner, OsStr::new("code"), None).unwrap();
 
         assert!(result.verified);
         assert_eq!(result.status.state, CompanionStatusState::NotInstalled);
@@ -1145,9 +1367,9 @@ mod tests {
         let runner = ScriptedRunner::new(Vec::new());
         let root = TempDir::new().unwrap();
         let missing = root.path().join("missing");
-        assert!(install_companion_with(&runner, OsStr::new("code"), &missing).is_err());
-        assert!(install_companion_with(&runner, OsStr::new(""), root.path()).is_err());
-        assert!(uninstall_companion_with(&runner, OsStr::new("")).is_err());
+        assert!(install_companion_with(&runner, OsStr::new("code"), &missing, None).is_err());
+        assert!(install_companion_with(&runner, OsStr::new(""), root.path(), None).is_err());
+        assert!(uninstall_companion_with(&runner, OsStr::new(""), None).is_err());
         assert!(runner.calls().is_empty());
     }
 

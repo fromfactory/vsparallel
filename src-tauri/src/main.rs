@@ -70,6 +70,14 @@ fn main() {
         Some(argument) if argument == std::ffi::OsStr::new("claude-hook") => {
             std::process::exit(vsparallel_lib::run_claude_hook_stdio());
         }
+        Some(argument) if argument == std::ffi::OsStr::new("antigravity-hook") => {
+            let event = std::env::args_os()
+                .nth(2)
+                .and_then(|argument| argument.into_string().ok())
+                .as_deref()
+                .and_then(vsparallel_lib::AntigravityHookEvent::from_cli_argument);
+            std::process::exit(event.map_or(0, vsparallel_lib::run_antigravity_hook_stdio));
+        }
         Some(argument)
             if argument == std::ffi::OsStr::new(vsparallel_lib::CLAUDE_STATUSLINE_ARGUMENT) =>
         {

@@ -4,7 +4,13 @@
   type JsonObject = Record<string, unknown>;
   type ThemePreference = "system" | "light" | "dark";
   type ColorTheme = Exclude<ThemePreference, "system">;
-  type IntegrationKind = "companion" | "codex" | "claude";
+  type IntegrationKind =
+    | "companion"
+    | "antigravityIde"
+    | "antigravity"
+    | "codex"
+    | "claude";
+  type EditorIntegrationKind = Extract<IntegrationKind, "companion" | "antigravityIde">;
   type IntegrationActionKind = IntegrationKind | "all";
   type IntegrationOperation = "install" | "uninstall";
   type IntegrationVisualState = "missing" | "ready" | "warning" | "error";
@@ -33,6 +39,8 @@
     | "install_claude_hooks"
     | "install_codex_hooks"
     | "install_companion"
+    | "install_antigravity_hooks"
+    | "install_antigravity_ide_companion"
     | "is_release_build"
     | "open_workspace"
     | "restore_full_window"
@@ -40,7 +48,9 @@
     | "toggle_window_maximize"
     | "uninstall_claude_hooks"
     | "uninstall_codex_hooks"
-    | "uninstall_companion";
+    | "uninstall_companion"
+    | "uninstall_antigravity_hooks"
+    | "uninstall_antigravity_ide_companion";
 
   interface ActivityView {
     kind: ActivityKind;
@@ -56,15 +66,19 @@
 
   interface Workspace {
     instanceId: string;
+    editor: "vscode" | "antigravity_ide" | "antigravity_2";
+    editorName: string;
     name: string;
     path: string;
     openable: boolean;
     active: boolean;
     focused: boolean;
+    recentlyActive: boolean;
     remoteWindow: boolean;
     lastSeenAtMs: number | null;
     codex: ActivityView;
     claude: ActivityView;
+    antigravity: ActivityView | null;
   }
 
   interface Snapshot {
@@ -118,6 +132,8 @@
   interface IntegrationStatus {
     schemaVersion: number;
     companion: IntegrationComponent;
+    antigravityIde: IntegrationComponent;
+    antigravity: IntegrationComponent;
     codex: IntegrationComponent;
     claude: IntegrationComponent;
     requiresRestart: boolean;
@@ -242,7 +258,13 @@
   const UPDATE_DOWNLOAD_TIMEOUT_MS = 5 * 60_000;
   const THEME_STORAGE_KEY = "vsparallel.appearance";
   const THEME_PREFERENCES: ReadonlySet<string> = new Set(["system", "light", "dark"]);
-  const INTEGRATION_KINDS = ["companion", "codex", "claude"] as const;
+  const INTEGRATION_KINDS = [
+    "companion",
+    "antigravityIde",
+    "antigravity",
+    "codex",
+    "claude",
+  ] as const;
   const MAX_JAVASCRIPT_TIMESTAMP_MS = 8_640_000_000_000_000;
   const tauriApi = (window as TauriWindow).__TAURI__;
   const tauriInvoke = tauriApi?.core?.invoke;
@@ -307,6 +329,26 @@
     companionMeta: requiredElement<HTMLParagraphElement>("#companionMeta"),
     companionInstallButton: requiredElement<HTMLButtonElement>("#companionInstallButton"),
     companionUninstallButton: requiredElement<HTMLButtonElement>("#companionUninstallButton"),
+    antigravityIdeCard: requiredElement<HTMLElement>("#antigravityIdeCard"),
+    antigravityIdeStatus: requiredElement<HTMLSpanElement>("#antigravityIdeStatus"),
+    antigravityIdeDetail: requiredElement<HTMLParagraphElement>("#antigravityIdeDetail"),
+    antigravityIdeMeta: requiredElement<HTMLParagraphElement>("#antigravityIdeMeta"),
+    antigravityIdeInstallButton: requiredElement<HTMLButtonElement>(
+      "#antigravityIdeInstallButton",
+    ),
+    antigravityIdeUninstallButton: requiredElement<HTMLButtonElement>(
+      "#antigravityIdeUninstallButton",
+    ),
+    antigravityCard: requiredElement<HTMLElement>("#antigravityCard"),
+    antigravityStatus: requiredElement<HTMLSpanElement>("#antigravityStatus"),
+    antigravityDetail: requiredElement<HTMLParagraphElement>("#antigravityDetail"),
+    antigravityMeta: requiredElement<HTMLParagraphElement>("#antigravityMeta"),
+    antigravityInstallButton: requiredElement<HTMLButtonElement>(
+      "#antigravityInstallButton",
+    ),
+    antigravityUninstallButton: requiredElement<HTMLButtonElement>(
+      "#antigravityUninstallButton",
+    ),
     codexCard: requiredElement<HTMLElement>("#codexCard"),
     codexStatus: requiredElement<HTMLSpanElement>("#codexStatus"),
     codexDetail: requiredElement<HTMLParagraphElement>("#codexDetail"),
@@ -498,7 +540,7 @@
 
     return {
       kind,
-      optional: kind !== "companion",
+      optional: kind !== "companion" && kind !== "antigravityIde",
       token,
       visualState,
       installed,
@@ -508,6 +550,10 @@
         raw.detail,
         kind === "companion"
           ? "VS Code companion status details are unavailable."
+          : kind === "antigravityIde"
+            ? "Antigravity IDE companion status details are unavailable."
+            : kind === "antigravity"
+              ? "Antigravity activity hook status details are unavailable."
           : kind === "codex"
             ? "Codex lifecycle hook status details are unavailable."
             : "Claude Code lifecycle hook status details are unavailable.",
@@ -531,6 +577,8 @@
     return {
       schemaVersion: raw.schemaVersion,
       companion: normalizeIntegrationComponent(raw.companion, "companion"),
+      antigravityIde: normalizeIntegrationComponent(raw.antigravityIde, "antigravityIde"),
+      antigravity: normalizeIntegrationComponent(raw.antigravity, "antigravity"),
       codex: normalizeIntegrationComponent(raw.codex, "codex"),
       claude: normalizeIntegrationComponent(raw.claude, "claude"),
       requiresRestart: raw.requiresRestart === true,
@@ -592,18 +640,33 @@
     const instanceId = asString(raw.instanceId);
     const path = asString(raw.path);
     const name = asString(raw.name, deriveName(path) || "Unnamed workspace");
+    const editorToken = normalizeStateToken(raw.editor);
+    const editor = editorToken === "antigravity_ide" || editorToken === "antigravity_2"
+      ? editorToken
+      : "vscode";
+    const defaultEditorName = editor === "antigravity_ide"
+      ? "Antigravity IDE"
+      : editor === "antigravity_2"
+        ? "Antigravity 2.0"
+        : "VS Code";
 
     return {
       instanceId,
+      editor,
+      editorName: asString(raw.editorName, defaultEditorName),
       name,
       path,
       openable: raw.openable === true && Boolean(instanceId),
       active: raw.active === true,
       focused: raw.focused === true,
+      recentlyActive: raw.recentlyActive === true,
       remoteWindow: raw.remoteWindow === true,
       lastSeenAtMs: asTimestamp(raw.lastSeenAtMs),
       codex: normalizeActivityView(raw.codex),
       claude: normalizeActivityView(raw.claude),
+      antigravity: isObject(raw.antigravity)
+        ? normalizeActivityView(raw.antigravity)
+        : null,
     };
   }
 
@@ -912,12 +975,18 @@
       finished: 2,
       unknown: 1,
     };
-    return [workspace.codex, workspace.claude].reduce((current, candidate) =>
+    return [workspace.codex, workspace.claude, workspace.antigravity]
+      .filter((activity): activity is ActivityView => activity !== null)
+      .reduce((current, candidate) =>
       priority[candidate.kind] > priority[current.kind] ? candidate : current,
     );
   }
 
-  function describeExtensionPresence(activity: ActivityView, remoteWindow = false): {
+  function describeExtensionPresence(
+    activity: ActivityView,
+    remoteWindow = false,
+    editorName = "VS Code",
+  ): {
     state: string;
     label: string;
     title: string;
@@ -937,8 +1006,8 @@
           ? "IDE extension status unavailable · remote window"
           : "IDE extension status unavailable",
         title: remoteWindow
-          ? `VS Code extension presence could not be checked for this remote window/profile. Reload the window after updating VSParallel Companion.${hostBoundary}`
-          : "VS Code extension presence could not be checked. Lifecycle state remains independent.",
+          ? `${editorName} extension presence could not be checked for this remote window/profile. Reload the window after updating VSParallel Companion.${hostBoundary}`
+          : `${editorName} extension presence could not be checked. Lifecycle state remains independent.`,
       };
     }
     if (activity.extensionInstalled === false && activity.extensionActive === true) {
@@ -953,8 +1022,8 @@
         state: "missing",
         label: "IDE extension not detected · this window/profile",
         title: remoteWindow
-          ? `The provider IDE extension was not detected in this VS Code window/profile. Install or enable it in the intended Local or Remote extension host, then reload the window.${hostBoundary}`
-          : "The provider IDE extension was not detected in this VS Code window/profile.",
+          ? `The provider IDE extension was not detected in this ${editorName} window/profile. Install or enable it in the intended Local or Remote extension host, then reload the window.${hostBoundary}`
+          : `The provider IDE extension was not detected in this ${editorName} window/profile.`,
       };
     }
     if (activity.extensionActive === true) {
@@ -970,20 +1039,20 @@
       return {
         state: "present",
         label: `IDE extension installed${hostLabel} · inactive`,
-        title: `The IDE extension is installed in this VS Code window/profile but inactive. This is separate from lifecycle activity.${hostBoundary}`,
+        title: `The IDE extension is installed in this ${editorName} window/profile but inactive. This is separate from lifecycle activity.${hostBoundary}`,
       };
     }
     if (activity.extensionInstalled === true) {
       return {
         state: "present",
         label: `IDE extension installed${hostLabel}`,
-        title: `The IDE extension is installed in this VS Code window/profile. Its activation state is unavailable.${hostBoundary}`,
+        title: `The IDE extension is installed in this ${editorName} window/profile. Its activation state is unavailable.${hostBoundary}`,
       };
     }
     return {
       state: "unknown",
-      label: "Reload VS Code for IDE status",
-      title: "This window is reporting through an older VSParallel Companion. Update the companion in Setup if offered, then run Developer: Reload Window in VS Code.",
+      label: `Reload ${editorName} for IDE status`,
+      title: `This window is reporting through an older VSParallel Companion. Update the companion in Setup if offered, then run Developer: Reload Window in ${editorName}.`,
     };
   }
 
@@ -991,7 +1060,9 @@
     providerName: string,
     activity: ActivityView,
     accessibleProviderName = providerName,
+    editorName = "VS Code",
     remoteWindow = false,
+    showExtensionPresence = true,
   ): HTMLDivElement {
     const provider = createElement("div", "provider-state");
     provider.dataset.state = activity.kind;
@@ -1017,16 +1088,21 @@
       changedAt.title = `Lifecycle marker: ${formatAbsoluteTime(activity.changedAtMs)}`;
     }
 
-    const presence = describeExtensionPresence(activity, remoteWindow);
-    const extension = createElement("span", "provider-extension", presence.label);
-    extension.dataset.state = presence.state;
-    extension.title = presence.title;
     stateLine.append(label, changedAt);
-    body.append(stateLine, extension);
+    body.append(stateLine);
+    let presenceLabel = "Hook-derived lifecycle activity";
+    if (showExtensionPresence) {
+      const presence = describeExtensionPresence(activity, remoteWindow, editorName);
+      const extension = createElement("span", "provider-extension", presence.label);
+      extension.dataset.state = presence.state;
+      extension.title = presence.title;
+      body.append(extension);
+      presenceLabel = presence.label;
+    }
     provider.append(name, body);
     provider.setAttribute(
       "aria-label",
-      `${accessibleProviderName}: ${activity.label}, ${relativeTime}. ${presence.label}.`,
+      `${accessibleProviderName}: ${activity.label}, ${relativeTime}. ${presenceLabel}.`,
     );
     return provider;
   }
@@ -1059,8 +1135,14 @@
     } else if (workspace.active) {
       windowState = "Open";
       windowStateToken = "active";
+    } else if (workspace.recentlyActive && !workspace.openable) {
+      windowState = "Recent";
+      windowStateToken = "recent";
     }
 
+    const editorBadge = createElement("span", "editor-badge", workspace.editorName);
+    editorBadge.dataset.editor = workspace.editor;
+    editorBadge.title = `Tracked by ${workspace.editorName}`;
     const windowBadge = createElement("span", "window-badge", windowState);
     windowBadge.dataset.state = windowStateToken;
     titleLine.append(name, windowBadge);
@@ -1069,15 +1151,43 @@
     if (workspace.path) {
       path.title = workspace.path;
     }
-    primary.append(titleLine, path);
+    const metaLine = createElement("div", "workspace-meta");
+    metaLine.append(editorBadge, path);
+    primary.append(titleLine, metaLine);
     row.append(primary);
 
     const providers = createElement("div", "activity-providers");
     providers.setAttribute("aria-label", "Agent lifecycle and IDE extension status");
-    providers.append(
-      createProviderState("Codex", workspace.codex, "Codex", workspace.remoteWindow),
-      createProviderState("Claude", workspace.claude, "Claude Code", workspace.remoteWindow),
-    );
+    if (workspace.antigravity) {
+      providers.append(
+        createProviderState(
+          "Antigravity",
+          workspace.antigravity,
+          "Antigravity",
+          workspace.editorName,
+          false,
+          false,
+        ),
+      );
+    }
+    if (workspace.editor !== "antigravity_2") {
+      providers.append(
+        createProviderState(
+          "Codex",
+          workspace.codex,
+          "Codex",
+          workspace.editorName,
+          workspace.remoteWindow,
+        ),
+        createProviderState(
+          "Claude",
+          workspace.claude,
+          "Claude Code",
+          workspace.editorName,
+          workspace.remoteWindow,
+        ),
+      );
+    }
     row.append(providers);
 
     const openButton = createElement("button", "open-button");
@@ -1085,12 +1195,17 @@
     openButton.type = "button";
     openButton.dataset.instanceId = workspace.instanceId;
     openButton.disabled = !openable;
-    openButton.setAttribute("aria-label", `${actionLabel} ${workspace.name} in VS Code`);
+    openButton.setAttribute(
+      "aria-label",
+      `${actionLabel} ${workspace.name} in ${workspace.editorName}`,
+    );
     openButton.setAttribute("aria-busy", String(opening));
     if (!workspace.openable) {
-      openButton.title = "This workspace cannot currently be opened";
+      openButton.title = workspace.recentlyActive
+        ? `${workspace.editorName} hook activity does not identify a live window or exact open target`
+        : "This workspace cannot currently be opened";
     } else {
-      openButton.title = `${actionLabel} ${workspace.name} in VS Code`;
+      openButton.title = `${actionLabel} ${workspace.name} in ${workspace.editorName}`;
     }
     openButton.addEventListener("click", () => openWorkspace(workspace));
     row.append(openButton);
@@ -1849,7 +1964,7 @@
   function beginWorkspaceLaunch(workspace: Workspace): void {
     state.openingInstanceId = workspace.instanceId;
     document.documentElement.dataset.workspaceOpening = "true";
-    elements.launchStatus.textContent = `Opening ${workspace.name}…`;
+    elements.launchStatus.textContent = `Opening ${workspace.name} in ${workspace.editorName}…`;
     elements.launchOverlay.hidden = false;
     updateWorkspaceOpeningState(workspace.instanceId, true);
   }
@@ -1876,12 +1991,16 @@
       const result = await invoke("open_workspace", { instanceId: workspace.instanceId });
       const response = isObject(result) ? result : null;
       if (result === false || response?.ok === false) {
-        throw new Error(asString(response?.error, "VS Code did not accept the open request."));
+        throw new Error(
+          asString(response?.error, `${workspace.editorName} did not accept the open request.`),
+        );
       }
       commitWindowChromeState(result);
       await transitionDelay;
     } catch (error) {
-      showNotice(readableError(error, `Could not open ${workspace.name} in VS Code.`));
+      showNotice(
+        readableError(error, `Could not open ${workspace.name} in ${workspace.editorName}.`),
+      );
       await refreshWindowChromeState();
     } finally {
       finishWorkspaceLaunch(workspace.instanceId);
@@ -1897,6 +2016,28 @@
         meta: elements.companionMeta,
         installButton: elements.companionInstallButton,
         uninstallButton: elements.companionUninstallButton,
+      };
+    }
+
+    if (kind === "antigravityIde") {
+      return {
+        card: elements.antigravityIdeCard,
+        status: elements.antigravityIdeStatus,
+        detail: elements.antigravityIdeDetail,
+        meta: elements.antigravityIdeMeta,
+        installButton: elements.antigravityIdeInstallButton,
+        uninstallButton: elements.antigravityIdeUninstallButton,
+      };
+    }
+
+    if (kind === "antigravity") {
+      return {
+        card: elements.antigravityCard,
+        status: elements.antigravityStatus,
+        detail: elements.antigravityDetail,
+        meta: elements.antigravityMeta,
+        installButton: elements.antigravityInstallButton,
+        uninstallButton: elements.antigravityUninstallButton,
       };
     }
 
@@ -1930,6 +2071,10 @@
     componentElements.installButton.textContent = component.actionLabel;
     const componentName = component.kind === "companion"
       ? "VS Code companion"
+      : component.kind === "antigravityIde"
+        ? "Antigravity IDE companion"
+        : component.kind === "antigravity"
+          ? "Antigravity activity hooks"
       : component.kind === "codex"
         ? "Codex activity hooks"
         : "Claude Code activity hooks";
@@ -1940,7 +2085,7 @@
     componentElements.uninstallButton.hidden = !component.installed;
 
     let meta = "";
-    if (component.kind === "companion") {
+    if (component.kind === "companion" || component.kind === "antigravityIde") {
       if (component.installedVersion && component.targetVersion) {
         meta = `Installed ${component.installedVersion} · Bundled ${component.targetVersion}`;
       } else if (component.installedVersion) {
@@ -2003,49 +2148,74 @@
     });
   }
 
-  function updateSetupSummary(): void {
-    let summary: string;
-    let attention = false;
+  function summarizeEditorCompanions(status: IntegrationStatus): {
+    installed: boolean;
+    warningCount: number;
+  } {
+    const companions = [status.companion, status.antigravityIde];
+    return {
+      installed: companions.some((component) => component.installed),
+      warningCount: companions.filter((component) =>
+        ["warning", "error"].includes(component.visualState)
+        && component.token !== "unavailable"
+      ).length,
+    };
+  }
 
-    if (!state.integrationStatus && !state.diagnosticsLoaded) {
-      summary = state.diagnosticsUnavailable
-        ? "Unavailable"
-        : "Local only";
-      attention = state.diagnosticsUnavailable;
-    } else {
-      const components: IntegrationComponent[] = state.integrationStatus
-        ? [
-            state.integrationStatus.companion,
-            state.integrationStatus.codex,
-            state.integrationStatus.claude,
-          ]
-        : [];
-      const requiredMissing = components.some(
-        (component) => !component.optional && component.visualState === "missing",
-      );
-      const optionalMissing = components.some(
-        (component) => component.optional && component.visualState === "missing",
-      );
-      const attentionCount = components.filter((component) =>
-        ["warning", "error"].includes(component.visualState),
-      ).length;
-      const totalWarnings = attentionCount + state.diagnosticWarningCount;
-
-      attention = requiredMissing || totalWarnings > 0;
-      if (requiredMissing) {
-        summary = "Setup needed";
-      } else if (totalWarnings) {
-        summary = `${totalWarnings} warning${totalWarnings === 1 ? "" : "s"}`;
-      } else if (optionalMissing) {
-        summary = "Optional setup";
-      } else if (state.integrationStatus && state.diagnosticsLoaded) {
-        summary = "Ready";
-      } else if (state.integrationStatus) {
-        summary = "Integrations ready";
-      } else {
-        summary = "Partially checked";
-      }
+  function describeSetupSummary(
+    status: IntegrationStatus | null,
+    diagnosticsLoaded: boolean,
+    diagnosticsUnavailable: boolean,
+    diagnosticWarningCount: number,
+  ): { summary: string; attention: boolean } {
+    if (!status && !diagnosticsLoaded) {
+      return {
+        summary: diagnosticsUnavailable ? "Unavailable" : "Local only",
+        attention: diagnosticsUnavailable,
+      };
     }
+
+    if (!status) {
+      return { summary: "Partially checked", attention: diagnosticWarningCount > 0 };
+    }
+
+    const editorSummary = summarizeEditorCompanions(status);
+    const optionalComponents = [status.antigravity, status.codex, status.claude];
+    const optionalMissing = optionalComponents.some(
+      (component) => component.visualState === "missing",
+    );
+    const optionalWarnings = optionalComponents.filter((component) =>
+      ["warning", "error"].includes(component.visualState)
+    ).length;
+    const totalWarnings = editorSummary.warningCount
+      + optionalWarnings
+      + diagnosticWarningCount;
+
+    if (!editorSummary.installed) {
+      return { summary: "Editor setup needed", attention: true };
+    }
+    if (totalWarnings) {
+      return {
+        summary: `${totalWarnings} warning${totalWarnings === 1 ? "" : "s"}`,
+        attention: true,
+      };
+    }
+    if (optionalMissing) {
+      return { summary: "Optional setup", attention: false };
+    }
+    return {
+      summary: diagnosticsLoaded ? "Ready" : "Integrations ready",
+      attention: false,
+    };
+  }
+
+  function updateSetupSummary(): void {
+    const { summary, attention } = describeSetupSummary(
+      state.integrationStatus,
+      state.diagnosticsLoaded,
+      state.diagnosticsUnavailable,
+      state.diagnosticWarningCount,
+    );
 
     elements.diagnosticsSummary.textContent = summary;
     elements.settingsButton.dataset.attention = String(attention);
@@ -2060,6 +2230,8 @@
     state.integrationStatus = status;
     state.integrationLoaded = true;
     renderIntegrationComponent(status.companion);
+    renderIntegrationComponent(status.antigravityIde);
+    renderIntegrationComponent(status.antigravity);
     renderIntegrationComponent(status.codex);
     renderIntegrationComponent(status.claude);
     elements.restartNotice.hidden = !status.requiresRestart;
@@ -2100,6 +2272,8 @@
         normalizeIntegrationStatus({
           schemaVersion: SCHEMA_VERSION,
           companion: { state: "error", label: "Check failed", detail: message },
+          antigravityIde: { state: "error", label: "Check failed", detail: message },
+          antigravity: { state: "error", label: "Check failed", detail: message },
           codex: { state: "error", label: "Check failed", detail: message },
           claude: { state: "error", label: "Check failed", detail: message },
           requiresRestart: false,
@@ -2122,10 +2296,24 @@
       if (kind === "companion") {
         return "VS Code companion uninstalled. Existing stale heartbeats will age out automatically.";
       }
-      return `${kind === "codex" ? "Codex" : "Claude Code"} activity hooks uninstalled. Existing stale activity markers will age out automatically.`;
+      if (kind === "antigravityIde") {
+        return "Antigravity IDE companion uninstalled. Existing stale heartbeats will age out automatically.";
+      }
+      const provider = kind === "antigravity"
+        ? "Antigravity"
+        : kind === "codex"
+          ? "Codex"
+          : "Claude Code";
+      return `${provider} activity hooks uninstalled. Existing stale activity markers will age out automatically.`;
     }
     if (kind === "companion") {
       return "VS Code companion installed. Reload open VS Code windows to start reporting heartbeats.";
+    }
+    if (kind === "antigravityIde") {
+      return "Antigravity IDE companion installed. Reload open Antigravity IDE windows to start reporting heartbeats.";
+    }
+    if (kind === "antigravity") {
+      return "Antigravity activity hooks installed. In Antigravity 2.0, open a saved Project and start an agent turn; opening the Project alone does not fire a hook.";
     }
     return kind === "codex"
       ? "Codex activity hooks installed. Usage remaining is separate; see the requirement above. In Codex, run /hooks and complete the required security review."
@@ -2148,6 +2336,16 @@
         install: "install_companion",
         uninstall: "uninstall_companion",
         name: "VS Code companion",
+      },
+      antigravityIde: {
+        install: "install_antigravity_ide_companion",
+        uninstall: "uninstall_antigravity_ide_companion",
+        name: "Antigravity IDE companion",
+      },
+      antigravity: {
+        install: "install_antigravity_hooks",
+        uninstall: "uninstall_antigravity_hooks",
+        name: "Antigravity activity hooks",
       },
       codex: {
         install: "install_codex_hooks",
@@ -2198,20 +2396,47 @@
     return value.replace(/[.!?\s]+$/g, "");
   }
 
+  function availableEditorSetupKinds(status: IntegrationStatus): EditorIntegrationKind[] {
+    const kinds: EditorIntegrationKind[] = [];
+    if (status.companion.token !== "unavailable") {
+      kinds.push("companion");
+    }
+    if (status.antigravityIde.token !== "unavailable") {
+      kinds.push("antigravityIde");
+    }
+    return kinds;
+  }
+
   async function setupAllIntegrations(): Promise<void> {
-    if (state.integrationAction || state.integrationPending) {
+    const integrationStatus = state.integrationStatus;
+    if (state.integrationAction || state.integrationPending || !integrationStatus) {
       return;
     }
 
+    const editorKinds = availableEditorSetupKinds(integrationStatus);
+    const editorSteps = editorKinds.map((kind) => kind === "companion"
+      ? {
+          kind,
+          name: "VS Code companion",
+          editorName: "VS Code",
+          command: "install_companion" as const,
+        }
+      : {
+          kind,
+          name: "Antigravity IDE companion",
+          editorName: "Antigravity IDE",
+          command: "install_antigravity_ide_companion" as const,
+        });
     const steps: Array<{
       kind: IntegrationKind;
       name: string;
       command: TauriCommand;
     }> = [
+      ...editorSteps,
       {
-        kind: "companion",
-        name: "VS Code companion",
-        command: "install_companion",
+        kind: "antigravity",
+        name: "Antigravity activity hooks",
+        command: "install_antigravity_hooks",
       },
       {
         kind: "codex",
@@ -2249,8 +2474,12 @@
     }
 
     if (unconfirmed.length === 0) {
+      const editorNames = editorSteps.map((step) => step.editorName);
+      const successMessage = editorNames.length
+        ? `${formatNaturalList(editorNames)} companion${editorNames.length === 1 ? "" : "s"} and activity hooks are installed. Reload ${formatNaturalList(editorNames)}, restart affected provider sessions, then run /hooks in Codex and complete its required security review.`
+        : "Activity hooks are installed. No available editor companion CLI was detected, so editor setup was skipped. Restart affected provider sessions, then run /hooks in Codex and complete its required security review.";
       setIntegrationMessage(
-        "The VS Code companion and activity hooks are installed. Usage remaining is separate; see each provider's requirement above. Reload VS Code, restart affected provider sessions, then run /hooks in Codex and complete its required security review.",
+        successMessage,
         "success",
       );
     } else if (completed.length) {
@@ -2293,14 +2522,24 @@
 
     const componentNames: Record<IntegrationKind, string> = {
       companion: "VS Code companion",
+      antigravityIde: "Antigravity IDE companion",
+      antigravity: "Antigravity activity hooks",
       codex: "Codex activity hooks",
       claude: "Claude Code activity hooks",
     };
     state.pendingUninstall = kind;
     elements.uninstallTitle.textContent = `Uninstall ${componentNames[kind]}?`;
-    elements.uninstallDescription.textContent = kind === "companion"
-      ? "VSParallel will stop receiving workspace heartbeats after existing VS Code windows are reloaded. No project files are removed."
-      : `VSParallel will remove only its own ${kind === "codex" ? "Codex" : "Claude Code"} handlers. Other provider hooks remain unchanged, and no project files are removed.`;
+    if (kind === "companion" || kind === "antigravityIde") {
+      const editorName = kind === "companion" ? "VS Code" : "Antigravity IDE";
+      elements.uninstallDescription.textContent = `VSParallel will stop receiving workspace heartbeats after existing ${editorName} windows are reloaded. No project files are removed.`;
+    } else {
+      const provider = kind === "antigravity"
+        ? "Antigravity"
+        : kind === "codex"
+          ? "Codex"
+          : "Claude Code";
+      elements.uninstallDescription.textContent = `VSParallel will remove only its own ${provider} handlers. Other hooks remain unchanged, and no project files are removed.`;
+    }
     elements.uninstallConfirmButton.disabled = false;
 
     showAccessibleDialog(elements.uninstallDialog, elements.uninstallCancelButton);
@@ -2354,18 +2593,60 @@
     const malformedInstances = asNonNegativeInteger(raw.malformedInstanceRecords);
     const malformedCodex = asNonNegativeInteger(raw.malformedCodexRecords);
     const malformedClaude = asNonNegativeInteger(raw.malformedClaudeRecords);
+    const malformedAntigravity = asNonNegativeInteger(raw.malformedAntigravityRecords);
     const omittedInstances = asNonNegativeInteger(raw.omittedInstanceRecords);
     const omittedCodex = asNonNegativeInteger(raw.omittedCodexRecords);
     const omittedClaude = asNonNegativeInteger(raw.omittedClaudeRecords);
+    const omittedAntigravity = asNonNegativeInteger(raw.omittedAntigravityRecords);
     const validInstances = asNonNegativeInteger(raw.validInstanceRecords);
     const validCodex = asNonNegativeInteger(raw.validCodexRecords);
     const validClaude = asNonNegativeInteger(raw.validClaudeRecords);
-    const totalMalformed = malformedInstances + malformedCodex + malformedClaude;
-    const totalOmitted = omittedInstances + omittedCodex + omittedClaude;
+    const validAntigravity = asNonNegativeInteger(raw.validAntigravityRecords);
+    const antigravityHookOutcome = normalizeStateToken(raw.antigravityTwoHookOutcome);
+    const antigravityHookEvent = asString(raw.antigravityTwoHookEvent)
+      .replaceAll("-", " ");
+    const antigravityHookObservedAt = asTimestamp(raw.antigravityTwoHookObservedAtMs);
+    const antigravityHookWorkspaceCount = asNonNegativeInteger(
+      raw.antigravityTwoHookWorkspaceCount,
+    );
+    const antigravityHookWarning = ![
+      "not_observed",
+      "recorded",
+    ].includes(antigravityHookOutcome);
+    let antigravityHookDetail = "Not observed · start an Antigravity 2.0 agent turn";
+    if (antigravityHookOutcome === "recorded") {
+      const observed = formatRelativeTime(antigravityHookObservedAt).toLowerCase();
+      antigravityHookDetail = [
+        antigravityHookEvent || "agent event",
+        observed,
+        `${antigravityHookWorkspaceCount} workspace path${
+          antigravityHookWorkspaceCount === 1 ? "" : "s"
+        } recorded`,
+      ].join(" · ");
+    } else if (antigravityHookOutcome === "no_workspace") {
+      antigravityHookDetail = "Observed, but no usable local Project workspace path was reported";
+    } else if (antigravityHookOutcome === "missing_conversation") {
+      antigravityHookDetail = "Observed, but no conversation identifier was reported";
+    } else if (antigravityHookOutcome === "persist_failed") {
+      antigravityHookDetail = "Observed, but VSParallel could not save workspace activity";
+    } else if (antigravityHookOutcome === "health_unreadable") {
+      antigravityHookDetail = "The local hook execution-health record is unreadable";
+    } else if (antigravityHookOutcome !== "not_observed") {
+      antigravityHookDetail = "Observed, but the event could not be used for workspace activity";
+    }
+    const totalMalformed = malformedInstances
+      + malformedCodex
+      + malformedClaude
+      + malformedAntigravity;
+    const totalOmitted = omittedInstances + omittedCodex + omittedClaude + omittedAntigravity;
 
     elements.diagnosticsList.replaceChildren();
     appendDiagnostic("State directory", asString(raw.stateDirectory, "Unavailable"));
     appendDiagnostic("VS Code command", asString(raw.codeCommand, "code"));
+    appendDiagnostic(
+      "Antigravity IDE command",
+      asString(raw.antigravityIdeCommand, "antigravity-ide"),
+    );
     appendDiagnostic(
       "Workspace records",
       `${validInstances} valid · ${malformedInstances} malformed · ${omittedInstances} omitted`,
@@ -2381,6 +2662,16 @@
       `${validClaude} valid · ${malformedClaude} malformed · ${omittedClaude} omitted`,
       malformedClaude > 0 || omittedClaude > 0,
     );
+    appendDiagnostic(
+      "Antigravity activity records",
+      `${validAntigravity} valid · ${malformedAntigravity} malformed · ${omittedAntigravity} omitted`,
+      malformedAntigravity > 0 || omittedAntigravity > 0,
+    );
+    appendDiagnostic(
+      "Antigravity 2.0 hook execution",
+      antigravityHookDetail,
+      antigravityHookWarning,
+    );
     appendDiagnostic("Active heartbeat window", formatDuration(raw.activeTtlMs));
     appendDiagnostic("Inactive record retention", formatDuration(raw.staleRetentionMs));
     appendDiagnostic(
@@ -2388,14 +2679,20 @@
       formatDuration(raw.activityStaleMs ?? raw.codexStaleMs),
     );
 
-    state.diagnosticWarningCount = totalMalformed + Number(totalOmitted > 0);
+    state.diagnosticWarningCount = totalMalformed
+      + Number(totalOmitted > 0)
+      + Number(antigravityHookWarning);
     state.diagnosticsLoaded = true;
     state.diagnosticsUnavailable = false;
     updateSetupSummary();
     elements.diagnosticsStatus.classList.remove("has-error");
-    elements.diagnosticsStatus.textContent = validInstances
-      ? "The companion is reporting one or more workspace records."
-      : "No valid workspace heartbeat is present yet. Check that the companion extension is enabled in an open VS Code window.";
+    elements.diagnosticsStatus.textContent = validInstances || validAntigravity
+      ? "One or more editor heartbeats or Antigravity activity records are available."
+      : antigravityHookOutcome === "not_observed"
+        ? "No workspace source is present yet. Opening an Antigravity 2.0 Project does not fire hooks; start an agent turn to create recent activity."
+        : antigravityHookWarning
+          ? "Antigravity 2.0 invoked VSParallel, but the latest event did not create a workspace record."
+          : "No valid workspace source is present yet. Check an editor companion or Antigravity activity hooks.";
   }
 
   async function refreshDiagnostics(): Promise<void> {
@@ -2625,6 +2922,12 @@
   elements.companionInstallButton.addEventListener("click", () =>
     runIntegrationAction("companion", "install"),
   );
+  elements.antigravityIdeInstallButton.addEventListener("click", () =>
+    runIntegrationAction("antigravityIde", "install"),
+  );
+  elements.antigravityInstallButton.addEventListener("click", () =>
+    runIntegrationAction("antigravity", "install"),
+  );
   elements.codexInstallButton.addEventListener("click", () =>
     runIntegrationAction("codex", "install"),
   );
@@ -2633,6 +2936,12 @@
   );
   elements.companionUninstallButton.addEventListener("click", () =>
     requestUninstall("companion"),
+  );
+  elements.antigravityIdeUninstallButton.addEventListener("click", () =>
+    requestUninstall("antigravityIde"),
+  );
+  elements.antigravityUninstallButton.addEventListener("click", () =>
+    requestUninstall("antigravity"),
   );
   elements.codexUninstallButton.addEventListener("click", () => requestUninstall("codex"));
   elements.claudeUninstallButton.addEventListener("click", () => requestUninstall("claude"));

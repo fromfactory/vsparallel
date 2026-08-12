@@ -1,8 +1,10 @@
+use crate::opener::EditorKind;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{hash_map::DefaultHasher, BinaryHeap, HashMap};
 use std::env;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -50,11 +52,33 @@ struct AgentExtensionsRecord {
     claude: Option<ExtensionPresenceRecord>,
 }
 
+/// Editor values accepted from the companion file protocol. Antigravity 2.0
+/// does not host the companion and must be synthesized from a separate trusted
+/// local source instead of being accepted from a heartbeat.
+#[derive(Debug, Clone, Copy, Deserialize)]
+enum CompanionEditorKind {
+    #[serde(rename = "vscode")]
+    VsCode,
+    #[serde(rename = "antigravity_ide")]
+    AntigravityIde,
+}
+
+impl From<CompanionEditorKind> for EditorKind {
+    fn from(value: CompanionEditorKind) -> Self {
+        match value {
+            CompanionEditorKind::VsCode => Self::VsCode,
+            CompanionEditorKind::AntigravityIde => Self::AntigravityIde,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct InstanceRecord {
     schema_version: u32,
     instance_id: String,
+    #[serde(default)]
+    editor: Option<CompanionEditorKind>,
     workspace_name: Option<String>,
     #[serde(default)]
     workspace_folders: Vec<WorkspaceFolderRecord>,
@@ -112,6 +136,8 @@ pub struct ActivityView {
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceView {
     pub instance_id: String,
+    pub editor: EditorKind,
+    pub editor_name: String,
     pub name: String,
     pub path: Option<String>,
     pub openable: bool,
@@ -121,6 +147,7 @@ pub struct WorkspaceView {
     pub remote_window: bool,
     pub last_seen_at_ms: i64,
     pub started_at_ms: i64,
+    pub antigravity: Option<ActivityView>,
     pub codex: ActivityView,
     pub claude: ActivityView,
 }
@@ -133,6 +160,14 @@ pub struct Snapshot {
     pub workspaces: Vec<WorkspaceView>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkspaceOpenTarget {
+    pub path: PathBuf,
+    /// `None` is a legacy heartbeat and deliberately uses the configured
+    /// default VS Code command rather than trusting an on-disk executable.
+    pub editor: Option<EditorKind>,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Diagnostics {
@@ -142,6 +177,7 @@ pub struct Diagnostics {
     pub stale_retention_ms: i64,
     pub activity_stale_ms: i64,
     pub code_command: String,
+    pub antigravity_ide_command: String,
     pub valid_instance_records: usize,
     pub malformed_instance_records: usize,
     pub omitted_instance_records: usize,
@@ -151,6 +187,13 @@ pub struct Diagnostics {
     pub valid_claude_records: usize,
     pub malformed_claude_records: usize,
     pub omitted_claude_records: usize,
+    pub valid_antigravity_records: usize,
+    pub malformed_antigravity_records: usize,
+    pub omitted_antigravity_records: usize,
+    pub antigravity_two_hook_observed_at_ms: Option<i64>,
+    pub antigravity_two_hook_event: Option<String>,
+    pub antigravity_two_hook_outcome: String,
+    pub antigravity_two_hook_workspace_count: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -178,6 +221,8 @@ impl StateStore {
         let instances = self.load_instances(now_ms);
         let codex = self.load_codex(now_ms);
         let claude = self.load_claude(now_ms);
+        let antigravity = self.load_antigravity(now_ms);
+        let antigravity_ide = self.load_antigravity_ide(now_ms);
         let mut latest_by_id: HashMap<String, InstanceRecord> = HashMap::new();
 
         for record in instances.records {
@@ -190,11 +235,45 @@ impl StateStore {
             }
         }
 
+        let antigravity_ide_paths: Vec<PathBuf> = latest_by_id
+            .values()
+            .filter(|record| {
+                matches!(record.editor, Some(CompanionEditorKind::AntigravityIde))
+                    && now_ms.saturating_sub(record.last_seen_at_ms) <= STALE_RETENTION_MS
+            })
+            .flat_map(workspace_paths)
+            .collect();
+
         let mut workspaces: Vec<_> = latest_by_id
             .into_values()
             .filter(|record| now_ms.saturating_sub(record.last_seen_at_ms) <= STALE_RETENTION_MS)
-            .map(|record| self.workspace_view(record, &codex.records, &claude.records, now_ms))
+            .map(|record| {
+                self.workspace_view(
+                    record,
+                    &antigravity_ide.records,
+                    &codex.records,
+                    &claude.records,
+                    now_ms,
+                )
+            })
             .collect();
+
+        workspaces.extend(self.antigravity_workspace_views(
+            &antigravity.records,
+            &codex.records,
+            &claude.records,
+            EditorKind::Antigravity2,
+            &[],
+            now_ms,
+        ));
+        workspaces.extend(self.antigravity_workspace_views(
+            &antigravity_ide.records,
+            &codex.records,
+            &claude.records,
+            EditorKind::AntigravityIde,
+            &antigravity_ide_paths,
+            now_ms,
+        ));
 
         workspaces.sort_by(|left, right| {
             right
@@ -212,10 +291,34 @@ impl StateStore {
         }
     }
 
-    pub fn diagnostics(&self, now_ms: i64, code_command: String) -> Diagnostics {
+    pub fn diagnostics(
+        &self,
+        now_ms: i64,
+        code_command: String,
+        antigravity_ide_command: String,
+    ) -> Diagnostics {
         let instances = self.load_instances(now_ms);
         let codex = self.load_codex(now_ms);
         let claude = self.load_claude(now_ms);
+        let antigravity = self.load_antigravity(now_ms);
+        let antigravity_ide = self.load_antigravity_ide(now_ms);
+        let antigravity_hook =
+            crate::antigravity_integration::antigravity_two_hook_observation(&self.root, now_ms);
+        let (
+            antigravity_two_hook_observed_at_ms,
+            antigravity_two_hook_event,
+            antigravity_two_hook_outcome,
+            antigravity_two_hook_workspace_count,
+        ) = match antigravity_hook {
+            Ok(Some(observation)) => (
+                Some(observation.observed_at_ms),
+                Some(observation.event),
+                observation.outcome.as_str().to_string(),
+                Some(observation.workspace_count),
+            ),
+            Ok(None) => (None, None, "not_observed".to_string(), None),
+            Err(_) => (None, None, "health_unreadable".to_string(), None),
+        };
         Diagnostics {
             schema_version: SCHEMA_VERSION,
             state_directory: self.root.to_string_lossy().into_owned(),
@@ -223,6 +326,7 @@ impl StateStore {
             stale_retention_ms: STALE_RETENTION_MS,
             activity_stale_ms: ACTIVITY_STALE_MS,
             code_command,
+            antigravity_ide_command,
             valid_instance_records: instances.records.len(),
             malformed_instance_records: instances.malformed,
             omitted_instance_records: instances.omitted,
@@ -232,27 +336,45 @@ impl StateStore {
             valid_claude_records: claude.records.len(),
             malformed_claude_records: claude.malformed,
             omitted_claude_records: claude.omitted,
+            valid_antigravity_records: antigravity
+                .records
+                .len()
+                .saturating_add(antigravity_ide.records.len()),
+            malformed_antigravity_records: antigravity
+                .malformed
+                .saturating_add(antigravity_ide.malformed),
+            omitted_antigravity_records: antigravity
+                .omitted
+                .saturating_add(antigravity_ide.omitted),
+            antigravity_two_hook_observed_at_ms,
+            antigravity_two_hook_event,
+            antigravity_two_hook_outcome,
+            antigravity_two_hook_workspace_count,
         }
     }
 
-    pub(crate) fn find_open_target(&self, instance_id: &str, now_ms: i64) -> Option<PathBuf> {
-        self.find_open_target_with_max_age(instance_id, now_ms, STALE_RETENTION_MS)
-    }
-
-    pub(crate) fn find_active_open_target(
+    pub(crate) fn find_workspace_open_target(
         &self,
         instance_id: &str,
         now_ms: i64,
-    ) -> Option<PathBuf> {
-        self.find_open_target_with_max_age(instance_id, now_ms, ACTIVE_TTL_MS)
+    ) -> Option<WorkspaceOpenTarget> {
+        self.find_workspace_open_target_with_max_age(instance_id, now_ms, STALE_RETENTION_MS)
     }
 
-    fn find_open_target_with_max_age(
+    pub(crate) fn find_active_workspace_open_target(
+        &self,
+        instance_id: &str,
+        now_ms: i64,
+    ) -> Option<WorkspaceOpenTarget> {
+        self.find_workspace_open_target_with_max_age(instance_id, now_ms, ACTIVE_TTL_MS)
+    }
+
+    fn find_workspace_open_target_with_max_age(
         &self,
         instance_id: &str,
         now_ms: i64,
         max_age_ms: i64,
-    ) -> Option<PathBuf> {
+    ) -> Option<WorkspaceOpenTarget> {
         if instance_id.is_empty() || instance_id.len() > 256 {
             return None;
         }
@@ -263,13 +385,19 @@ impl StateStore {
             .filter(|record| record.instance_id == instance_id)
             .filter(|record| now_ms.saturating_sub(record.last_seen_at_ms) <= max_age_ms)
             .max_by_key(|record| record.last_seen_at_ms)
-            .and_then(|record| open_target_path(&record))
-            .filter(|target| target.exists())
+            .and_then(|record| {
+                let path = open_target_path(&record)?;
+                path.exists().then(|| WorkspaceOpenTarget {
+                    path,
+                    editor: record.editor.map(EditorKind::from),
+                })
+            })
     }
 
     fn workspace_view(
         &self,
         record: InstanceRecord,
+        antigravity_records: &[ActivityRecord],
         codex_records: &[ActivityRecord],
         claude_records: &[ActivityRecord],
         now_ms: i64,
@@ -306,9 +434,25 @@ impl StateStore {
             .agent_extensions
             .as_ref()
             .and_then(|extensions| extensions.claude);
+        let editor = record
+            .editor
+            .map(EditorKind::from)
+            .unwrap_or(EditorKind::VsCode);
+        let antigravity = (editor == EditorKind::AntigravityIde)
+            .then(|| {
+                aggregate_activity_if_observed(
+                    "Antigravity",
+                    &workspace_paths,
+                    antigravity_records,
+                    now_ms,
+                )
+            })
+            .flatten();
 
         WorkspaceView {
             instance_id: record.instance_id,
+            editor,
+            editor_name: editor.display_name().to_string(),
             name,
             path: display_path,
             openable: target.as_ref().is_some_and(|path| path.exists()),
@@ -318,11 +462,13 @@ impl StateStore {
             remote_window: record.remote_window,
             last_seen_at_ms: record.last_seen_at_ms,
             started_at_ms: record.started_at_ms,
+            antigravity,
             codex: aggregate_activity(
                 "Codex",
                 &workspace_paths,
                 codex_records,
                 codex_extension,
+                Some(editor.display_name()),
                 record.remote_window,
                 now_ms,
             ),
@@ -331,10 +477,93 @@ impl StateStore {
                 &workspace_paths,
                 claude_records,
                 claude_extension,
+                Some(editor.display_name()),
                 record.remote_window,
                 now_ms,
             ),
         }
+    }
+
+    fn antigravity_workspace_views(
+        &self,
+        records: &[ActivityRecord],
+        codex_records: &[ActivityRecord],
+        claude_records: &[ActivityRecord],
+        editor: EditorKind,
+        companion_paths: &[PathBuf],
+        now_ms: i64,
+    ) -> Vec<WorkspaceView> {
+        let mut newest_by_path: HashMap<PathBuf, &ActivityRecord> = HashMap::new();
+        for record in records
+            .iter()
+            .filter(|record| now_ms.saturating_sub(record.changed_at_ms) <= ACTIVITY_STALE_MS)
+        {
+            match newest_by_path.get(&record.normalized_cwd) {
+                Some(existing) if existing.changed_at_ms >= record.changed_at_ms => {}
+                _ => {
+                    newest_by_path.insert(record.normalized_cwd.clone(), record);
+                }
+            }
+        }
+
+        newest_by_path
+            .into_iter()
+            .filter(|(path, _)| !companion_paths.iter().any(|known| known == path))
+            .map(|(path, newest)| {
+                let workspace_paths = vec![path.clone()];
+                let name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| "Antigravity project".to_string());
+                let instance_id = format!(
+                    "{}:{}",
+                    match editor {
+                        EditorKind::AntigravityIde => "antigravity-ide",
+                        _ => "antigravity-2",
+                    },
+                    stable_path_key(&path)
+                );
+                WorkspaceView {
+                    instance_id,
+                    editor,
+                    editor_name: editor.display_name().to_string(),
+                    name,
+                    path: Some(path.to_string_lossy().into_owned()),
+                    openable: false,
+                    active: false,
+                    focused: false,
+                    recently_active: true,
+                    remote_window: false,
+                    last_seen_at_ms: newest.changed_at_ms,
+                    started_at_ms: newest.changed_at_ms,
+                    antigravity: aggregate_activity_if_observed(
+                        "Antigravity",
+                        &workspace_paths,
+                        records,
+                        now_ms,
+                    ),
+                    codex: aggregate_activity(
+                        "Codex",
+                        &workspace_paths,
+                        codex_records,
+                        None,
+                        None,
+                        false,
+                        now_ms,
+                    ),
+                    claude: aggregate_activity(
+                        "Claude Code",
+                        &workspace_paths,
+                        claude_records,
+                        None,
+                        None,
+                        false,
+                        now_ms,
+                    ),
+                }
+            })
+            .collect()
     }
 
     fn load_instances(&self, now_ms: i64) -> LoadResult<InstanceRecord> {
@@ -358,6 +587,14 @@ impl StateStore {
 
     fn load_claude(&self, now_ms: i64) -> LoadResult<ActivityRecord> {
         self.load_activity("claude", now_ms)
+    }
+
+    fn load_antigravity(&self, now_ms: i64) -> LoadResult<ActivityRecord> {
+        self.load_activity("antigravity", now_ms)
+    }
+
+    fn load_antigravity_ide(&self, now_ms: i64) -> LoadResult<ActivityRecord> {
+        self.load_activity("antigravity-ide", now_ms)
     }
 
     fn load_activity(&self, provider: &str, now_ms: i64) -> LoadResult<ActivityRecord> {
@@ -636,11 +873,44 @@ fn path_is_within(path: &Path, root: &Path) -> bool {
     }
 }
 
+fn stable_path_key(path: &Path) -> String {
+    let mut hasher = DefaultHasher::new();
+    path.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn aggregate_activity_if_observed(
+    provider: &str,
+    workspace_paths: &[PathBuf],
+    records: &[ActivityRecord],
+    now_ms: i64,
+) -> Option<ActivityView> {
+    records
+        .iter()
+        .any(|record| {
+            workspace_paths
+                .iter()
+                .any(|workspace| path_is_within(&record.normalized_cwd, workspace))
+        })
+        .then(|| {
+            aggregate_activity(
+                provider,
+                workspace_paths,
+                records,
+                None,
+                None,
+                false,
+                now_ms,
+            )
+        })
+}
+
 fn aggregate_activity(
     provider: &str,
     workspace_paths: &[PathBuf],
     records: &[ActivityRecord],
     extension: Option<ExtensionPresenceRecord>,
+    editor_name: Option<&str>,
     remote_window: bool,
     now_ms: i64,
 ) -> ActivityView {
@@ -658,7 +928,7 @@ fn aggregate_activity(
         .collect();
 
     if matching.is_empty() {
-        return unknown_activity(provider, extension);
+        return unknown_activity(provider, extension, editor_name);
     }
 
     matching.sort_by_key(|record| record.changed_at_ms);
@@ -747,7 +1017,11 @@ fn pathless_activity(
     )
 }
 
-fn unknown_activity(provider: &str, extension: Option<ExtensionPresenceRecord>) -> ActivityView {
+fn unknown_activity(
+    provider: &str,
+    extension: Option<ExtensionPresenceRecord>,
+    editor_name: Option<&str>,
+) -> ActivityView {
     let mut detail = match extension {
         Some(extension) if !extension.available => format!(
             "{provider} extension presence could not be checked; no lifecycle signal has been observed."
@@ -758,7 +1032,10 @@ fn unknown_activity(provider: &str, extension: Option<ExtensionPresenceRecord>) 
         Some(extension) if extension.installed => format!(
             "The {provider} extension is installed but not active in this window; no lifecycle signal has been observed."
         ),
-        Some(_) => format!("The {provider} extension was not detected in this VS Code window."),
+        Some(_) => format!(
+            "The {provider} extension was not detected in this {} window.",
+            editor_name.unwrap_or("VS Code")
+        ),
         None => format!("No matching {provider} lifecycle signal has been observed."),
     };
     detail.push_str(&format!(
@@ -885,8 +1162,11 @@ mod tests {
             fs::hard_link(&source, instances.join(format!("{index:04}.json"))).unwrap();
         }
 
-        let diagnostics =
-            StateStore::new(temp.path().to_path_buf()).diagnostics(20_000, "code".into());
+        let diagnostics = StateStore::new(temp.path().to_path_buf()).diagnostics(
+            20_000,
+            "code".into(),
+            "antigravity-ide".into(),
+        );
         assert_eq!(
             diagnostics.valid_instance_records,
             MAX_RECORD_CANDIDATES_PER_DIRECTORY
@@ -896,9 +1176,50 @@ mod tests {
         assert_eq!(diagnostics.omitted_claude_records, 0);
 
         let serialized = serde_json::to_value(diagnostics).unwrap();
+        assert_eq!(serialized["codeCommand"], "code");
+        assert_eq!(serialized["antigravityIdeCommand"], "antigravity-ide");
         assert_eq!(serialized["omittedInstanceRecords"], 1);
         assert_eq!(serialized["omittedCodexRecords"], 0);
         assert_eq!(serialized["omittedClaudeRecords"], 0);
+        assert_eq!(serialized["antigravityTwoHookOutcome"], "not_observed");
+        assert!(serialized["antigravityTwoHookObservedAtMs"].is_null());
+    }
+
+    #[test]
+    fn diagnostics_distinguish_hook_execution_from_configuration() {
+        let temp = TempDir::new().unwrap();
+        write_json(
+            &temp
+                .path()
+                .join("antigravity-hook-health/antigravity-2.json"),
+            json!({
+                "schemaVersion": 1,
+                "event": "pre-invocation",
+                "surface": "antigravity_2",
+                "outcome": "no_workspace",
+                "observedAtMs": 20_000,
+                "workspaceCount": 0
+            }),
+        );
+        let store = StateStore::new(temp.path().to_path_buf());
+
+        let observed = store.diagnostics(20_000, "code".into(), "antigravity-ide".into());
+        assert_eq!(
+            observed.antigravity_two_hook_event.as_deref(),
+            Some("pre-invocation")
+        );
+        assert_eq!(observed.antigravity_two_hook_outcome, "no_workspace");
+        assert_eq!(observed.antigravity_two_hook_observed_at_ms, Some(20_000));
+        assert_eq!(observed.antigravity_two_hook_workspace_count, Some(0));
+
+        fs::write(
+            temp.path()
+                .join("antigravity-hook-health/antigravity-2.json"),
+            b"{not json",
+        )
+        .unwrap();
+        let unreadable = store.diagnostics(20_000, "code".into(), "antigravity-ide".into());
+        assert_eq!(unreadable.antigravity_two_hook_outcome, "health_unreadable");
     }
 
     #[test]
@@ -956,7 +1277,7 @@ mod tests {
             .workspaces
             .iter()
             .any(|item| item.instance_id == "b" && !item.active));
-        let diagnostics = store.diagnostics(now, "code".to_string());
+        let diagnostics = store.diagnostics(now, "code".to_string(), "antigravity-ide".to_string());
         assert_eq!(diagnostics.valid_instance_records, 2);
         assert_eq!(diagnostics.malformed_instance_records, 1);
     }
@@ -991,13 +1312,324 @@ mod tests {
         let store = StateStore::new(temp.path().to_path_buf());
         let snapshot = store.snapshot(now);
         assert_eq!(snapshot.workspaces.len(), 1);
+        assert_eq!(snapshot.workspaces[0].editor, EditorKind::VsCode);
+        assert_eq!(snapshot.workspaces[0].editor_name, "VS Code");
         assert!(snapshot.workspaces[0].openable);
         assert!(snapshot.workspaces[0].focused);
+        let target = store
+            .find_workspace_open_target("51adf7cb-d0ee-42a2-8d5d-dc8ef93d74f8", now)
+            .unwrap();
+        assert_eq!(target.path, repo);
+        assert_eq!(
+            target.editor, None,
+            "legacy records use the configured default"
+        );
         assert_eq!(
             store
-                .diagnostics(now, "code".to_string())
+                .diagnostics(now, "code".to_string(), "antigravity-ide".to_string())
                 .malformed_instance_records,
             0
+        );
+    }
+
+    #[test]
+    fn trusted_companion_editor_is_exposed_and_selects_its_launcher_kind() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("antigravity-project");
+        fs::create_dir_all(&repo).unwrap();
+        let now = 30_000;
+        let mut heartbeat = instance("antigravity-window", &repo, now, true);
+        heartbeat["editor"] = json!("antigravity_ide");
+        write_json(
+            &temp.path().join("instances/antigravity-window.json"),
+            heartbeat,
+        );
+
+        let store = StateStore::new(temp.path().to_path_buf());
+        let snapshot = store.snapshot(now);
+        assert_eq!(snapshot.workspaces.len(), 1);
+        assert_eq!(snapshot.workspaces[0].editor, EditorKind::AntigravityIde);
+        assert_eq!(snapshot.workspaces[0].editor_name, "Antigravity IDE");
+        let serialized = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(serialized["workspaces"][0]["editor"], "antigravity_ide");
+        assert_eq!(serialized["workspaces"][0]["editorName"], "Antigravity IDE");
+
+        assert_eq!(
+            store.find_workspace_open_target("antigravity-window", now),
+            Some(WorkspaceOpenTarget {
+                path: repo,
+                editor: Some(EditorKind::AntigravityIde),
+            })
+        );
+    }
+
+    #[test]
+    fn missing_provider_copy_names_antigravity_ide_instead_of_vs_code() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("antigravity-project");
+        fs::create_dir_all(&repo).unwrap();
+        let now = 30_000;
+        let mut heartbeat = instance("antigravity-window", &repo, now, true);
+        heartbeat["editor"] = json!("antigravity_ide");
+        heartbeat["agentExtensions"] = json!({
+            "codex": {"available": true, "installed": false, "active": false, "remote": null},
+            "claude": {"available": true, "installed": false, "active": false, "remote": null}
+        });
+        write_json(
+            &temp.path().join("instances/antigravity-window.json"),
+            heartbeat,
+        );
+
+        let snapshot = StateStore::new(temp.path().to_path_buf()).snapshot(now);
+        assert!(snapshot.workspaces[0]
+            .codex
+            .detail
+            .contains("Antigravity IDE window"));
+        assert!(!snapshot.workspaces[0]
+            .codex
+            .detail
+            .contains("VS Code window"));
+    }
+
+    #[test]
+    fn antigravity_hook_activity_synthesizes_a_recent_non_openable_workspace() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("antigravity-project");
+        fs::create_dir_all(&repo).unwrap();
+        let now = 30_000;
+        write_json(
+            &temp.path().join("antigravity/conversation-project.json"),
+            json!({
+                "schemaVersion": 1,
+                "sessionKey": "hashed-conversation",
+                "cwd": repo,
+                "state": "turn_finished",
+                "changedAtMs": now - 10
+            }),
+        );
+
+        let store = StateStore::new(temp.path().to_path_buf());
+        let snapshot = store.snapshot(now);
+        assert_eq!(snapshot.workspaces.len(), 1);
+        let workspace = &snapshot.workspaces[0];
+        assert_eq!(workspace.editor, EditorKind::Antigravity2);
+        assert_eq!(workspace.editor_name, "Antigravity 2.0");
+        assert_eq!(
+            workspace.path.as_deref(),
+            Some(repo.to_string_lossy().as_ref())
+        );
+        assert!(!workspace.openable);
+        assert!(!workspace.active);
+        assert!(!workspace.focused);
+        assert!(workspace.recently_active);
+        assert_eq!(
+            workspace
+                .antigravity
+                .as_ref()
+                .map(|activity| activity.state.as_str()),
+            Some("turn_finished")
+        );
+        assert!(store
+            .find_workspace_open_target(&workspace.instance_id, now)
+            .is_none());
+
+        let diagnostics = store.diagnostics(now, "code".into(), "antigravity-ide".into());
+        assert_eq!(diagnostics.valid_antigravity_records, 1);
+        assert_eq!(diagnostics.malformed_antigravity_records, 0);
+        assert_eq!(diagnostics.omitted_antigravity_records, 0);
+    }
+
+    #[test]
+    fn antigravity_ide_heartbeat_owns_matching_hook_activity_without_a_duplicate_row() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("shared-antigravity-project");
+        fs::create_dir_all(&repo).unwrap();
+        let now = 30_000;
+        let mut heartbeat = instance("antigravity-ide-window", &repo, now, true);
+        heartbeat["editor"] = json!("antigravity_ide");
+        write_json(
+            &temp.path().join("instances/antigravity-ide-window.json"),
+            heartbeat,
+        );
+        write_json(
+            &temp
+                .path()
+                .join("antigravity-ide/conversation-project.json"),
+            json!({
+                "schemaVersion": 1,
+                "sessionKey": "hashed-conversation",
+                "cwd": repo,
+                "state": "activity_detected",
+                "changedAtMs": now
+            }),
+        );
+
+        let snapshot = StateStore::new(temp.path().to_path_buf()).snapshot(now);
+        assert_eq!(snapshot.workspaces.len(), 1);
+        assert_eq!(snapshot.workspaces[0].editor, EditorKind::AntigravityIde);
+        assert_eq!(
+            snapshot.workspaces[0]
+                .antigravity
+                .as_ref()
+                .map(|activity| activity.state.as_str()),
+            Some("activity_detected")
+        );
+    }
+
+    #[test]
+    fn ide_hook_without_a_heartbeat_stays_identified_as_antigravity_ide() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("ide-project");
+        fs::create_dir_all(&repo).unwrap();
+        let now = 30_000;
+        write_json(
+            &temp.path().join("antigravity-ide/conversation.json"),
+            json!({
+                "schemaVersion": 1,
+                "sessionKey": "ide-conversation",
+                "cwd": repo,
+                "state": "turn_finished",
+                "changedAtMs": now
+            }),
+        );
+
+        let snapshot = StateStore::new(temp.path().to_path_buf()).snapshot(now);
+        assert_eq!(snapshot.workspaces.len(), 1);
+        let workspace = &snapshot.workspaces[0];
+        assert_eq!(workspace.editor, EditorKind::AntigravityIde);
+        assert_eq!(workspace.editor_name, "Antigravity IDE");
+        assert!(!workspace.openable);
+        assert!(workspace.recently_active);
+    }
+
+    #[test]
+    fn stale_antigravity_ide_heartbeat_does_not_hide_recent_shared_hook_activity() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("reopened-in-antigravity");
+        fs::create_dir_all(&repo).unwrap();
+        let now = 2_000_000;
+        let mut heartbeat = instance(
+            "old-antigravity-ide-window",
+            &repo,
+            now - STALE_RETENTION_MS - 1,
+            false,
+        );
+        heartbeat["editor"] = json!("antigravity_ide");
+        write_json(
+            &temp
+                .path()
+                .join("instances/old-antigravity-ide-window.json"),
+            heartbeat,
+        );
+        write_json(
+            &temp.path().join("antigravity/current.json"),
+            json!({
+                "schemaVersion": 1,
+                "sessionKey": "current-conversation",
+                "cwd": repo,
+                "state": "activity_detected",
+                "changedAtMs": now
+            }),
+        );
+
+        let snapshot = StateStore::new(temp.path().to_path_buf()).snapshot(now);
+        assert_eq!(snapshot.workspaces.len(), 1);
+        assert_eq!(snapshot.workspaces[0].editor, EditorKind::Antigravity2);
+    }
+
+    #[test]
+    fn stale_or_malformed_antigravity_activity_does_not_create_a_workspace() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("old-project");
+        fs::create_dir_all(&repo).unwrap();
+        let now = ACTIVITY_STALE_MS + 10_000;
+        write_json(
+            &temp.path().join("antigravity/old.json"),
+            json!({
+                "schemaVersion": 1,
+                "sessionKey": "old-conversation",
+                "cwd": repo,
+                "state": "turn_finished",
+                "changedAtMs": 1
+            }),
+        );
+        fs::write(temp.path().join("antigravity/broken.json"), b"{not json").unwrap();
+
+        let store = StateStore::new(temp.path().to_path_buf());
+        assert!(store.snapshot(now).workspaces.is_empty());
+        let diagnostics = store.diagnostics(now, "code".into(), "antigravity-ide".into());
+        assert_eq!(diagnostics.valid_antigravity_records, 1);
+        assert_eq!(diagnostics.malformed_antigravity_records, 1);
+    }
+
+    #[test]
+    fn heartbeat_editor_is_a_closed_set_and_cannot_supply_a_launcher() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let now = 30_000;
+        for (id, editor) in [
+            ("standalone-antigravity", "antigravity_2"),
+            ("untrusted", "/tmp/untrusted-editor"),
+        ] {
+            let mut heartbeat = instance(id, &repo, now, false);
+            heartbeat["editor"] = json!(editor);
+            write_json(&temp.path().join(format!("instances/{id}.json")), heartbeat);
+        }
+
+        let store = StateStore::new(temp.path().to_path_buf());
+        assert!(store.snapshot(now).workspaces.is_empty());
+        assert!(store
+            .find_workspace_open_target("standalone-antigravity", now)
+            .is_none());
+        assert!(store.find_workspace_open_target("untrusted", now).is_none());
+        assert_eq!(
+            store
+                .diagnostics(now, "code".into(), "antigravity-ide".into())
+                .malformed_instance_records,
+            2
+        );
+    }
+
+    #[test]
+    fn same_path_from_different_companion_editors_remains_two_workspaces() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("shared-project");
+        fs::create_dir_all(&repo).unwrap();
+        let now = 30_000;
+        for (id, editor) in [
+            ("vscode-window", "vscode"),
+            ("antigravity-window", "antigravity_ide"),
+        ] {
+            let mut heartbeat = instance(id, &repo, now, false);
+            heartbeat["editor"] = json!(editor);
+            write_json(&temp.path().join(format!("instances/{id}.json")), heartbeat);
+        }
+
+        let store = StateStore::new(temp.path().to_path_buf());
+        let snapshot = store.snapshot(now);
+        assert_eq!(snapshot.workspaces.len(), 2);
+        assert!(snapshot
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.editor == EditorKind::VsCode));
+        assert!(snapshot
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.editor == EditorKind::AntigravityIde));
+        assert_eq!(
+            store
+                .find_workspace_open_target("vscode-window", now)
+                .unwrap()
+                .editor,
+            Some(EditorKind::VsCode)
+        );
+        assert_eq!(
+            store
+                .find_workspace_open_target("antigravity-window", now)
+                .unwrap()
+                .editor,
+            Some(EditorKind::AntigravityIde)
         );
     }
 
@@ -1086,7 +1718,7 @@ mod tests {
 
     #[test]
     fn pathless_workspace_explains_that_activity_cannot_be_associated() {
-        let view = aggregate_activity("Codex", &[], &[], None, false, 20_000);
+        let view = aggregate_activity("Codex", &[], &[], None, None, false, 20_000);
         assert_eq!(view.state, "unknown");
         assert_eq!(view.label, "Workspace path needed");
         assert!(view
@@ -1097,7 +1729,7 @@ mod tests {
 
     #[test]
     fn pathless_remote_workspace_explains_the_host_boundary() {
-        let view = aggregate_activity("Claude Code", &[], &[], None, true, 20_000);
+        let view = aggregate_activity("Claude Code", &[], &[], None, None, true, 20_000);
         assert_eq!(view.state, "unknown");
         assert_eq!(view.label, "Remote workspace");
         assert!(view.detail.contains("Remote workspace paths are omitted"));
@@ -1168,7 +1800,9 @@ mod tests {
         assert_eq!(workspace.codex.extension_active, Some(false));
         assert_eq!(workspace.codex.extension_remote, Some(false));
         assert_eq!(
-            store.diagnostics(now, "code".into()).valid_claude_records,
+            store
+                .diagnostics(now, "code".into(), "antigravity-ide".into())
+                .valid_claude_records,
             1
         );
     }
@@ -1214,7 +1848,7 @@ mod tests {
 
         let store = StateStore::new(temp.path().to_path_buf());
         assert_eq!(store.snapshot(now).workspaces.len(), 1);
-        let diagnostics = store.diagnostics(now, "code".into());
+        let diagnostics = store.diagnostics(now, "code".into(), "antigravity-ide".into());
         assert_eq!(diagnostics.malformed_claude_records, 1);
         assert_eq!(diagnostics.valid_claude_records, 0);
     }
@@ -1232,7 +1866,7 @@ mod tests {
         assert!(store.snapshot(123).workspaces.is_empty());
         assert_eq!(
             store
-                .diagnostics(123, "code".into())
+                .diagnostics(123, "code".into(), "antigravity-ide".into())
                 .malformed_instance_records,
             2
         );
@@ -1287,7 +1921,7 @@ mod tests {
     }
 
     #[test]
-    fn open_target_is_resolved_from_trusted_record_not_ui_path() {
+    fn open_target_and_editor_are_resolved_from_trusted_record_not_ui_path() {
         let temp = TempDir::new().unwrap();
         let repo = temp.path().join("repo");
         let missing_repo = temp.path().join("missing-repo");
@@ -1302,13 +1936,14 @@ mod tests {
             instance("missing", &missing_repo, now, false),
         );
         assert_eq!(
-            StateStore::new(temp.path().to_path_buf())
-                .find_open_target("repo", now)
-                .as_deref(),
-            Some(repo.as_path())
+            StateStore::new(temp.path().to_path_buf()).find_workspace_open_target("repo", now),
+            Some(WorkspaceOpenTarget {
+                path: repo,
+                editor: None,
+            })
         );
         assert!(StateStore::new(temp.path().to_path_buf())
-            .find_open_target("unknown", now)
+            .find_workspace_open_target("unknown", now)
             .is_none());
         let snapshot = StateStore::new(temp.path().to_path_buf()).snapshot(now);
         assert!(
@@ -1320,7 +1955,7 @@ mod tests {
                 .openable
         );
         assert!(StateStore::new(temp.path().to_path_buf())
-            .find_open_target("missing", now)
+            .find_workspace_open_target("missing", now)
             .is_none());
     }
 
@@ -1343,13 +1978,21 @@ mod tests {
 
         let store = StateStore::new(temp.path().to_path_buf());
         assert_eq!(
-            store.find_active_open_target("active", now).as_deref(),
-            Some(active_repo.as_path())
+            store.find_active_workspace_open_target("active", now),
+            Some(WorkspaceOpenTarget {
+                path: active_repo,
+                editor: None,
+            })
         );
-        assert!(store.find_active_open_target("retained", now).is_none());
+        assert!(store
+            .find_active_workspace_open_target("retained", now)
+            .is_none());
         assert_eq!(
-            store.find_open_target("retained", now).as_deref(),
-            Some(retained_repo.as_path())
+            store.find_workspace_open_target("retained", now),
+            Some(WorkspaceOpenTarget {
+                path: retained_repo,
+                editor: None,
+            })
         );
     }
 }

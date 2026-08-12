@@ -909,6 +909,8 @@ main {
 }
 
 .workspace-name {
+  min-width: 0;
+  flex: 1 1 auto;
   overflow: hidden;
   color: var(--text);
   font-size: 13px;
@@ -933,6 +935,34 @@ main {
   text-transform: uppercase;
 }
 
+.editor-badge {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  max-width: 112px;
+  overflow: hidden;
+  color: var(--text-faint);
+  font-size: 8px;
+  font-weight: 650;
+  letter-spacing: 0.035em;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.editor-badge[data-editor="antigravity_ide"],
+.editor-badge[data-editor="antigravity_2"] {
+  color: var(--accent-text);
+}
+
+.workspace-meta {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 6px;
+  margin-top: 3px;
+}
+
 .window-badge[data-state="focused"] {
   border-color: var(--accent-border);
   background: var(--accent-soft);
@@ -944,9 +974,15 @@ main {
   color: var(--green-text);
 }
 
+.window-badge[data-state="recent"] {
+  border-color: var(--accent-border);
+  color: var(--accent-text);
+}
+
 .workspace-path {
   display: block;
-  margin-top: 3px;
+  min-width: 0;
+  flex: 1 1 auto;
   overflow: hidden;
   color: var(--text-faint);
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
@@ -966,7 +1002,7 @@ main {
 .provider-state {
   display: grid;
   min-width: 0;
-  grid-template-columns: 48px minmax(0, 1fr);
+  grid-template-columns: 72px minmax(0, 1fr);
   align-items: start;
   gap: 6px;
 }
@@ -1608,7 +1644,8 @@ html[data-workspace-opening="true"] .app-shell {
   font-size: 9px;
 }
 
-.integration-usage-requirement {
+.integration-usage-requirement,
+.integration-activity-limitation {
   margin-top: 8px;
   padding: 7px 8px;
   border: 1px solid var(--divider-subtle);
@@ -1619,7 +1656,8 @@ html[data-workspace-opening="true"] .app-shell {
   line-height: 1.4;
 }
 
-.integration-usage-requirement strong {
+.integration-usage-requirement strong,
+.integration-activity-limitation strong {
   display: block;
   margin-bottom: 2px;
   color: var(--text);
@@ -2218,8 +2256,11 @@ html[data-workspace-opening="true"] .app-shell {
   font-size: 10px;
 }
 
-:root[data-window-mode="floating"] .workspace-path {
+:root[data-window-mode="floating"] .workspace-meta {
   margin-top: 2px;
+}
+
+:root[data-window-mode="floating"] .workspace-path {
   font-size: 9px;
 }
 

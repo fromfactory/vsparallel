@@ -311,7 +311,7 @@ fn read_codex_rate_limits(
 
 /// Send a Codex app-server request using either a selected non-default
 /// executable or, for the `codex` command, the binary bundled with the installed
-/// Codex VS Code extension as a fallback.
+/// Codex extension in VS Code or Antigravity IDE as a fallback.
 pub(crate) fn codex_app_server_request_resolved(
     executable: &OsStr,
     method: &str,
@@ -424,11 +424,28 @@ fn cached_provider_extension_executable(
 }
 
 fn locate_codex_extension_executable() -> Option<PathBuf> {
-    locate_codex_extension_with_cli().or_else(locate_codex_extension_from_registry)
+    choose_newest_extension_executable(
+        locate_codex_extension_with_cli(),
+        locate_codex_extension_from_registry(),
+    )
 }
 
 fn locate_claude_extension_executable() -> Option<PathBuf> {
-    locate_claude_extension_with_cli().or_else(locate_claude_extension_from_registry)
+    choose_newest_extension_executable(
+        locate_claude_extension_with_cli(),
+        locate_claude_extension_from_registry(),
+    )
+}
+
+fn choose_newest_extension_executable(
+    cli: Option<PathBuf>,
+    registry: Option<PathBuf>,
+) -> Option<PathBuf> {
+    [cli, registry].into_iter().flatten().max_by_key(|path| {
+        fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(std::time::UNIX_EPOCH)
+    })
 }
 
 fn locate_codex_extension_with_cli() -> Option<PathBuf> {
@@ -443,43 +460,65 @@ fn locate_extension_with_cli(
     extension_id: &str,
     binary: fn(&Path) -> Option<PathBuf>,
 ) -> Option<PathBuf> {
-    let code_command = crate::opener::code_command();
+    let commands = [
+        OsString::from(crate::opener::code_command()),
+        OsString::from(crate::opener::antigravity_ide_command()),
+    ];
+    locate_extension_with_commands(&ProcessCodeCliRunner, commands, extension_id, binary)
+}
+
+fn locate_extension_with_commands(
+    runner: &impl CodeCliRunner,
+    commands: impl IntoIterator<Item = OsString>,
+    extension_id: &str,
+    binary: fn(&Path) -> Option<PathBuf>,
+) -> Option<PathBuf> {
     let arguments = [
         OsString::from("--locate-extension"),
         OsString::from(extension_id),
     ];
-    let output = ProcessCodeCliRunner
-        .run(OsStr::new(&code_command), &arguments)
-        .ok()?;
-    if !output.success {
-        return None;
+    let mut attempted = Vec::new();
+    for command in commands {
+        if command.is_empty() || attempted.contains(&command) {
+            continue;
+        }
+        attempted.push(command.clone());
+        let Ok(output) = runner.run(command.as_os_str(), &arguments) else {
+            continue;
+        };
+        if output.success {
+            if let Some(executable) = extension_executable_from_output(&output.stdout, binary) {
+                return Some(executable);
+            }
+        }
     }
-    extension_executable_from_output(&output.stdout, binary)
+    None
 }
 
 #[derive(Debug, Deserialize)]
-struct VsCodeExtensionRegistryEntry {
-    identifier: VsCodeExtensionIdentifier,
+struct EditorExtensionRegistryEntry {
+    identifier: EditorExtensionIdentifier,
     #[serde(rename = "relativeLocation")]
     relative_location: Option<String>,
     #[serde(default)]
-    metadata: VsCodeExtensionMetadata,
+    metadata: EditorExtensionMetadata,
 }
 
 #[derive(Debug, Deserialize)]
-struct VsCodeExtensionIdentifier {
+struct EditorExtensionIdentifier {
     id: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
-struct VsCodeExtensionMetadata {
+struct EditorExtensionMetadata {
     #[serde(default, rename = "installedTimestamp")]
     installed_timestamp: u64,
 }
 
-/// VS Code's launcher can be missing from PATH or unusable in a confined
-/// package even while its extensions are available. Its local registry is a
-/// bounded second source for the exact installed extension path.
+/// An editor launcher can be missing from PATH or unusable in a confined
+/// package even while its extensions are available. The bounded local VS Code
+/// and Antigravity IDE registries are a second source for the exact installed
+/// extension path.
 fn locate_codex_extension_from_registry() -> Option<PathBuf> {
     locate_extension_from_registry(CODEX_EXTENSION_ID, codex_extension_binary)
 }
@@ -493,7 +532,15 @@ fn locate_extension_from_registry(
     binary: fn(&Path) -> Option<PathBuf>,
 ) -> Option<PathBuf> {
     let home = platform_home_directory()?;
-    vscode_extension_directories(&home)
+    locate_extension_from_registry_under_home(&home, extension_id, binary)
+}
+
+fn locate_extension_from_registry_under_home(
+    home: &Path,
+    extension_id: &str,
+    binary: fn(&Path) -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    vs_compatible_extension_directories(home)
         .into_iter()
         .filter_map(|directory| extension_from_registry(&directory, extension_id, binary))
         .max_by_key(|(installed_at, _)| *installed_at)
@@ -512,11 +559,12 @@ fn platform_home_directory() -> Option<PathBuf> {
     home.filter(|value| !value.is_empty()).map(PathBuf::from)
 }
 
-fn vscode_extension_directories(home: &Path) -> [PathBuf; 3] {
+fn vs_compatible_extension_directories(home: &Path) -> [PathBuf; 4] {
     [
         home.join(".vscode").join("extensions"),
         home.join(".vscode-insiders").join("extensions"),
         home.join(".vscode-oss").join("extensions"),
+        home.join(".antigravity-ide").join("extensions"),
     ]
 }
 
@@ -549,7 +597,7 @@ fn extension_from_registry(
     if bytes.len() as u64 > VSCODE_EXTENSION_REGISTRY_LIMIT {
         return None;
     }
-    let entries: Vec<VsCodeExtensionRegistryEntry> = serde_json::from_slice(&bytes).ok()?;
+    let entries: Vec<EditorExtensionRegistryEntry> = serde_json::from_slice(&bytes).ok()?;
     entries
         .into_iter()
         .filter(|entry| entry.identifier.id.eq_ignore_ascii_case(extension_id))
@@ -1290,9 +1338,9 @@ fn provider_failure_detail(
     };
     let normalized = error.to_ascii_lowercase();
     let subject = match source {
-        "automatic" => {
-            format!("{provider} from the app PATH or a local VS Code extension")
-        }
+        "automatic" => format!(
+            "{provider} from the app PATH or a local VS Code-compatible editor extension (VS Code or Antigravity IDE)"
+        ),
         "configured" => {
             format!("The {provider} executable selected by {override_variable}")
         }
@@ -1313,7 +1361,7 @@ fn provider_failure_detail(
     }
     if normalized.contains("rejected") || normalized.contains("no result") {
         return format!(
-            "{subject} rejected the usage request. Sign in to the same local account used by VS Code, or update it, then refresh usage."
+            "{subject} rejected the usage request. Sign in to the same local account used by VS Code or Antigravity IDE, or update it, then refresh usage."
         );
     }
     if normalized.contains("malformed")
@@ -1722,6 +1770,7 @@ fn terminate_child(child: &mut Child) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::companion_integration::CliOutput;
     use std::io::Cursor;
     use tempfile::TempDir;
 
@@ -1740,6 +1789,33 @@ mod tests {
     impl ClaudeUsageRunner for FakeClaudeRunner {
         fn read_rate_limits(&self, _executable: &OsStr) -> Result<Value, String> {
             self.0.clone()
+        }
+    }
+
+    struct FakeExtensionCliRunner {
+        antigravity_root: PathBuf,
+        calls: Mutex<Vec<(OsString, Vec<OsString>)>>,
+    }
+
+    impl CodeCliRunner for FakeExtensionCliRunner {
+        fn run(&self, executable: &OsStr, arguments: &[OsString]) -> io::Result<CliOutput> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((executable.to_owned(), arguments.to_vec()));
+            if executable == OsStr::new("antigravity-ide") {
+                Ok(CliOutput {
+                    success: true,
+                    exit_code: Some(0),
+                    stdout: format!("{}\n", self.antigravity_root.display()).into_bytes(),
+                    stderr: Vec::new(),
+                })
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "injected missing editor launcher",
+                ))
+            }
         }
     }
 
@@ -1925,7 +2001,8 @@ mod tests {
             tag_provider_failure("could not start the Codex app-server".to_string(), true);
         let detail =
             provider_failure_detail("Codex", "VSPARALLEL_CODEX_COMMAND", &automatic, "fallback");
-        assert!(detail.contains("app PATH or a local VS Code extension"));
+        assert!(detail.contains("app PATH or a local VS Code-compatible editor extension"));
+        assert!(detail.contains("VS Code or Antigravity IDE"));
 
         let configured = tag_provider_failure("could not start Claude Code".to_string(), false);
         let detail = provider_failure_detail(
@@ -1946,6 +2023,9 @@ mod tests {
         ] {
             let detail = provider_failure_detail("Provider", "OVERRIDE", error, "fallback");
             assert!(detail.contains(expected));
+            if error.contains("rejected") {
+                assert!(detail.contains("VS Code or Antigravity IDE"));
+            }
         }
 
         let detail = provider_failure_detail(
@@ -2143,6 +2223,75 @@ mod tests {
     }
 
     #[test]
+    fn extension_cli_discovery_falls_back_to_antigravity_ide() {
+        let temp = TempDir::new().unwrap();
+        let binary_name = if cfg!(windows) { "codex.exe" } else { "codex" };
+        let platform = if cfg!(target_os = "windows") {
+            "windows"
+        } else if cfg!(target_os = "macos") {
+            "macos"
+        } else {
+            std::env::consts::OS
+        };
+        let architecture = std::env::consts::ARCH;
+        let binary = temp
+            .path()
+            .join("bin")
+            .join(format!("{platform}-{architecture}"))
+            .join(binary_name);
+        fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        fs::write(&binary, b"test binary").unwrap();
+        let runner = FakeExtensionCliRunner {
+            antigravity_root: temp.path().to_owned(),
+            calls: Mutex::new(Vec::new()),
+        };
+
+        assert_eq!(
+            locate_extension_with_commands(
+                &runner,
+                [OsString::from("code"), OsString::from("antigravity-ide")],
+                CODEX_EXTENSION_ID,
+                codex_extension_binary,
+            ),
+            Some(binary)
+        );
+        assert_eq!(
+            runner.calls.lock().unwrap().as_slice(),
+            [
+                (
+                    OsString::from("code"),
+                    vec![
+                        OsString::from("--locate-extension"),
+                        OsString::from(CODEX_EXTENSION_ID),
+                    ],
+                ),
+                (
+                    OsString::from("antigravity-ide"),
+                    vec![
+                        OsString::from("--locate-extension"),
+                        OsString::from(CODEX_EXTENSION_ID),
+                    ],
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn provider_discovery_prefers_the_newer_working_editor_install() {
+        let temp = TempDir::new().unwrap();
+        let older = temp.path().join("vscode-provider");
+        let newer = temp.path().join("antigravity-provider");
+        fs::write(&older, b"old").unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        fs::write(&newer, b"new").unwrap();
+
+        assert_eq!(
+            choose_newest_extension_executable(Some(older), Some(newer.clone())),
+            Some(newer)
+        );
+    }
+
+    #[test]
     fn codex_extension_location_accepts_the_other_macos_architecture() {
         let temp = TempDir::new().unwrap();
         let binary = temp.path().join("bin").join("macos-aarch64").join("codex");
@@ -2250,7 +2399,7 @@ mod tests {
     #[test]
     fn claude_extension_registry_fallback_is_bounded_to_a_child_directory() {
         let temp = TempDir::new().unwrap();
-        let extensions = temp.path().join(".vscode").join("extensions");
+        let extensions = temp.path().join(".antigravity-ide").join("extensions");
         let valid_relative = "anthropic.claude-code-2.1.222-test";
         let binary_name = if cfg!(windows) {
             "claude.exe"
@@ -2284,14 +2433,23 @@ mod tests {
 
         assert_eq!(
             claude_extension_from_registry(&extensions),
-            Some((100, binary))
+            Some((100, binary.clone()))
         );
         assert_eq!(
-            vscode_extension_directories(temp.path()),
+            locate_extension_from_registry_under_home(
+                temp.path(),
+                CLAUDE_EXTENSION_ID,
+                claude_extension_binary,
+            ),
+            Some(binary)
+        );
+        assert_eq!(
+            vs_compatible_extension_directories(temp.path()),
             [
                 temp.path().join(".vscode").join("extensions"),
                 temp.path().join(".vscode-insiders").join("extensions"),
                 temp.path().join(".vscode-oss").join("extensions"),
+                temp.path().join(".antigravity-ide").join("extensions"),
             ]
         );
     }

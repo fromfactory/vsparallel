@@ -121,6 +121,7 @@ struct TrayWorkspaceEntry {
     menu_id: String,
     instance_id: String,
     name: String,
+    editor_name: String,
     status: TrayActivityStatus,
     openable: bool,
 }
@@ -128,9 +129,10 @@ struct TrayWorkspaceEntry {
 impl TrayWorkspaceEntry {
     fn menu_label(&self) -> String {
         format!(
-            "{} {} — {}",
+            "{} {} · {} — {}",
             self.status.marker(),
             escape_menu_mnemonics(&self.name),
+            self.editor_name,
             self.status.label()
         )
     }
@@ -215,7 +217,7 @@ impl TrayMenuController {
                 MenuItem::with_id(
                     app,
                     "tray-empty",
-                    "No active VS Code workspaces",
+                    "No active editor workspaces",
                     false,
                     None::<&str>,
                 )
@@ -445,7 +447,12 @@ fn tray_workspace_entries(snapshot: &Snapshot) -> Vec<TrayWorkspaceEntry> {
             menu_id: stable_workspace_menu_id(&workspace.instance_id),
             instance_id: workspace.instance_id.clone(),
             name: sanitize_workspace_name(&workspace.name),
-            status: aggregate_status(&workspace.codex, &workspace.claude),
+            editor_name: workspace.editor_name.clone(),
+            status: aggregate_status(
+                &workspace.codex,
+                &workspace.claude,
+                workspace.antigravity.as_ref(),
+            ),
             openable: workspace.openable,
         })
         .collect();
@@ -469,14 +476,17 @@ fn stable_workspace_menu_id(instance_id: &str) -> String {
     menu_id
 }
 
-fn aggregate_status(codex: &ActivityView, claude: &ActivityView) -> TrayActivityStatus {
-    let codex = activity_status(codex);
-    let claude = activity_status(claude);
-    if claude.priority() > codex.priority() {
-        claude
-    } else {
-        codex
-    }
+fn aggregate_status(
+    codex: &ActivityView,
+    claude: &ActivityView,
+    antigravity: Option<&ActivityView>,
+) -> TrayActivityStatus {
+    [Some(codex), Some(claude), antigravity]
+        .into_iter()
+        .flatten()
+        .map(activity_status)
+        .max_by_key(|status| status.priority())
+        .unwrap_or(TrayActivityStatus::Unknown)
 }
 
 fn activity_status(activity: &ActivityView) -> TrayActivityStatus {
@@ -556,6 +566,8 @@ mod tests {
     ) -> WorkspaceView {
         WorkspaceView {
             instance_id: instance_id.to_string(),
+            editor: crate::opener::EditorKind::VsCode,
+            editor_name: "VS Code".to_string(),
             name: name.to_string(),
             path: Some("/private/project-path".to_string()),
             openable,
@@ -565,6 +577,7 @@ mod tests {
             remote_window: false,
             last_seen_at_ms: 1,
             started_at_ms: 0,
+            antigravity: None,
             codex: activity(codex, "PRIVATE CODEX DETAIL"),
             claude: activity(claude, "PRIVATE CLAUDE DETAIL"),
         }
@@ -727,7 +740,7 @@ mod tests {
         ];
         for (codex, claude, expected) in cases {
             assert_eq!(
-                aggregate_status(&activity(codex, ""), &activity(claude, "")),
+                aggregate_status(&activity(codex, ""), &activity(claude, ""), None),
                 expected
             );
         }
@@ -753,6 +766,31 @@ mod tests {
         assert!(!label.contains("/private/project-path"));
         assert!(!label.contains("PRIVATE"));
         assert!(entries[0].name.chars().count() <= MAX_WORKSPACE_NAME_CHARS);
+    }
+
+    #[test]
+    fn tray_labels_identify_antigravity_ide_and_include_its_activity() {
+        let mut antigravity_workspace = workspace(
+            "antigravity-window",
+            "shared-project",
+            true,
+            true,
+            true,
+            "unknown",
+            "unknown",
+        );
+        antigravity_workspace.editor = crate::opener::EditorKind::AntigravityIde;
+        antigravity_workspace.editor_name = "Antigravity IDE".to_string();
+        antigravity_workspace.antigravity =
+            Some(activity("activity_detected", "PRIVATE ANTIGRAVITY DETAIL"));
+
+        let entries = tray_workspace_entries(&snapshot(vec![antigravity_workspace]));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].status, TrayActivityStatus::Activity);
+        let label = entries[0].menu_label();
+        assert!(label.contains("Antigravity IDE"));
+        assert!(label.contains("Activity detected"));
+        assert!(!label.contains("PRIVATE"));
     }
 
     #[test]

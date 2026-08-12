@@ -22,6 +22,7 @@ Stored as `instances/<safe-instance-id>.json`:
 {
   "schemaVersion": 1,
   "instanceId": "51adf7cb-d0ee-42a2-8d5d-dc8ef93d74f8",
+  "editor": "antigravity_ide",
   "workspaceName": "example-workspace",
   "workspaceFolders": [
     {
@@ -55,17 +56,22 @@ Stored as `instances/<safe-instance-id>.json`:
 }
 ```
 
-`active` is VS Code's recent-interaction hint; it is not used as liveness.
-VSParallel derives liveness only from `lastSeenAtMs`.
+`editor`, added in companion version 0.4.0, is the closed value `vscode` or
+`antigravity_ide`. It selects a locally configured launcher but never contains
+an executable or command path. Older heartbeats without `editor` remain valid
+and use the historical VS Code behavior. `antigravity_2` is not accepted from
+a companion heartbeat.
+
+`active` is the VS Code-compatible host's recent-interaction hint; it is not
+used as liveness. VSParallel derives liveness only from `lastSeenAtMs`.
 
 `agentExtensions` is additive to schema version 1 and is always included by
-companion version 0.2.0 and later. Each provider entry has three status
-booleans:
+companion version 0.2.0 and later. Each provider entry has these status fields:
 
-- `available`: the public VS Code extension lookup succeeded
-- `installed`: the extension was found for this VS Code window/profile; this
+- `available`: the public VS Code-compatible extension lookup succeeded
+- `installed`: the extension was found for this editor window/profile; this
   does not by itself identify which extension host runs it
-- `active`: VS Code reports that the extension has activated
+- `active`: the editor host reports that the extension has activated
 - `remote`: added in companion 0.3.0; `true` means the installed extension runs
   in the remote/workspace extension host, `false` means the local/UI extension
   host, and `null` means placement is not known or not applicable
@@ -73,8 +79,8 @@ booleans:
 When lookup is unavailable or fails, the three booleans are false and `remote`
 is `null`. A false `available` value distinguishes that case from a successful
 lookup that confirmed the extension is absent. `remoteWindow`, also added in
-companion 0.3.0, says only whether VS Code reports a remote window. It never
-contains the remote name, authority, or host identity.
+companion 0.3.0, says only whether the editor host reports a remote window. It
+never contains the remote name, authority, or host identity.
 Older heartbeats without `agentExtensions`, and 0.2.x heartbeats without the
 placement fields, are still valid. Installation and activation are not agent
 lifecycle signals: in particular, `active: true` does not mean that Codex or
@@ -82,15 +88,26 @@ Claude is processing a turn.
 
 Only local `file` paths are serialized. Remote or virtual workspace URIs and
 their authorities are deliberately omitted; such windows remain listable by
-their VS Code-provided display names but are not openable by VSParallel. The
+their editor-provided display names but are not openable by VSParallel. The
 desktop app, lifecycle hooks, and live usage subprocesses are machine-local;
 this release has no bridge for reading provider state from a remote host.
 
-## Lifecycle record (schema version 1)
+Opening resolves both the target and editor from the validated heartbeat, not
+from UI-supplied path or command data. `vscode` selects
+`VSPARALLEL_CODE_COMMAND`; `antigravity_ide` selects
+`VSPARALLEL_ANTIGRAVITY_IDE_COMMAND`. An active heartbeat asks that editor to
+prefer an existing exact-target window. A retained but inactive heartbeat uses
+`--new-window` for the exact target. The target must still be an existing local
+absolute path. Hook-only Antigravity 2.0 and Antigravity IDE rows never produce
+an open target.
+
+## Lifecycle records (schema version 1)
 
 Codex records are stored as `codex/<sha256-of-session-id>.json`; Claude records
 use the same five-field structure at
-`claude/<sha256-of-session-id>.json`:
+`claude/<sha256-of-session-id>.json`. Antigravity 2.0 records are stored under
+`antigravity/` and Antigravity IDE records under `antigravity-ide/`, each using
+`<sha256-of-conversation-id-NUL-normalized-workspace-path>.json`:
 
 ```json
 {
@@ -102,16 +119,16 @@ use the same five-field structure at
 }
 ```
 
-Allowed on-disk states are `activity_detected`, `turn_finished`,
-`session_ended`, and `failed_or_interrupted`. The Claude adapter writes
-`failed_or_interrupted` for its documented `StopFailure` event. Codex does not
-currently expose a corresponding documented hook, so its adapter produces the
-other three states only. The snapshot derives `unknown` when no usable recent
-record can be associated with a workspace; `unknown` is not written as a
-lifecycle state. The main UI labels an initial absence **No activity yet** and
-reserves **Unknown** for a previous lifecycle signal that has become stale.
+Allowed on-disk states across the three adapters are `activity_detected`,
+`turn_finished`, `session_ended`, `failed_or_interrupted`, `failed`, and
+`interrupted`. Each adapter writes only its subset shown below. The snapshot
+normalizes the last three failure states to **Failed/interrupted** and derives
+`unknown` when no usable recent record can be associated with a workspace;
+`unknown` is not written. The main UI labels an initial absence **No activity
+yet** and reserves **Unknown** for a previous lifecycle signal that has become
+stale.
 
-Both adapters map only documented lifecycle events:
+The adapters map only documented lifecycle events:
 
 | Provider | Event | Recorded state |
 | --- | --- | --- |
@@ -122,9 +139,79 @@ Both adapters map only documented lifecycle events:
 | Claude | `Stop` | `turn_finished` |
 | Claude | `StopFailure` | `failed_or_interrupted` |
 | Claude | `SessionEnd` | `session_ended` |
+| Antigravity | `PreInvocation` | `activity_detected` |
+| Antigravity | `PostToolUse` without an error | `activity_detected` |
+| Antigravity | `PostToolUse` with an error | `failed` |
+| Antigravity | `Stop` with an error or error termination | `failed` |
+| Antigravity | Otherwise `Stop`, interrupted/cancelled | `interrupted` |
+| Antigravity | Otherwise `Stop`, `fullyIdle: false` | `activity_detected` |
+| Antigravity | Otherwise `Stop` | `turn_finished` |
 
-Each adapter hashes the provider session ID and does not retain the raw session
-ID or turn ID.
+Codex and Claude hash the provider session ID and do not retain the raw session
+or turn ID. The Antigravity adapter selects documented `conversationId`,
+`workspacePaths`, `transcriptPath`, and `artifactDirectoryPath` fields, plus
+`error` for `PostToolUse`/`Stop` and `terminationReason`/`fullyIdle` for `Stop`.
+It reduces the transcript path, or the artifact directory as a fallback, to the
+bounded surface `antigravity` or `antigravity-ide` and immediately discards
+both paths; CLI, conflicting, and unrecognized surfaces are not recorded. It
+hashes `conversationId`, writes one record for each distinct valid local path
+in `workspacePaths`, and discards all other payload fields. Its `sessionKey` is
+the conversation hash; including the normalized path in the filename prevents
+one multi-folder project path from replacing another.
+
+Antigravity 2.0, Antigravity IDE, and the Antigravity CLI share the documented
+global hook configuration at `~/.gemini/config/hooks.json`. Their documented
+transcript roots distinguish the product surface, but no hook identifies a
+native window, liveness, focus, or an exact open target. A supported path
+without a matching companion heartbeat is therefore presented as recent and
+non-openable under its identified Antigravity product. These events start in
+the agent execution loop: opening or selecting an Antigravity 2.0 Project alone
+does not produce a record. A workspace `.agents/hooks.json` can take precedence
+over the global configuration.
+
+### Antigravity hook installation
+
+VSParallel manages one top-level entry named `vsparallel` in the documented
+global `~/.gemini/config/hooks.json`. It installs fail-open command handlers for
+`PreInvocation`, `PostToolUse` with matcher `*`, and `Stop`; a recording failure
+never blocks or changes the Antigravity action. Existing unrelated top-level
+entries are preserved. If an unrelated entry already owns the name
+`vsparallel`, installation reports a conflict and leaves the file unchanged.
+
+Before its first change, VSParallel makes the one-time full-file backup
+`~/.gemini/config/hooks.json.vsparallel.bak`. Uninstall removes only a
+recognized VSParallel-owned entry and deliberately retains the backup. After
+uninstalling the integration and confirming the remaining hook configuration,
+the user may delete that backup manually. Existing files under the shared
+state root's `antigravity/`, `antigravity-ide/`, and
+`antigravity-hook-health/` directories are likewise not deleted automatically.
+
+### Antigravity hook execution health
+
+Because a valid installation proves only that the global JSON was written,
+each invocation also atomically replaces one product-specific record in
+`antigravity-hook-health/`. For Antigravity 2.0 the file is
+`antigravity-hook-health/antigravity-2.json`:
+
+```json
+{
+  "schemaVersion": 1,
+  "event": "pre-invocation",
+  "surface": "antigravity_2",
+  "outcome": "recorded",
+  "observedAtMs": 1785800000000,
+  "workspaceCount": 1
+}
+```
+
+The fixed outcomes are `recorded`, `invalid_payload`, `unsupported_surface`,
+`missing_conversation`, `no_workspace`, and `persist_failed`. Health records
+never contain a conversation identifier, workspace path, transcript or
+artifact path, model name, error text, prompt, or response. Setup and
+diagnostics use this record to distinguish **awaiting agent turn** from a hook
+that executed but could not produce an activity row. If the shared state root
+itself is unavailable, the hook remains fail-open and cannot write either the
+activity or health record.
 
 ## Claude Code status-line fallback record (schema version 1)
 
@@ -197,14 +284,15 @@ unexpired last-known value in memory for up to 15 minutes and marks it as stale.
 If the executable is absent, signed out, times out, exposes an incompatible
 control interface, or returns no valid windows, VSParallel falls back to the
 managed status-line record above when that record is usable. Native graphical
-Claude sessions in VS Code do not run `statusLine`; the active query is what
-makes usage available for those sessions. `VSPARALLEL_CLAUDE_COMMAND` can
+Claude sessions in VS Code-compatible editors do not run `statusLine`; the
+active query is what makes usage available for those sessions.
+`VSPARALLEL_CLAUDE_COMMAND` can
 select a different executable; otherwise VSParallel can use either `claude`
-from `PATH` or the executable bundled with the installed Claude VS Code
-extension, trying the other source if the first query fails. It locates the
-bundled source through the VS Code launcher or, when the launcher is
-unavailable, a bounded read of the local extension registry for the exact
-Anthropic extension entry.
+from `PATH` or the executable bundled with the installed Claude extension in VS
+Code or Antigravity IDE, trying the other source if the first query fails. It
+locates the bundled source through either configured editor launcher or, when
+the launchers are unavailable, a bounded read of the local extension registries
+described below.
 
 ## Codex hook review status (not persisted)
 
@@ -236,8 +324,22 @@ as unavailable. The UI may retain a recent, unexpired last-known value in memory
 for up to 15 minutes and marks it as stale; it is never written to disk.
 `VSPARALLEL_CODEX_COMMAND` can select a different executable; otherwise
 VSParallel tries `codex` from `PATH` and the executable bundled with a locally
-installed Codex VS Code extension. An explicit `VSPARALLEL_CODEX_COMMAND` is
-used literally and does not enable bundled-extension fallback.
+installed Codex extension in VS Code or Antigravity IDE. An explicit
+`VSPARALLEL_CODEX_COMMAND` is used literally and does not enable
+bundled-extension fallback.
+
+For bundled-provider discovery, VSParallel first invokes the configured
+`VSPARALLEL_CODE_COMMAND` and `VSPARALLEL_ANTIGRAVITY_IDE_COMMAND` launchers
+with the supported extension-location argument. If that fails, it reads only
+the exact provider entries in these local registry files:
+
+- `~/.vscode/extensions/extensions.json`
+- `~/.vscode-insiders/extensions/extensions.json`
+- `~/.vscode-oss/extensions/extensions.json`
+- `~/.antigravity-ide/extensions/extensions.json`
+
+The resulting extension path may be cached in process memory but is not
+persisted.
 
 ## Privacy invariant
 
@@ -251,5 +353,6 @@ status-line adapter likewise creates the minimal usage record shown above and
 does not represent or persist the accompanying session ID, working directory,
 model, cost, repository data, or transcript path. Live Codex and Claude usage
 remains in memory only, and VSParallel never reads or stores provider
-credentials. Only the minimal Claude status-line fallback record is persisted.
+credentials. Of the usage responses, only the minimal Claude status-line
+fallback record is persisted; live usage responses remain memory-only.
 Automated Rust and JavaScript tests assert these boundaries.

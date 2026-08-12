@@ -1,3 +1,4 @@
+mod antigravity_integration;
 mod claude_integration;
 mod codex_integration;
 mod companion_integration;
@@ -6,12 +7,16 @@ mod state;
 mod tray;
 mod usage;
 
+pub use antigravity_integration::{run_antigravity_hook_stdio, AntigravityHookEvent};
 pub use claude_integration::run_claude_hook_stdio;
 pub use codex_integration::run_codex_hook_stdio;
 pub use usage::{run_claude_statusline_stdio, CLAUDE_STATUSLINE_ARGUMENT};
 
 use companion_integration::{CompanionOperationResult, CompanionStatus, CompanionStatusState};
-use opener::{code_command, open_with, ProcessWorkspaceLauncher, WorkspaceLaunchMode};
+use opener::{
+    antigravity_ide_command, code_command, open_editor_with, ProcessWorkspaceLauncher,
+    WorkspaceLaunchMode,
+};
 use serde::Serialize;
 use state::{now_ms, Diagnostics, Snapshot, StateStore};
 use std::ffi::OsStr;
@@ -150,6 +155,8 @@ struct LifecycleIntegrationView {
 struct IntegrationStatusView {
     schema_version: u32,
     companion: CompanionIntegrationView,
+    antigravity_ide: CompanionIntegrationView,
+    antigravity: LifecycleIntegrationView,
     codex: LifecycleIntegrationView,
     claude: LifecycleIntegrationView,
     requires_restart: bool,
@@ -178,7 +185,8 @@ fn current_snapshot() -> Result<Snapshot, String> {
 async fn get_diagnostics() -> Result<Diagnostics, String> {
     run_background(|| {
         let command = code_command();
-        Ok(StateStore::from_environment()?.diagnostics(now_ms(), command))
+        let antigravity_command = antigravity_ide_command();
+        Ok(StateStore::from_environment()?.diagnostics(now_ms(), command, antigravity_command))
     })
     .await
 }
@@ -206,6 +214,40 @@ async fn uninstall_companion() -> Result<IntegrationStatusView, String> {
         let result = companion_integration::uninstall_companion(OsStr::new(&command))?;
         let status = verified_companion_status(result)?;
         Ok(build_integration_status_with_companion(status, true))
+    })
+    .await
+}
+
+#[tauri::command]
+async fn install_antigravity_ide_companion() -> Result<IntegrationStatusView, String> {
+    run_background(|| {
+        let command = antigravity_ide_command();
+        let result = companion_integration::install_companion_for_editor(
+            OsStr::new(&command),
+            "Antigravity IDE",
+            companion_integration::ANTIGRAVITY_IDE_PROFILE_ENV,
+        )?;
+        let status = verified_companion_status(result)?;
+        Ok(build_integration_status_with_antigravity_ide_companion(
+            status, true,
+        ))
+    })
+    .await
+}
+
+#[tauri::command]
+async fn uninstall_antigravity_ide_companion() -> Result<IntegrationStatusView, String> {
+    run_background(|| {
+        let command = antigravity_ide_command();
+        let result = companion_integration::uninstall_companion_for_editor(
+            OsStr::new(&command),
+            "Antigravity IDE",
+            companion_integration::ANTIGRAVITY_IDE_PROFILE_ENV,
+        )?;
+        let status = verified_companion_status(result)?;
+        Ok(build_integration_status_with_antigravity_ide_companion(
+            status, true,
+        ))
     })
     .await
 }
@@ -254,6 +296,45 @@ async fn uninstall_claude_hooks() -> Result<IntegrationStatusView, String> {
     .await
 }
 
+#[tauri::command]
+async fn install_antigravity_hooks() -> Result<IntegrationStatusView, String> {
+    run_background(|| {
+        let config_dir = antigravity_integration::antigravity_config_dir_from_environment()?;
+        let executable = integration_executable()?;
+        let change =
+            antigravity_integration::install_antigravity_integration(&config_dir, &executable)?;
+        verify_antigravity_change(&change, true)?;
+        Ok(build_integration_status(true))
+    })
+    .await
+}
+
+#[tauri::command]
+async fn uninstall_antigravity_hooks() -> Result<IntegrationStatusView, String> {
+    run_background(|| {
+        let config_dir = antigravity_integration::antigravity_config_dir_from_environment()?;
+        let executable = integration_executable()?;
+        let change =
+            antigravity_integration::uninstall_antigravity_integration(&config_dir, &executable)?;
+        verify_antigravity_change(&change, false)?;
+        Ok(build_integration_status(true))
+    })
+    .await
+}
+
+fn verify_antigravity_change(
+    change: &antigravity_integration::AntigravityIntegrationChange,
+    expected_installed: bool,
+) -> Result<(), String> {
+    if change.status.installed == expected_installed
+        && (expected_installed || change.status.state == "not_installed")
+    {
+        Ok(())
+    } else {
+        Err(change.status.message.clone())
+    }
+}
+
 async fn run_background<T, F>(operation: F) -> Result<T, String>
 where
     T: Send + 'static,
@@ -265,21 +346,47 @@ where
 }
 
 fn build_integration_status(requires_restart: bool) -> IntegrationStatusView {
-    let command = code_command();
-    let companion_status = companion_integration::companion_status(OsStr::new(&command));
-    build_integration_status_with_companion(companion_status, requires_restart)
+    build_integration_status_with_companions(None, None, requires_restart)
 }
 
 fn build_integration_status_with_companion(
     companion_status: CompanionStatus,
     requires_restart: bool,
 ) -> IntegrationStatusView {
+    build_integration_status_with_companions(Some(companion_status), None, requires_restart)
+}
+
+fn build_integration_status_with_antigravity_ide_companion(
+    companion_status: CompanionStatus,
+    requires_restart: bool,
+) -> IntegrationStatusView {
+    build_integration_status_with_companions(None, Some(companion_status), requires_restart)
+}
+
+fn build_integration_status_with_companions(
+    companion_status: Option<CompanionStatus>,
+    antigravity_ide_status: Option<CompanionStatus>,
+    requires_restart: bool,
+) -> IntegrationStatusView {
+    let companion_status = companion_status
+        .unwrap_or_else(|| companion_integration::companion_status(OsStr::new(&code_command())));
+    let antigravity_ide_status = antigravity_ide_status.unwrap_or_else(|| {
+        companion_integration::companion_status_for_editor(
+            OsStr::new(&antigravity_ide_command()),
+            "Antigravity IDE",
+            companion_integration::ANTIGRAVITY_IDE_PROFILE_ENV,
+        )
+    });
     let companion = companion_view(companion_status);
+    let antigravity_ide = companion_view_for(antigravity_ide_status, "Antigravity IDE");
+    let antigravity = antigravity_view();
     let codex = codex_view();
     let claude = claude_view();
     IntegrationStatusView {
         schema_version: INTEGRATION_SCHEMA_VERSION,
         companion,
+        antigravity_ide,
+        antigravity,
         codex,
         claude,
         requires_restart,
@@ -295,37 +402,45 @@ fn verified_companion_status(result: CompanionOperationResult) -> Result<Compani
 }
 
 fn companion_view(status: CompanionStatus) -> CompanionIntegrationView {
-    let (state, label, fallback_detail) = match status.state {
+    companion_view_for(status, "VS Code")
+}
+
+fn companion_view_for(status: CompanionStatus, editor_name: &str) -> CompanionIntegrationView {
+    let (state, label, fallback_detail): (&str, String, String) = match status.state {
         CompanionStatusState::Current => (
             "installed",
-            "Installed",
-            "The VS Code companion is installed and current.",
+            "Installed".to_string(),
+            format!("The {editor_name} companion is installed and current."),
         ),
         CompanionStatusState::DifferentVersion => (
             "outdated",
-            "Update available",
-            "The installed VS Code companion differs from the version bundled with VSParallel.",
+            "Update available".to_string(),
+            format!(
+                "The installed {editor_name} companion differs from the version bundled with VSParallel."
+            ),
         ),
         CompanionStatusState::VersionUnknown => (
             "repair_needed",
-            "Repair needed",
-            "VS Code reports the companion, but its installed version could not be verified.",
+            "Repair needed".to_string(),
+            format!(
+                "{editor_name} reports the companion, but its installed version could not be verified."
+            ),
         ),
         CompanionStatusState::NotInstalled => (
             "not_installed",
-            "Not installed",
-            "The VS Code companion is not installed.",
+            "Not installed".to_string(),
+            format!("The {editor_name} companion is not installed."),
         ),
         CompanionStatusState::Unavailable => (
             "unavailable",
-            "VS Code unavailable",
-            "VSParallel could not query the VS Code extension installation.",
+            format!("{editor_name} unavailable"),
+            format!("VSParallel could not query the {editor_name} extension installation."),
         ),
     };
     CompanionIntegrationView {
         state: state.to_string(),
-        label: label.to_string(),
-        detail: status.detail.unwrap_or_else(|| fallback_detail.to_string()),
+        label,
+        detail: status.detail.unwrap_or(fallback_detail),
         installed_version: status.installed_version,
         target_version: status.bundled_version,
     }
@@ -481,6 +596,127 @@ fn unavailable_claude_view(error: String, config_path: Option<String>) -> Lifecy
     }
 }
 
+fn antigravity_view() -> LifecycleIntegrationView {
+    let config_dir = match antigravity_integration::antigravity_config_dir_from_environment() {
+        Ok(path) => path,
+        Err(error) => return unavailable_antigravity_view(error, None),
+    };
+    let config_path = Some(config_dir.join("hooks.json").to_string_lossy().into_owned());
+    let executable = match integration_executable() {
+        Ok(path) => path,
+        Err(error) => return unavailable_antigravity_view(error, config_path),
+    };
+    match antigravity_integration::antigravity_integration_status(&config_dir, &executable) {
+        Ok(status) => {
+            let (state, label, detail) = if status.hooks_disabled && status.installed {
+                (
+                    "repair_needed",
+                    "Installed · hooks disabled".to_string(),
+                    status.message,
+                )
+            } else if status.hooks_disabled && status.state == "not_installed" {
+                (
+                    "not_installed",
+                    "Not installed · hooks disabled".to_string(),
+                    status.message,
+                )
+            } else if status.hooks_disabled {
+                (
+                    "repair_needed",
+                    "Repair needed · hooks disabled".to_string(),
+                    status.message,
+                )
+            } else {
+                match status.state.as_str() {
+                    "installed" => {
+                        let (label, detail) = antigravity_installed_copy();
+                        ("installed", label, detail)
+                    }
+                    "not_installed" => {
+                        ("not_installed", "Not installed".to_string(), status.message)
+                    }
+                    "stale" => (
+                        "repair_needed",
+                        "Update available".to_string(),
+                        status.message,
+                    ),
+                    "partial" => ("repair_needed", "Repair needed".to_string(), status.message),
+                    _ => (
+                        "unavailable",
+                        "Status unavailable".to_string(),
+                        status.message,
+                    ),
+                }
+            };
+            LifecycleIntegrationView {
+                state: state.to_string(),
+                label,
+                detail,
+                config_path: Some(status.config_path),
+                review_required: None,
+            }
+        }
+        Err(error) => unavailable_antigravity_view(
+            format!("VSParallel could not safely read the Antigravity hook configuration: {error}"),
+            config_path,
+        ),
+    }
+}
+
+fn antigravity_installed_copy() -> (String, String) {
+    const FIRST_TURN_GUIDANCE: &str = "Opening a Project alone does not run lifecycle hooks; start a new Antigravity 2.0 agent turn. A Project-level .agents/hooks.json can override this global hook.";
+    let observation = state::state_dir_from_environment().and_then(|root| {
+        antigravity_integration::antigravity_two_hook_observation(&root, now_ms())
+    });
+    match observation {
+        Ok(Some(observation))
+            if observation.outcome
+                == antigravity_integration::AntigravityHookOutcome::Recorded =>
+        {
+            (
+                "Installed · event observed".to_string(),
+                format!(
+                    "Antigravity 2.0 activity monitoring is installed; the latest {} event recorded {} workspace path{}. Hook rows show recent agent activity, not a live window.",
+                    observation.event,
+                    observation.workspace_count,
+                    if observation.workspace_count == 1 { "" } else { "s" },
+                ),
+            )
+        }
+        Ok(Some(observation)) => (
+            "Installed · hook issue".to_string(),
+            format!(
+                "Antigravity 2.0 ran the hook, but {}; {}",
+                observation.outcome.user_message(),
+                FIRST_TURN_GUIDANCE
+            ),
+        ),
+        Ok(None) => (
+            "Installed · awaiting agent turn".to_string(),
+            format!("Antigravity activity monitoring is configured. {FIRST_TURN_GUIDANCE}"),
+        ),
+        Err(_) => (
+            "Installed · observation unavailable".to_string(),
+            format!(
+                "Antigravity activity monitoring is configured, but its local execution-health record could not be read. {FIRST_TURN_GUIDANCE}"
+            ),
+        ),
+    }
+}
+
+fn unavailable_antigravity_view(
+    error: String,
+    config_path: Option<String>,
+) -> LifecycleIntegrationView {
+    LifecycleIntegrationView {
+        state: "unavailable".to_string(),
+        label: "Status unavailable".to_string(),
+        detail: error,
+        config_path,
+        review_required: None,
+    }
+}
+
 fn integration_executable() -> Result<PathBuf, String> {
     #[cfg(target_os = "linux")]
     if let Some(app_image) = std::env::var_os("APPIMAGE").filter(|value| !value.is_empty()) {
@@ -502,7 +738,7 @@ fn validate_macos_integration_location(path: &Path) -> Result<(), String> {
     );
     if mounted_volume || app_translocation {
         return Err(
-            "VSParallel is running from a temporary macOS location. Copy VSParallel.app to /Applications, relaunch it there, then use Repair for both the Codex and Claude Code integrations."
+            "VSParallel is running from a temporary macOS location. Copy VSParallel.app to /Applications, relaunch it there, then use Repair for the Antigravity, Codex, and Claude Code lifecycle integrations."
                 .to_string(),
         );
     }
@@ -870,7 +1106,7 @@ fn set_macos_floating_behavior(window: &tauri::WebviewWindow) -> Result<(), Stri
                 native_window.setCollectionBehavior(behavior);
                 native_window.setHidesOnDeactivate(false);
                 // Unlike `show`, this orders the panel above other apps without making it key
-                // and taking keyboard focus back from VS Code.
+                // and taking keyboard focus back from the selected editor.
                 native_window.orderFrontRegardless();
             }
         })
@@ -1181,7 +1417,7 @@ async fn wait_for_floating_panel_ready(window: &tauri::WebviewWindow) -> Result<
                 && minimizable
                 && floating_panel_size_is_ready(size, scale_factor)
             {
-                // Keep a small compositor turn between the sticky-window request and VS Code's
+                // Keep a small compositor turn between the sticky-window request and the editor's
                 // focus request. This closes the cross-desktop race on X11 and macOS Spaces.
                 std::thread::sleep(Duration::from_millis(40));
                 return Ok(());
@@ -1197,7 +1433,7 @@ async fn wait_for_floating_panel_ready(window: &tauri::WebviewWindow) -> Result<
             }
             if !always_on_top {
                 window.set_always_on_top(true).map_err(|error| {
-                    format!("could not keep the VSParallel panel above VS Code: {error}")
+                    format!("could not keep the VSParallel panel above the editor: {error}")
                 })?;
             }
             #[cfg(target_os = "macos")]
@@ -1223,7 +1459,7 @@ async fn wait_for_floating_panel_ready(window: &tauri::WebviewWindow) -> Result<
         let minimizable = true;
         if !visible || minimized || !minimizable {
             return Err(
-                "VSParallel could not make the floating panel visible and minimizable before opening VS Code"
+                "VSParallel could not make the floating panel visible and minimizable before opening the editor"
                     .to_string(),
             );
         }
@@ -1282,7 +1518,7 @@ fn apply_floating_panel_presentation(
     apply_floating_window_effect(window, &theme)?;
     window
         .set_always_on_top(true)
-        .map_err(|error| format!("could not keep the floating panel above VS Code: {error}"))?;
+        .map_err(|error| format!("could not keep the floating panel above the editor: {error}"))?;
     window
         .set_visible_on_all_workspaces(true)
         .map_err(|error| {
@@ -1676,17 +1912,17 @@ async fn open_workspace(
     instance_id: String,
     app: tauri::AppHandle,
 ) -> Result<WindowChromeState, String> {
-    let (target, launch_mode) = run_background(move || {
+    let (open_target, launch_mode) = run_background(move || {
         let store = StateStore::from_environment()?;
         let now = now_ms();
-        if let Some(target) = store.find_active_open_target(&instance_id, now) {
+        if let Some(target) = store.find_active_workspace_open_target(&instance_id, now) {
             return Ok((target, WorkspaceLaunchMode::PreferExisting));
         }
         store
-            .find_open_target(&instance_id, now)
+            .find_workspace_open_target(&instance_id, now)
             .map(|target| (target, WorkspaceLaunchMode::NewWindow))
             .ok_or_else(|| {
-                "the selected VS Code workspace is no longer available or has no local open target"
+                "the selected workspace is no longer available or has no supported local open target"
                     .to_string()
             })
     })
@@ -1696,45 +1932,52 @@ async fn open_workspace(
     let presentation = app.state::<WindowPresentationState>();
     let panel_generation = enter_floating_panel(&window, &presentation).await?;
 
-    let command = code_command();
-    let watchdog_editor_executable = command.clone();
     let launch_result = run_background(move || {
-        open_with(&ProcessWorkspaceLauncher, &command, &target, launch_mode)
+        open_editor_with(
+            &ProcessWorkspaceLauncher,
+            open_target.editor,
+            &open_target.path,
+            launch_mode,
+        )
     })
     .await;
-    if let Err(error) = launch_result {
-        let restore_result = restore_full_window_state(&window, &presentation, true);
-        return match restore_result {
-            Ok(()) => Err(error),
-            Err(restore_error) => Err(format!(
-                "{error}; VSParallel also could not restore its full window: {restore_error}"
-            )),
-        };
-    }
+    let watchdog_editor_executable = match launch_result {
+        Ok(command) => command,
+        Err(error) => {
+            let restore_result = restore_full_window_state(&window, &presentation, true);
+            return match restore_result {
+                Ok(()) => Err(error),
+                Err(restore_error) => Err(format!(
+                    "{error}; VSParallel also could not restore its full window: {restore_error}"
+                )),
+            };
+        }
+    };
 
-    // VS Code may activate an existing window on another desktop or full-screen Space after its
-    // CLI process has already returned. A bounded, non-focusing watchdog follows that delayed
+    // A compatible editor may activate an existing window on another desktop or full-screen
+    // Space after its CLI process has already returned. A bounded, non-focusing watchdog follows that delayed
     // activation and repairs visibility without taking keyboard focus away from the editor.
     schedule_floating_panel_watchdog(app.clone(), panel_generation, watchdog_editor_executable);
 
-    // The VS Code launch is deliberately the final focus-affecting action. Reading state here
+    // The editor launch is deliberately the final focus-affecting action. Reading state here
     // does not bring VSParallel back in front.
     read_window_chrome_state(&window, &presentation)
 }
 
 fn activate_tray_workspace(instance_id: &str) -> Result<(), String> {
     let target = StateStore::from_environment()?
-        .find_active_open_target(instance_id, now_ms())
+        .find_active_workspace_open_target(instance_id, now_ms())
         .ok_or_else(|| {
-            "the selected VS Code workspace is no longer active or has no local open target"
+            "the selected workspace is no longer active or has no supported local open target"
                 .to_string()
         })?;
-    open_with(
+    open_editor_with(
         &ProcessWorkspaceLauncher,
-        &code_command(),
-        &target,
+        target.editor,
+        &target.path,
         WorkspaceLaunchMode::PreferExisting,
     )
+    .map(|_| ())
 }
 
 fn mark_floating_panel_hidden(
@@ -2001,10 +2244,14 @@ pub fn run() {
             get_integration_status,
             install_companion,
             uninstall_companion,
+            install_antigravity_ide_companion,
+            uninstall_antigravity_ide_companion,
             install_codex_hooks,
             uninstall_codex_hooks,
             install_claude_hooks,
             uninstall_claude_hooks,
+            install_antigravity_hooks,
+            uninstall_antigravity_hooks,
             open_workspace,
             hide_window,
             get_window_chrome_state,
@@ -2039,7 +2286,7 @@ mod tests {
         CompanionStatus {
             state,
             extension_id: companion_integration::EXTENSION_ID.to_string(),
-            bundled_version: Some("0.3.0".to_string()),
+            bundled_version: Some("0.4.0".to_string()),
             installed_version: None,
             detail: None,
         }
@@ -2351,11 +2598,11 @@ mod tests {
     #[test]
     fn maps_companion_states_to_the_versioned_setup_contract() {
         let current = companion_view(CompanionStatus {
-            installed_version: Some("0.3.0".to_string()),
+            installed_version: Some("0.4.0".to_string()),
             ..companion_status(CompanionStatusState::Current)
         });
         assert_eq!(current.state, "installed");
-        assert_eq!(current.target_version.as_deref(), Some("0.3.0"));
+        assert_eq!(current.target_version.as_deref(), Some("0.4.0"));
 
         assert_eq!(
             companion_view(companion_status(CompanionStatusState::DifferentVersion)).state,
@@ -2423,6 +2670,37 @@ mod tests {
     }
 
     #[test]
+    fn antigravity_hook_changes_are_verified_before_setup_reports_success() {
+        let change = |state: &str, installed: bool, message: &str| {
+            antigravity_integration::AntigravityIntegrationChange {
+                changed: false,
+                migrated: false,
+                status: antigravity_integration::AntigravityIntegrationStatus {
+                    state: state.to_string(),
+                    installed,
+                    config_path: "/config/hooks.json".to_string(),
+                    backup_path: "/config/hooks.json.vsparallel.bak".to_string(),
+                    event_states: std::collections::BTreeMap::new(),
+                    hooks_disabled: false,
+                    message: message.to_string(),
+                },
+            }
+        };
+
+        assert!(verify_antigravity_change(&change("installed", true, "installed"), true).is_ok());
+        assert!(
+            verify_antigravity_change(&change("not_installed", false, "not installed"), false,)
+                .is_ok()
+        );
+        let error = verify_antigravity_change(
+            &change("conflict", false, "Rename the unrelated entry"),
+            false,
+        )
+        .unwrap_err();
+        assert!(error.contains("Rename"));
+    }
+
+    #[test]
     fn setup_contract_serializes_both_optional_lifecycle_integrations() {
         let lifecycle = LifecycleIntegrationView {
             state: "not_installed".to_string(),
@@ -2436,6 +2714,11 @@ mod tests {
         let status = IntegrationStatusView {
             schema_version: INTEGRATION_SCHEMA_VERSION,
             companion: companion_view(companion_status(CompanionStatusState::NotInstalled)),
+            antigravity_ide: companion_view_for(
+                companion_status(CompanionStatusState::NotInstalled),
+                "Antigravity IDE",
+            ),
+            antigravity: lifecycle.clone(),
             codex,
             claude: lifecycle,
             requires_restart: false,
@@ -2448,5 +2731,7 @@ mod tests {
         assert!(serialized["claude"]["reviewRequired"].is_null());
         assert_eq!(serialized["claude"]["state"], "not_installed");
         assert!(serialized["companion"].is_object());
+        assert!(serialized["antigravityIde"].is_object());
+        assert_eq!(serialized["antigravity"]["state"], "not_installed");
     }
 }
