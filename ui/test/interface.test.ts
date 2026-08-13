@@ -472,7 +472,7 @@ test("workspaces render as cards in single Open and Recent sections", () => {
   );
 });
 
-test("workspace application labels are prominent without theming the entire card", () => {
+test("workspace names lead the application label hierarchy without theming the entire card", () => {
   const javascript = read("ui/generated/app.js");
   const css = read("ui/styles.css");
   const createRow = sliceBetween(
@@ -498,8 +498,15 @@ test("workspace application labels are prominent without theming the entire card
 
   const applicationLabel = css.match(/\.workspace-application\s*\{([^}]*)\}/i)?.[1];
   assert.ok(applicationLabel, "application labels should have dedicated styling");
-  assert.match(applicationLabel, /font-size\s*:\s*11px/i);
-  assert.match(applicationLabel, /font-weight\s*:\s*720/i);
+  assert.match(applicationLabel, /font-size\s*:\s*9px/i);
+  assert.match(applicationLabel, /font-weight\s*:\s*680/i);
+  assert.match(applicationLabel, /line-height\s*:\s*14px/i);
+
+  const workspaceName = css.match(/\.workspace-name\s*\{([^}]*)\}/i)?.[1];
+  assert.ok(workspaceName, "workspace names should have dedicated styling");
+  assert.match(workspaceName, /font-size\s*:\s*15px/i);
+  assert.match(workspaceName, /font-weight\s*:\s*680/i);
+  assert.match(workspaceName, /line-height\s*:\s*20px/i);
   assert.match(css, /\.workspace-row\.is-inactive\s*\{[^}]*opacity\s*:\s*1\s*;/i);
   assert.doesNotMatch(
     css,
@@ -507,7 +514,7 @@ test("workspace application labels are prominent without theming the entire card
   );
   assert.match(
     css,
-    /data-window-mode="floating"\][^{}]*\.workspace-application\s*\{[^}]*font-size\s*:\s*10px/i,
+    /data-window-mode="floating"\][^{}]*\.workspace-application\s*\{[^}]*font-size\s*:\s*9px/i,
   );
 
   assert.doesNotMatch(css, /\.workspace-row\[data-editor=/i);

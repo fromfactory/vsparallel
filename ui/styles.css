@@ -904,15 +904,15 @@ main {
   max-width: 100%;
   align-items: center;
   margin-bottom: 5px;
-  padding: 0 7px;
+  padding: 0 6px;
   overflow: hidden;
   border: 1px solid var(--border-strong);
   border-radius: 999px;
   color: var(--text-subtle);
-  font-size: 11px;
-  font-weight: 720;
+  font-size: 9px;
+  font-weight: 680;
   letter-spacing: 0.015em;
-  line-height: 18px;
+  line-height: 14px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -944,9 +944,10 @@ main {
   flex: 1 1 auto;
   overflow: hidden;
   color: var(--text);
-  font-size: 13px;
-  font-weight: 630;
+  font-size: 15px;
+  font-weight: 680;
   letter-spacing: -0.01em;
+  line-height: 20px;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -2286,8 +2287,8 @@ html[data-workspace-opening="true"] .app-shell {
 
 :root[data-window-mode="floating"] .workspace-application {
   margin-bottom: 2px;
-  padding: 0 5px;
-  font-size: 10px;
+  padding: 0 4px;
+  font-size: 9px;
   line-height: 14px;
 }
 
