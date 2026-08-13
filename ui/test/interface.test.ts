@@ -850,7 +850,7 @@ test("the primary palette is VS Code blue in dark and light themes", () => {
   );
 });
 
-test("workspace rows omit redundant leading status icons while keeping provider details", () => {
+test("workspace rows omit redundant leading lifecycle icons while keeping provider details", () => {
   const javascript = read("ui/generated/app.js");
   const css = read("ui/styles.css");
   const createRow = sliceBetween(
@@ -887,6 +887,44 @@ test("workspace rows omit redundant leading status icons while keeping provider 
   const providerName = css.match(/\.provider-name\s*\{([^}]*)\}/i)?.[1];
   assert.ok(providerName, "provider names should have dedicated styling");
   assert.match(providerName, /text-overflow\s*:\s*ellipsis/i);
+});
+
+test("focused workspaces use a compact illuminated indicator beside the title", () => {
+  const javascript = read("ui/generated/app.js");
+  const css = read("ui/styles.css");
+  const createRow = sliceBetween(
+    javascript,
+    /function\s+createWorkspaceRow\s*\(/,
+    /function\s+groupWorkspaces\s*\(/,
+    "createWorkspaceRow",
+  );
+
+  assert.match(
+    createRow,
+    /if\s*\(workspace\.focused\)\s*\{\s*const\s+focused\s*=\s*createElement\(\s*["']span["']\s*,\s*["']workspace-focus["']\s*\)/,
+  );
+  assert.match(createRow, /focused\.setAttribute\(\s*["']aria-hidden["']\s*,\s*["']true["']\s*\)/);
+  assert.doesNotMatch(
+    createRow,
+    /createElement\(\s*["']span["']\s*,\s*["']workspace-focus["']\s*,\s*["']Focused["']\s*\)/,
+  );
+
+  const indicatorAppend = createRow.indexOf("titleLine.append(focused)");
+  const nameAppend = createRow.indexOf("titleLine.append(name)");
+  assert.ok(indicatorAppend >= 0, "the focus indicator should be added to the title line");
+  assert.ok(
+    indicatorAppend < nameAppend,
+    "the focus indicator should sit consistently before the workspace name",
+  );
+
+  const focusLight = css.match(/\.workspace-focus\s*\{([^}]*)\}/i)?.[1];
+  assert.ok(focusLight, "the focus indicator should have dedicated styling");
+  assert.match(focusLight, /width\s*:\s*7px/i);
+  assert.match(focusLight, /height\s*:\s*7px/i);
+  assert.match(focusLight, /border-radius\s*:\s*50%/i);
+  assert.match(focusLight, /background\s*:\s*var\(--accent\)/i);
+  assert.match(focusLight, /box-shadow\s*:/i);
+  assert.doesNotMatch(focusLight, /font-|letter-spacing|text-transform|padding/i);
 });
 
 test("workspace rows render one model-free status for the compact panel", () => {
@@ -1108,10 +1146,6 @@ test("workspace rows use a transparent native full-card action without visible O
   assert.match(
     createRow,
     /openable[\s\S]*?`\$\{actionLabel\} \$\{workspace\.name\} in \$\{workspace\.editorName\}\$\{focusContext\}`[\s\S]*?cannot currently be opened/,
-  );
-  assert.match(
-    createRow,
-    /workspace\.focused[\s\S]*?createElement\(\s*["']span["']\s*,\s*["']workspace-focus["']\s*,\s*["']Focused["']\s*\)/,
   );
   assert.match(createRow, /openButton\.title\s*=\s*workspace\.recentlyActive/);
   assert.match(createRow, /hook activity does not identify a live window or exact open target/);

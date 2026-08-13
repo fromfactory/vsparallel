@@ -952,19 +952,15 @@ main {
 }
 
 .workspace-focus {
-  display: inline-flex;
-  flex: 0 0 auto;
-  align-items: center;
-  padding: 0 6px;
-  border: 1px solid var(--accent-border);
-  border-radius: 999px;
-  background: var(--accent-soft);
-  color: var(--accent-text);
-  font-size: 8px;
-  font-weight: 650;
-  letter-spacing: 0.04em;
-  line-height: 16px;
-  text-transform: uppercase;
+  display: block;
+  width: 7px;
+  height: 7px;
+  flex: 0 0 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow:
+    0 0 0 2px var(--accent-soft-strong),
+    0 0 8px var(--accent);
 }
 
 .workspace-meta {

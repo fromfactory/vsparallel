@@ -1245,11 +1245,12 @@
     const titleLine = createElement("div", "workspace-title-line");
     const name = createElement("h4", "workspace-name", workspace.name);
     name.title = workspace.name;
-    titleLine.append(name);
     if (workspace.focused) {
-      const focused = createElement("span", "workspace-focus", "Focused");
+      const focused = createElement("span", "workspace-focus");
+      focused.setAttribute("aria-hidden", "true");
       titleLine.append(focused);
     }
+    titleLine.append(name);
 
     const path = createElement("span", "workspace-path", formatShortPath(workspace.path));
     if (workspace.path) {
