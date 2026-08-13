@@ -480,7 +480,7 @@ fn records_from_payload(
     let Some(identity) = event_identity(event, payload) else {
         return Vec::new();
     };
-    let session_key = sha256_hex(identity.as_bytes());
+    let session_key = cursor_identity_hash(identity);
     let model_name = cursor_model_display(payload);
     let agent_kind = matches!(
         event,
@@ -521,11 +521,10 @@ fn workspace_observation_hash(domain: &[u8], cwd: &str) -> String {
 fn event_identity(event: CursorHookEvent, payload: &HookPayload) -> Option<&str> {
     let candidates = match event {
         CursorHookEvent::WorkspaceOpen => return None,
-        CursorHookEvent::SessionStart | CursorHookEvent::SessionEnd => [
-            payload.session_id.as_deref(),
-            payload.conversation_id.as_deref(),
-        ],
-        CursorHookEvent::BeforeSubmitPrompt | CursorHookEvent::Stop => [
+        CursorHookEvent::SessionStart
+        | CursorHookEvent::BeforeSubmitPrompt
+        | CursorHookEvent::Stop
+        | CursorHookEvent::SessionEnd => [
             payload.conversation_id.as_deref(),
             payload.session_id.as_deref(),
         ],
@@ -1678,6 +1677,14 @@ impl<R: Read> Read for CappedReader<R> {
 }
 
 // Dependency-free SHA-256 used only to pseudonymize conversation identities.
+pub(crate) fn cursor_identity_hash(identity: &str) -> String {
+    sha256_hex(identity.as_bytes())
+}
+
+pub(crate) fn cursor_bytes_hash(bytes: &[u8]) -> String {
+    sha256_hex(bytes)
+}
+
 fn sha256_hex(input: &[u8]) -> String {
     const INITIAL: [u32; 8] = [
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
@@ -1936,7 +1943,10 @@ mod tests {
         assert_eq!(record["state"], "session_started");
         assert_eq!(cursor_state_precedence("session_started"), 0);
         assert_eq!(record["agentKind"], "Edit");
-        assert_eq!(record["sessionKey"], sha256_hex(b"private-session-id"));
+        assert_eq!(
+            record["sessionKey"],
+            sha256_hex(b"fallback-conversation-id")
+        );
         let saved = record.to_string();
         assert!(!saved.contains("private-session-id"));
         assert!(!saved.contains("fallback-conversation-id"));

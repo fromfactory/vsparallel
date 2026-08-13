@@ -74,6 +74,7 @@ current device:
   deterministic path-derived one-way key, one normalized local workspace path,
   fixed state `workspace_opened`, and a timestamp, but no conversation/session
   identity or agent/model label;
+- the local on/off preference for experimental Cursor Agents Window monitoring;
 - for IDE hook activity only, metadata for the latest `USER_INPUT` row in the
   local Antigravity IDE conversation database selected directly from the
   validated hook `conversationId`, or hash-matched in memory during a desktop
@@ -115,7 +116,9 @@ The bundled companion gives VS Code, Cursor IDE, and Antigravity IDE live
 window tracking. A heartbeat's editor field is a closed value and cannot inject
 an executable path; opening uses the corresponding command configured locally
 in VSParallel. Cursor's separate Agents Window does not activate the third-party
-companion and remains hook-only. Antigravity 2.0 does not host this companion.
+companion. Its experimental Desktop Bridge integration is a separate opt-in and
+does not provide focus or an open target. Antigravity 2.0 does not host this
+companion.
 
 Cursor's native `workspaceOpen`, `sessionStart`, `beforeSubmitPrompt`, `stop`,
 and `sessionEnd` user hooks in `~/.cursor/hooks.json` can execute for local
@@ -127,9 +130,7 @@ may supply the bounded composer/background fields used for the closed agent
 label, but its record is metadata-only and does not itself appear as activity.
 These hooks do not identify a native window or prove liveness, focus, or an open
 target, and they do not identify whether an unmatched event came from the IDE,
-Agents Window, or Cursor CLI. VSParallel does not scan Cursor processes or
-native-window internals; live state comes only from companion heartbeats. For
-the four lifecycle events, it admits a bounded
+Agents Window, or Cursor CLI. For the four lifecycle events, it admits a bounded
 conversation/session identity only long enough to hash it, usable local paths
 from `workspace_roots`, the minimum fields required to choose a coarse state,
 and optional bounded model/agent labels. The raw identity is discarded.
@@ -145,6 +146,43 @@ generic rather than guessing an owner.
 The primary **Set up Cursor monitoring** action installs or repairs both the
 Cursor IDE companion and these native hooks. The separate hooks-only action
 changes only `~/.cursor/hooks.json` and provides no live-window monitoring.
+
+Experimental Cursor Agents Window monitoring is off by default and depends on
+Cursor's limited, server-controlled `desktop_bridge` rollout. Only when Cursor
+shows **Settings > Beta > Desktop Bridge > Allow CLI to access desktop agents**
+can the user enable that option, restart Cursor, and then enable the separate
+option in VSParallel. If Cursor hides that section, VSParallel cannot activate
+the bridge and continues to offer only recent, hook-derived fallback status.
+VSParallel does not edit Cursor's internal feature-gate storage. When available,
+VSParallel reads Cursor's private local Desktop
+Bridge discovery files and sends only `listThreads` over local inter-process
+communication. It never invokes a send-message operation.
+
+The discovery response includes more than VSParallel keeps. Each raw thread ID
+is immediately SHA-256 hashed and discarded. Thread titles, bridge tokens,
+socket paths, Cursor user-data paths, raw thread IDs, prompt text, and response
+text are not logged, persisted, or exposed to the UI. The bridge-derived thread
+hash, a bridge-instance-scoped hash of Cursor's numeric window ID, coarse status, source
+category, and update time remain in process memory only. VSParallel displays a
+bridge observation only when its thread hash exactly
+matches a Cursor hook `sessionKey`, which supplies the local workspace and any
+bounded model or agent label. An unmatched bridge thread is discarded rather
+than guessed onto a workspace.
+
+On Unix-like systems, VSParallel requires the bridge discovery directory,
+files, and socket to be owned by the current user and rejects links or public
+permissions. On Windows it rejects reparse points, validates the named-pipe
+shape and live Cursor process, and relies on the user's profile and named-pipe
+access controls for account isolation.
+
+Only a matched `running` status is treated as **Open**. Matched `completed`,
+`error`, and `idle` observations remain **Recent** with coarse status. These
+rows are never marked focused and cannot be opened or activated by VSParallel.
+Cursor's bridge is private and undocumented, and it does not prove that a
+thread belongs to the standalone Agents Window rather than another Cursor agent
+surface. A missing discovery file is also ambiguous: Cursor may be closed, the
+Cursor setting or private feature may be unavailable, or the bridge may not
+have started. VSParallel reports the absence without choosing one explanation.
 
 The exact, case-sensitive environment value `CURSOR_CODE_REMOTE=true`
 suppresses all Cursor hook-record persistence because this release has no

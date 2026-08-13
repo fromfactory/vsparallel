@@ -100,7 +100,7 @@ test("the main chrome omits redundant labels while retaining an accessible works
   );
 });
 
-test("the workspace empty state links directly to setup and explains Cursor fallback limits", () => {
+test("the workspace empty state links directly to setup and explains Cursor source limits", () => {
   const html = read("ui/index.html");
   const css = read("ui/styles.css");
   const javascript = read("ui/generated/app.js");
@@ -109,7 +109,8 @@ test("the workspace empty state links directly to setup and explains Cursor fall
   )?.[0];
   assert.ok(emptyState, "the workspace empty state should exist");
   assert.match(emptyState, /id="emptySetupButton"[^>]*>[\s\S]*?Open setup/i);
-  assert.match(emptyState, /only the companion\s+reports a live, focused, or openable window/i);
+  assert.match(emptyState, /experimental Cursor desktop bridge can correlate a live agent thread/i);
+  assert.match(emptyState, /does not\s+provide focus or a safe open target/i);
   assert.match(css, /\.empty-state__actions\s*\{[^}]*display:\s*flex[^}]*justify-content:\s*center/s);
   assert.match(
     javascript,
@@ -321,6 +322,7 @@ test("workspace normalization preserves Cursor IDE and agent metadata", () => {
     normalizeWorkspace(value: unknown, index: number): {
       editor: string;
       editorName: string;
+      surface: string;
       cursor: {
         kind: string;
         label: string;
@@ -348,6 +350,7 @@ test("workspace normalization preserves Cursor IDE and agent metadata", () => {
 
   assert.equal(workspace.editor, "cursor");
   assert.equal(workspace.editorName, "Cursor");
+  assert.equal(workspace.surface, "editor_workspace");
   assert.equal(workspace.cursor?.kind, "finished");
   assert.equal(workspace.cursor?.label, "Turn finished");
   assert.equal(workspace.cursor?.modelName, "claude-4-sonnet");
@@ -373,6 +376,7 @@ test("workspace normalization preserves Antigravity source and recent hook activ
     normalizeWorkspace(value: unknown, index: number): {
       editor: string;
       editorName: string;
+      surface: string;
       recentlyActive: boolean;
       openable: boolean;
       antigravity: { kind: string; label: string; modelKind: string | null } | null;
@@ -387,6 +391,7 @@ test("workspace normalization preserves Antigravity source and recent hook activ
     instanceId: "antigravity-2:opaque",
     editor: "antigravity_2",
     editorName: "Antigravity 2.0",
+    surface: "hook_only",
     name: "project",
     path: "/work/project",
     openable: false,
@@ -403,11 +408,55 @@ test("workspace normalization preserves Antigravity source and recent hook activ
 
   assert.equal(workspace.editor, "antigravity_2");
   assert.equal(workspace.editorName, "Antigravity 2.0");
+  assert.equal(workspace.surface, "hook_only");
   assert.equal(workspace.recentlyActive, true);
   assert.equal(workspace.openable, false);
   assert.equal(workspace.antigravity?.kind, "finished");
   assert.equal(workspace.antigravity?.label, "Turn finished");
   assert.equal(workspace.antigravity?.modelKind, "gemini_3_6_flash_medium");
+});
+
+test("workspace normalization keeps experimental Cursor agent rows non-openable", () => {
+  const javascript = read("ui/generated/app.js");
+  const functions = [
+    "isObject",
+    "asString",
+    "asFiniteNumber",
+    "asTimestamp",
+    "asNullableBoolean",
+    "normalizeStateToken",
+    "describeActivityState",
+    "normalizeAntigravityModelKind",
+    "normalizeActivityView",
+    "deriveName",
+    "normalizeWorkspace",
+  ].map((name) => appFunction(javascript, name)).join("\n");
+  const context = {} as {
+    normalizeWorkspace(value: unknown, index: number): {
+      editor: string;
+      editorName: string;
+      surface: string;
+      openable: boolean;
+    };
+  };
+  vm.runInNewContext(
+    `const MAX_JAVASCRIPT_TIMESTAMP_MS = 8_640_000_000_000_000; ${functions}`,
+    context,
+  );
+
+  const workspace = context.normalizeWorkspace({
+    instanceId: "cursor-agent-thread:opaque",
+    editor: "cursor",
+    surface: "cursor_agent_thread",
+    name: "project",
+    path: "/work/project",
+    openable: true,
+  }, 0);
+
+  assert.equal(workspace.editor, "cursor");
+  assert.equal(workspace.editorName, "Cursor agent thread (experimental)");
+  assert.equal(workspace.surface, "cursor_agent_thread");
+  assert.equal(workspace.openable, false, "the private bridge must not create an open target");
 });
 
 test("workspace activity aggregation keeps the highest-priority lifecycle state", () => {
@@ -834,6 +883,190 @@ test("Cursor setup distinguishes combined live monitoring from hooks-only setup"
   );
 });
 
+test("Cursor agent-thread monitoring is an explicit experimental opt-in", () => {
+  const html = read("ui/index.html");
+  const css = read("ui/styles.css");
+  const javascript = read("ui/generated/app.js");
+  const cursorCompanionIndex = html.indexOf('id="cursorCompanionCard"');
+  const cursorAgentsIndex = html.indexOf('id="cursorAgentsBridgeCard"');
+  const antigravityIdeIndex = html.indexOf('id="antigravityIdeCard"');
+  assert.ok(
+    cursorCompanionIndex >= 0
+      && cursorAgentsIndex > cursorCompanionIndex
+      && antigravityIdeIndex > cursorAgentsIndex,
+    "the experimental card should follow the Cursor companion",
+  );
+
+  const card = html.match(
+    /<article\b(?=[^>]*id="cursorAgentsBridgeCard")[^>]*>[\s\S]*?<\/article>/i,
+  )?.[0];
+  assert.ok(card, "the Cursor agent-thread monitoring card should exist");
+  assert.match(card, /Cursor Agents Window/i);
+  assert.match(card, />\s*Experimental\s*</i);
+  assert.match(card, /id="cursorAgentsBridgeDetail"[^>]*>\s*Optional live thread status/i);
+  assert.match(
+    card,
+    /<button\b(?=[^>]*class="help-popover__trigger")(?=[^>]*type="button")(?=[^>]*aria-label="About experimental Cursor agent-thread monitoring")(?=[^>]*aria-describedby="cursorAgentsBridgePrivacy")[^>]*>/i,
+  );
+  const tooltip = card.match(
+    /<span\b(?=[^>]*class="help-popover__content")(?=[^>]*id="cursorAgentsBridgePrivacy")(?=[^>]*role="tooltip")(?=[^>]*popover="manual")[^>]*>[\s\S]*?<\/span>\s*<\/span>/i,
+  )?.[0];
+  assert.ok(tooltip, "the detailed Cursor bridge guidance should be a help tooltip");
+  assert.match(card, /id="cursorAgentsMonitoringEnabled"[^>]*type="checkbox"[^>]*role="switch"/i);
+  const switchInput = card.match(
+    /<input\b(?=[^>]*id="cursorAgentsMonitoringEnabled")[^>]*>/i,
+  )?.[0] ?? "";
+  assert.doesNotMatch(switchInput, /\bchecked\b/i);
+  assert.match(switchInput, /aria-describedby="cursorAgentsBridgeDetail cursorAgentsMonitoringHint"/i);
+  assert.doesNotMatch(switchInput, /cursorAgentsBridgePrivacy/i);
+  assert.match(tooltip, /Settings &gt; Beta &gt; Desktop Bridge &gt; Allow CLI to access\s+desktop agents/i);
+  assert.match(tooltip, /limited server-controlled rollout/i);
+  assert.match(tooltip, /If that section is absent,[\s\S]*live agent-thread monitoring is unavailable/i);
+  assert.match(tooltip, /Cursor hooks still provide\s+recent activity/i);
+  assert.match(tooltip, /exact hook match/i);
+  assert.match(tooltip, /never keeps\s+prompts, responses, credentials, or raw thread and window identifiers/i);
+  assert.match(tooltip, /Cursor changes may break this experimental integration/i);
+  assert.match(card, /Off by default/i);
+
+  assert.match(css, /\.setting-switch input:checked \+ \.setting-switch__track\s*\{/);
+  assert.match(css, /\.setting-switch input:focus-visible \+ \.setting-switch__track\s*\{/);
+  assert.match(css, /\.help-popover__trigger:focus-visible\s*\{[^}]*outline:/s);
+  assert.match(css, /\.help-popover__content\s*\{[^}]*position:\s*fixed[^}]*max-width:/s);
+  assert.match(javascript, /function initializeHelpPopovers\(\)/);
+  assert.match(javascript, /addEventListener\("pointerenter"/);
+  assert.match(javascript, /addEventListener\("focus"/);
+  assert.match(javascript, /showPopover\(\)/);
+  assert.match(javascript, /hidePopover\(\)/);
+  assert.match(javascript, /"get_cursor_agents_bridge_status"/);
+  assert.match(javascript, /"set_cursor_agents_monitoring_enabled"/);
+
+  const setupAll = sliceBetween(
+    javascript,
+    /async function\s+setupAllIntegrations\s*\(/,
+    /function\s+openSettingsDialog\s*\(/,
+    "setupAllIntegrations",
+  );
+  assert.doesNotMatch(setupAll, /set_cursor_agents_monitoring_enabled/);
+  const setupSummary = appFunction(javascript, "describeSetupSummary");
+  assert.doesNotMatch(setupSummary, /cursorAgents|bridge/i);
+});
+
+test("Cursor bridge status is closed, bounded, and rendered independently", () => {
+  const javascript = read("ui/generated/app.js");
+  const functions = [
+    "isObject",
+    "asString",
+    "asFiniteNumber",
+    "asNonNegativeInteger",
+    "asTimestamp",
+    "parseBridgeValue",
+    "normalizeStateToken",
+    "normalizeCursorAgentsBridgeStatus",
+    "formatRelativeTime",
+    "describeCursorAgentsBridgeStatus",
+  ].map((name) => appFunction(javascript, name)).join("\n");
+  const context = {} as {
+    normalizeCursorAgentsBridgeStatus(value: unknown): {
+      enabled: boolean;
+      availability: string;
+      connected: boolean;
+      instanceCount: number;
+      threadCount: number;
+      errorCode: string;
+    };
+    describeCursorAgentsBridgeStatus(status: unknown): {
+      state: string;
+      label: string;
+      detail: string;
+    };
+  };
+  vm.runInNewContext(
+    `const SCHEMA_VERSION = 1;
+     const MAX_JAVASCRIPT_TIMESTAMP_MS = 8_640_000_000_000_000;
+     ${functions}`,
+    context,
+  );
+
+  const connected = context.normalizeCursorAgentsBridgeStatus({
+    schemaVersion: 1,
+    enabled: true,
+    availability: "connected",
+    connected: true,
+    instanceCount: 1,
+    threadCount: 2,
+    lastCheckedAtMs: Date.now(),
+    errorCode: null,
+    detail: "Connected read-only.",
+    token: "must-not-be-selected",
+  });
+  assert.equal(connected.enabled, true);
+  assert.equal(connected.availability, "connected");
+  assert.equal(connected.connected, true);
+  assert.equal(connected.instanceCount, 1);
+  assert.equal(connected.threadCount, 2);
+  assert.equal(connected.errorCode, "");
+  const connectedView = context.describeCursorAgentsBridgeStatus(connected);
+  assert.equal(connectedView.state, "ready");
+  assert.equal(connectedView.label, "Connected");
+  assert.match(connectedView.detail, /1 instance · 2 threads/);
+
+  const waiting = context.normalizeCursorAgentsBridgeStatus({
+    schemaVersion: 1,
+    enabled: true,
+    availability: "waiting",
+    connected: false,
+    instanceCount: 0,
+    threadCount: 0,
+    lastCheckedAtMs: Date.now(),
+    errorCode: "bridge_not_found",
+    detail: "",
+  });
+  const waitingView = context.describeCursorAgentsBridgeStatus(waiting);
+  assert.equal(waitingView.label, "Not connected");
+  assert.equal(waitingView.detail, "Desktop Bridge is not available");
+  assert.match(javascript, /cursorAgentsBridgeHelpStatus\.textContent = status\.detail/);
+
+  const future = context.normalizeCursorAgentsBridgeStatus({
+    schemaVersion: 1,
+    enabled: true,
+    availability: "future-private-state",
+    connected: true,
+    instanceCount: -2,
+    threadCount: -4,
+  });
+  assert.equal(future.availability, "error");
+  assert.equal(future.connected, false);
+  assert.equal(future.instanceCount, 0);
+  assert.equal(future.threadCount, 0);
+  assert.equal(context.describeCursorAgentsBridgeStatus(future).label, "Check failed");
+  assert.throws(() => context.normalizeCursorAgentsBridgeStatus({ schemaVersion: 2 }));
+
+  const setter = sliceBetween(
+    javascript,
+    /async function\s+setCursorAgentsMonitoringEnabled\s*\(/,
+    /function\s+setIntegrationMessage\s*\(/,
+    "setCursorAgentsMonitoringEnabled",
+  );
+  assert.match(setter, /invoke\("set_cursor_agents_monitoring_enabled",\s*\{\s*enabled\s*\}\)/);
+  assert.match(setter, /const status = normalizeCursorAgentsBridgeStatus\(raw\)/);
+  assert.match(setter, /renderCursorAgentsBridgeStatus\(status\)/);
+  assert.match(setter, /status\.enabled/);
+  assert.match(setter, /await refreshSnapshot\(\)/);
+  assert.match(setter, /renderCursorAgentsBridgeStatus\(previous\)/);
+
+  const refreshSetup = sliceBetween(
+    javascript,
+    /async function\s+refreshSetup\s*\(/,
+    /async function\s+hideWindow\s*\(/,
+    "refreshSetup",
+  );
+  assert.match(refreshSetup, /refreshCursorAgentsBridgeStatus\(\)/);
+  assert.match(
+    javascript,
+    /elements\.cursorAgentsMonitoringEnabled\.addEventListener\("change"/,
+  );
+});
+
 test("setup summary treats VS Code, Cursor, and Antigravity IDE as peer editor choices", () => {
   const javascript = read("ui/generated/app.js");
   const functions = [
@@ -964,11 +1197,11 @@ test("setup-all skips each editor whose CLI is unavailable", () => {
   );
   assert.match(
     setupAll,
-    /Live Cursor IDE heartbeats begin after reload; the Agents Window remains hook-only/,
+    /Monitoring installed\. Reload affected editors, restart provider sessions, and review \/hooks in Codex\./,
   );
 });
 
-test("setup separates activity hooks from provider usage requirements", () => {
+test("settings keep integration summaries compact and expose details through accessible help", () => {
   const html = read("ui/index.html");
   const css = read("ui/styles.css");
   const javascript = read("ui/generated/app.js");
@@ -978,8 +1211,7 @@ test("setup separates activity hooks from provider usage requirements", () => {
   assert.ok(integrationSection, "the integrations section should exist");
   const integrationText = integrationSection.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ");
 
-  assert.match(integrationText, /Activity hooks and usage are separate\./i);
-  assert.match(integrationText, /Hooks report lifecycle status/i);
+  assert.match(integrationText, /Companions track live workspaces\. Hooks add lifecycle status\./i);
   assert.doesNotMatch(integrationText, /VS Code extension is required/i);
   assert.match(integrationText, /Codex activity hooks/i);
   assert.match(integrationText, /Claude Code activity hooks/i);
@@ -987,17 +1219,44 @@ test("setup separates activity hooks from provider usage requirements", () => {
   assert.match(integrationText, /Cursor companion/i);
   assert.match(integrationText, /Cursor hooks only/i);
   assert.match(integrationText, /Cursor IDE and Agents Window/i);
-  assert.match(integrationText, /workspaceOpen observation creates recent workspace evidence/i);
-  assert.match(integrationText, /not a live, focused, or openable window or an agent-activity card/i);
-  assert.match(integrationText, /all five managed handlers—including workspaceOpen—are current/i);
+  assert.match(integrationText, /create recent evidence, not a focusable or openable live window/i);
+  assert.match(integrationText, /Start a turn to see Activity detected or Turn finished/i);
   assert.match(integrationText, /Antigravity activity hooks/i);
-  assert.match(integrationText, /Recent activity only/i);
   assert.match(integrationText, /Start an agent turn after installation/i);
   assert.match(integrationText, /workspace-level \.agents\/hooks\.json can override/i);
-  assert.match(
-    integrationText,
-    /Install at least one editor companion—VS Code, Cursor, or Antigravity IDE—to track live workspaces/i,
-  );
+
+  const visibleDescriptions = Array.from(integrationSection.matchAll(
+    /<p\b(?=[^>]*class="[^"]*\bintegration-detail\b[^"]*")[^>]*>([\s\S]*?)<\/p>/gi,
+  )).map((match) => match[1].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim());
+  assert.deepEqual(visibleDescriptions, [
+    "Live VS Code workspaces",
+    "Live IDE workspaces · recent agent activity",
+    "Optional live thread status",
+    "Live Antigravity IDE workspaces",
+    "Recent workspace and agent activity",
+    "Recent agent activity · start a turn",
+    "Lifecycle hooks · CLI usage",
+    "Lifecycle hooks · CLI usage",
+  ]);
+
+  const helpTriggers = Array.from(integrationSection.matchAll(
+    /<button\b(?=[^>]*class="help-popover__trigger")(?=[^>]*type="button")(?=[^>]*aria-label="[^"]+")(?=[^>]*aria-describedby="([^"]+)")[^>]*>/gi,
+  ));
+  assert.equal(helpTriggers.length, 8, "each integration should have a labeled help button");
+  const helpIds = helpTriggers.map((match) => match[1]);
+  assert.equal(new Set(helpIds).size, 8, "each help button should describe a unique tooltip");
+  for (const helpId of helpIds) {
+    assert.match(
+      integrationSection,
+      new RegExp(
+        '<span\\b(?=[^>]*class="help-popover__content")(?=[^>]*id="' +
+          helpId +
+          '")(?=[^>]*role="tooltip")(?=[^>]*popover="manual")[^>]*>',
+        "i",
+      ),
+    );
+  }
+
   const antigravityIdeCard = integrationSection.match(
     /<article\b(?=[^>]*id="antigravityIdeCard")[^>]*>[\s\S]*?<\/article>/i,
   );
@@ -1009,58 +1268,61 @@ test("setup separates activity hooks from provider usage requirements", () => {
   assert.ok(cursorCompanionCard, "the Cursor companion card should exist");
   assert.doesNotMatch(cursorCompanionCard[0], /optional-label|>\s*Optional\s*</i);
   assert.match(cursorCompanionCard[0], /Set up Cursor monitoring/i);
-  assert.match(cursorCompanionCard[0], /Reload Cursor IDE windows before live heartbeats begin/i);
-  assert.match(cursorCompanionCard[0], /Agents Window remains\s+hook-only/i);
-  assert.match(cursorCompanionCard[0], /not a live or openable window/i);
+  assert.match(cursorCompanionCard[0], /Reload\s+Cursor IDE windows before live heartbeats begin/i);
+  assert.match(cursorCompanionCard[0], /Agents Window activity\s+is hook-only unless/i);
+  assert.match(cursorCompanionCard[0], /cannot focus or open it/i);
   assert.match(cursorCompanionCard[0], /Uninstall companion/i);
-  assert.match(cursorCompanionCard[0], /removes live IDE support only/i);
+  assert.match(cursorCompanionCard[0], /leaves activity hooks installed/i);
   const cursorHooksCard = integrationSection.match(
     /<article\b(?=[^>]*id="cursorCard")[^>]*>[\s\S]*?<\/article>/i,
   );
   assert.ok(cursorHooksCard, "the Cursor hooks-only card should exist");
   assert.match(cursorHooksCard[0], /Cursor hooks only/i);
-  assert.match(cursorHooksCard[0], /Recent activity only/i);
+  assert.match(cursorHooksCard[0], /Recent workspace and agent activity/i);
   assert.match(cursorHooksCard[0], /Install hooks only/i);
   assert.match(
     integrationText,
-    /compatible, signed-in Codex CLI available to this app, either from a standalone installation or the locally installed Codex extension in VS Code, Cursor, or Antigravity IDE/i,
+    /compatible, signed-in Codex CLI available to VSParallel, either standalone or from a local Codex extension in VS Code, Cursor, or Antigravity IDE/i,
   );
   assert.match(
     integrationText,
-    /compatible, signed-in Claude Code CLI available to this app, either from a standalone installation or the locally installed Claude Code extension in VS Code, Cursor, or Antigravity IDE/i,
+    /compatible, signed-in Claude Code CLI available to VSParallel, either standalone or from a local Claude Code extension in VS Code, Cursor, or Antigravity IDE/i,
   );
-  assert.match(integrationText, /recent terminal status-line capture can also provide fallback usage/i);
-  assert.equal(
-    Array.from(integrationSection.matchAll(/<p\b(?=[^>]*class="integration-usage-requirement")(?=[^>]*role="note")[^>]*>/gi)).length,
-    2,
-    "each provider should have a separate usage requirement",
-  );
-  assert.match(css, /\.integration-usage-requirement[\s,]/);
-  assert.match(css, /\.integration-activity-limitation\s*\{/);
+  assert.match(integrationText, /recent terminal status-line capture can provide fallback usage/i);
+  assert.doesNotMatch(integrationSection, /integration-usage-requirement|integration-activity-limitation/i);
+  assert.match(css, /\.help-popover__trigger\s*\{[\s\S]*?width:\s*24px/i);
+  assert.match(css, /\.help-popover__trigger:focus-visible\s*\{[\s\S]*?outline:/i);
+  assert.match(css, /\.help-popover__content\s*\{[\s\S]*?position:\s*fixed/i);
+  assert.match(css, /\.help-popover__content\s*\{[\s\S]*?max-width:/i);
+  assert.match(css, /\.help-popover__content:popover-open[\s\S]*?data-fallback-open="true"/i);
+  assert.doesNotMatch(css, /\.integration-usage-requirement[\s,{]|\.integration-activity-limitation[\s,{]/);
   assert.match(integrationText, /Set up monitoring/i);
   assert.doesNotMatch(integrationText, /Set up all/i);
   assert.match(javascript, /:\s*"Set up monitoring"/);
-  assert.match(javascript, /Codex activity hooks installed\. Usage remaining is separate/);
-  assert.match(javascript, /Claude Code activity hooks installed\. Usage remaining is separate/);
+  assert.match(javascript, /componentElements\.detail\.textContent = integrationPurpose\(component\.kind\)/);
+  assert.match(javascript, /componentElements\.meta\.hidden = true/);
+  assert.match(javascript, /componentElements\.helpDetail\.textContent = helpDetails\.length/);
+  assert.match(javascript, /Current status details are unavailable\./);
+  assert.match(javascript, /function integrationPurpose\(/);
+  assert.match(javascript, /querySelectorAll\("\.help-popover"\)/);
+  assert.match(javascript, /addEventListener\("pointerenter"/);
+  assert.match(javascript, /addEventListener\("focus"/);
+  assert.match(javascript, /addEventListener\("click"/);
+  assert.match(javascript, /\.showPopover\(\)/);
+  assert.match(javascript, /\.hidePopover\(\)/);
+  assert.match(javascript, /closeActiveHelpPopover\(\)/);
+  assert.match(javascript, /Codex hooks installed\. Review \/hooks in Codex\./);
+  assert.match(javascript, /Claude Code hooks installed\. Restart active sessions\./);
+  assert.match(javascript, /Cursor hooks installed\. Open a workspace or start a new turn\./);
+  assert.match(javascript, /Cursor monitoring installed\. Reload open Cursor IDE windows\./);
+  assert.match(javascript, /Antigravity hooks installed\. Start a new agent turn\./);
   assert.match(javascript, /Antigravity 2\.0 hook execution/);
   assert.match(javascript, /Antigravity IDE hook execution/);
   assert.match(javascript, /Cursor hook records/);
   assert.match(javascript, /Cursor live heartbeat/);
   assert.match(javascript, /Cursor workspace hook/);
   assert.match(javascript, /Cursor command/);
-  assert.match(
-    javascript,
-    /Opening a local workspace can create recent workspace evidence; start a new turn in the Cursor IDE or Agents Window for lifecycle status/,
-  );
-  assert.match(
-    javascript,
-    /live IDE heartbeats begin after reload\. The Agents Window remains hook-only/,
-  );
-  assert.match(
-    javascript,
-    /Opening an Antigravity 2\.0 Project or Antigravity IDE workspace does not fire hooks/,
-  );
-  assert.match(javascript, /No available editor companion CLI was detected/);
+  assert.match(javascript, /No editor companion was available/);
   assert.doesNotMatch(javascript, /All integrations are installed|still needs/i);
 });
 
@@ -1085,11 +1347,11 @@ test("Cursor heartbeat diagnostics keep hook-only Agents Window evidence informa
   );
   assert.match(
     context.describeCursorHeartbeatDiagnostic(0, 0, "unavailable", 1),
-    /hook source may be the hook-only Agents Window; reload Cursor IDE for OPEN/,
+    /hook source may be Agents Window; an exact experimental bridge match is required for live thread status/,
   );
   assert.match(
     context.describeCursorHeartbeatDiagnostic(0, 1, "5 minutes ago", 0),
-    /No active Cursor IDE heartbeat.*Agents Window is hook-only/,
+    /No active Cursor IDE heartbeat.*unmatched Agents Window evidence is hook-only/,
   );
 });
 
@@ -1419,8 +1681,21 @@ test("workspace rows use a transparent native full-card action without visible O
     createRow,
     /openable[\s\S]*?`\$\{actionLabel\} \$\{workspace\.name\} in \$\{workspace\.editorName\}\$\{focusContext\}`[\s\S]*?cannot currently be opened/,
   );
-  assert.match(createRow, /openButton\.title\s*=\s*workspace\.recentlyActive/);
+  assert.match(
+    createRow,
+    /openButton\.title\s*=\s*workspace\.surface\s*===\s*["']cursor_agent_thread["'][\s\S]*workspace\.recentlyActive/,
+  );
+  assert.match(createRow, /does not provide a safe window activation target/);
   assert.match(createRow, /hook activity does not identify a live window or exact open target/);
+  assert.match(
+    createRow,
+    /workspace\.surface\s*===\s*["']cursor_agent_thread["'][\s\S]*["']Cursor desktop bridge["']/,
+  );
+  assert.match(
+    createRow,
+    /workspace\.surface\s*!==\s*["']cursor_agent_thread["'][\s\S]*createProviderState\(\s*["']Codex["']/,
+    "Cursor agent-thread rows should omit unrelated Codex and Claude cards",
+  );
 
   const openButtonCss = cssBlocksMatching(css, /\.open-button\b/);
   assert.match(openButtonCss, /position\s*:\s*absolute/i);

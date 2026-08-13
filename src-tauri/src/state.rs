@@ -1,4 +1,7 @@
 use crate::antigravity_integration::AntigravityModelKind;
+use crate::cursor_agents_bridge::{
+    CursorAgentsBridgeSnapshot, CursorBridgeThread, CursorBridgeThreadStatus,
+};
 use crate::opener::EditorKind;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
@@ -162,6 +165,7 @@ pub struct WorkspaceView {
     pub instance_id: String,
     pub editor: EditorKind,
     pub editor_name: String,
+    pub surface: WorkspaceSurface,
     pub name: String,
     pub path: Option<String>,
     pub openable: bool,
@@ -175,6 +179,14 @@ pub struct WorkspaceView {
     pub cursor: Option<ActivityView>,
     pub codex: ActivityView,
     pub claude: ActivityView,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceSurface {
+    EditorWorkspace,
+    HookOnly,
+    CursorAgentThread,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -272,6 +284,14 @@ impl StateStore {
     }
 
     pub fn snapshot(&self, now_ms: i64) -> Snapshot {
+        self.snapshot_with_cursor_agents(now_ms, None)
+    }
+
+    pub(crate) fn snapshot_with_cursor_agents(
+        &self,
+        now_ms: i64,
+        cursor_agents: Option<&CursorAgentsBridgeSnapshot>,
+    ) -> Snapshot {
         let instances = self.load_instances(now_ms);
         let codex = self.load_codex(now_ms);
         let claude = self.load_claude(now_ms);
@@ -303,7 +323,7 @@ impl StateStore {
             .values()
             .filter(|record| {
                 matches!(record.editor, Some(CompanionEditorKind::Cursor))
-                    && now_ms.saturating_sub(record.last_seen_at_ms) <= STALE_RETENTION_MS
+                    && now_ms.saturating_sub(record.last_seen_at_ms) <= ACTIVE_TTL_MS
             })
             .map(|record| (record.instance_id.clone(), workspace_paths(record)))
             .collect();
@@ -336,6 +356,8 @@ impl StateStore {
             &cursor.records,
             &codex.records,
             &claude.records,
+            &cursor_workspaces,
+            cursor_agents,
             now_ms,
         ));
         workspaces.extend(self.antigravity_workspace_views(
@@ -591,6 +613,7 @@ impl StateStore {
             instance_id,
             editor,
             editor_name: editor.display_name().to_string(),
+            surface: WorkspaceSurface::EditorWorkspace,
             name,
             path: display_path,
             openable: target.as_ref().is_some_and(|path| path.exists()),
@@ -667,6 +690,7 @@ impl StateStore {
                     instance_id,
                     editor,
                     editor_name: editor.display_name().to_string(),
+                    surface: WorkspaceSurface::HookOnly,
                     name,
                     path: Some(path.to_string_lossy().into_owned()),
                     openable: false,
@@ -711,11 +735,23 @@ impl StateStore {
         records: &[ActivityRecord],
         codex_records: &[ActivityRecord],
         claude_records: &[ActivityRecord],
+        cursor_workspaces: &[(String, Vec<PathBuf>)],
+        cursor_agents: Option<&CursorAgentsBridgeSnapshot>,
         now_ms: i64,
     ) -> Vec<WorkspaceView> {
+        let mut bridge_threads: HashMap<&str, Vec<&CursorBridgeThread>> = HashMap::new();
+        if let Some(snapshot) = cursor_agents {
+            for thread in &snapshot.threads {
+                bridge_threads
+                    .entry(thread.session_key.as_str())
+                    .or_default()
+                    .push(thread);
+            }
+        }
         let mut newest_by_path: HashMap<PathBuf, &ActivityRecord> = HashMap::new();
         for record in records.iter().filter(|record| {
-            record.state != ActivityRecordState::SessionStarted
+            (record.state != ActivityRecordState::SessionStarted
+                || bridge_threads.contains_key(record.session_key.as_str()))
                 && record.cursor_instance_id.is_none()
                 && now_ms.saturating_sub(record.changed_at_ms) <= ACTIVITY_STALE_MS
         }) {
@@ -731,9 +767,39 @@ impl StateStore {
             .into_iter()
             .map(|(path, newest)| {
                 let workspace_paths = vec![path.clone()];
-                let cursor =
-                    aggregate_cursor_activity_if_observed(&workspace_paths, records, None, now_ms);
+                // The bridge has no stable surface discriminator. Fail closed
+                // when a live Cursor IDE heartbeat already covers this path;
+                // otherwise an exact pseudonymized thread/hook join can safely
+                // enrich a conservative Cursor agent-thread row.
+                let ide_path_covered = cursor_workspaces.iter().any(|(_, paths)| {
+                    paths
+                        .iter()
+                        .any(|workspace| path_is_within(&path, workspace))
+                });
+                let bridge_activity = (!ide_path_covered)
+                    .then(|| {
+                        cursor_agents_activity(
+                            &workspace_paths,
+                            records,
+                            &bridge_threads,
+                            cursor_agents.map(|snapshot| snapshot.observed_at_ms),
+                            now_ms,
+                        )
+                    })
+                    .flatten();
+                let bridge_observed = bridge_activity.is_some();
+                let bridge_running = bridge_activity
+                    .as_ref()
+                    .is_some_and(|activity| activity.state == "activity_detected");
+                let cursor = bridge_activity.or_else(|| {
+                    aggregate_cursor_activity_if_observed(&workspace_paths, records, None, now_ms)
+                });
                 let lifecycle_observed = cursor.is_some();
+                let newest_observation_at_ms = cursor
+                    .as_ref()
+                    .and_then(|activity| activity.changed_at_ms)
+                    .map(|changed_at| changed_at.max(newest.changed_at_ms))
+                    .unwrap_or(newest.changed_at_ms);
                 let name = path
                     .file_name()
                     .map(|name| name.to_string_lossy().into_owned())
@@ -742,7 +808,9 @@ impl StateStore {
                 WorkspaceView {
                     instance_id: format!(
                         "{}:{}",
-                        if lifecycle_observed {
+                        if bridge_observed {
+                            "cursor-agent-thread"
+                        } else if lifecycle_observed {
                             "cursor-agent"
                         } else {
                             "cursor-workspace"
@@ -750,43 +818,68 @@ impl StateStore {
                         stable_path_key(&path)
                     ),
                     editor: EditorKind::Cursor,
-                    editor_name: if lifecycle_observed {
+                    editor_name: if bridge_observed {
+                        "Cursor agent thread (experimental)".to_string()
+                    } else if lifecycle_observed {
                         "Cursor Agent".to_string()
                     } else {
                         "Cursor".to_string()
                     },
                     name,
                     path: Some(path.to_string_lossy().into_owned()),
+                    surface: if bridge_observed {
+                        WorkspaceSurface::CursorAgentThread
+                    } else {
+                        WorkspaceSurface::HookOnly
+                    },
                     openable: false,
-                    active: false,
+                    active: bridge_running,
                     focused: false,
                     // A workspaceOpen observation is presence metadata, not
                     // agent activity. Real lifecycle records retain the
                     // historical hook-only recent-activity affordance.
                     recently_active: lifecycle_observed,
                     remote_window: false,
-                    last_seen_at_ms: newest.changed_at_ms,
+                    last_seen_at_ms: if bridge_running {
+                        cursor_agents
+                            .map(|snapshot| snapshot.observed_at_ms)
+                            .unwrap_or(newest_observation_at_ms)
+                    } else {
+                        newest_observation_at_ms
+                    },
                     started_at_ms: newest.changed_at_ms,
                     antigravity: None,
                     cursor,
-                    codex: aggregate_activity(
-                        "Codex",
-                        &workspace_paths,
-                        codex_records,
-                        None,
-                        None,
-                        false,
-                        now_ms,
-                    ),
-                    claude: aggregate_activity(
-                        "Claude Code",
-                        &workspace_paths,
-                        claude_records,
-                        None,
-                        None,
-                        false,
-                        now_ms,
-                    ),
+                    codex: if bridge_observed {
+                        unknown_activity("Codex", None, Some("Cursor agent thread (experimental)"))
+                    } else {
+                        aggregate_activity(
+                            "Codex",
+                            &workspace_paths,
+                            codex_records,
+                            None,
+                            None,
+                            false,
+                            now_ms,
+                        )
+                    },
+                    claude: if bridge_observed {
+                        unknown_activity(
+                            "Claude Code",
+                            None,
+                            Some("Cursor agent thread (experimental)"),
+                        )
+                    } else {
+                        aggregate_activity(
+                            "Claude Code",
+                            &workspace_paths,
+                            claude_records,
+                            None,
+                            None,
+                            false,
+                            now_ms,
+                        )
+                    },
                 }
             })
             .collect()
@@ -1272,6 +1365,127 @@ fn aggregate_cursor_activity_if_observed(
         .collect();
     (!matching.is_empty())
         .then(|| aggregate_matching_activity("Cursor Agent", matching, None, None, now_ms))
+}
+
+fn cursor_agents_activity(
+    workspace_paths: &[PathBuf],
+    records: &[ActivityRecord],
+    bridge_threads: &HashMap<&str, Vec<&CursorBridgeThread>>,
+    observed_at_ms: Option<i64>,
+    now_ms: i64,
+) -> Option<ActivityView> {
+    let observed_at_ms = observed_at_ms.filter(|observed| {
+        *observed <= now_ms.saturating_add(MAX_FUTURE_SKEW_MS)
+            && now_ms.saturating_sub(*observed) <= ACTIVE_TTL_MS
+    })?;
+    let mut matching: Vec<(&ActivityRecord, &CursorBridgeThread)> = records
+        .iter()
+        .filter(|record| {
+            !matches!(record.state, ActivityRecordState::WorkspaceOpened)
+                && record.cursor_instance_id.is_none()
+                && workspace_paths
+                    .iter()
+                    .any(|workspace| path_is_within(&record.normalized_cwd, workspace))
+        })
+        .flat_map(|record| {
+            bridge_threads
+                .get(record.session_key.as_str())
+                .into_iter()
+                .flat_map(move |threads| threads.iter().map(move |thread| (record, *thread)))
+        })
+        .collect();
+    if matching.is_empty() {
+        return None;
+    }
+
+    // A running thread wins over terminal history on the same workspace. For
+    // equal coarse states, Cursor's own update timestamp selects the newest
+    // thread; hook timestamps then select the best bounded metadata record.
+    matching.sort_by(|(left_record, left_thread), (right_record, right_thread)| {
+        let left_running = left_thread.status == CursorBridgeThreadStatus::Running;
+        let right_running = right_thread.status == CursorBridgeThreadStatus::Running;
+        left_running
+            .cmp(&right_running)
+            .then_with(|| {
+                left_thread
+                    .last_updated_at_ms
+                    .cmp(&right_thread.last_updated_at_ms)
+            })
+            .then_with(|| left_record.changed_at_ms.cmp(&right_record.changed_at_ms))
+    });
+    let (_, selected_thread) = *matching.last()?;
+    let selected_record = matching
+        .iter()
+        .filter(|(_, thread)| thread.session_key == selected_thread.session_key)
+        .map(|(record, _)| *record)
+        .max_by(|left, right| {
+            left.changed_at_ms.cmp(&right.changed_at_ms).then_with(|| {
+                cursor_state_precedence(left.state).cmp(&cursor_state_precedence(right.state))
+            })
+        })?;
+    let source = match selected_thread.source {
+        crate::cursor_agents_bridge::CursorBridgeThreadSource::Local => "local",
+        crate::cursor_agents_bridge::CursorBridgeThreadSource::Cloud => "cloud",
+        crate::cursor_agents_bridge::CursorBridgeThreadSource::Draft => "draft",
+        crate::cursor_agents_bridge::CursorBridgeThreadSource::ClaudeCode => "Claude Code",
+    };
+    let metadata = (
+        None,
+        selected_record.model_name.clone(),
+        selected_record.agent_kind.clone(),
+    );
+    let changed_at = Some(selected_thread.last_updated_at_ms);
+    let exact_join = format!(
+        "Cursor's experimental read-only local bridge reports a {source} agent thread; an exact hook identity match supplies this workspace{}.",
+        if selected_record.model_name.is_some() || selected_record.agent_kind.is_some() {
+            " and bounded agent/model metadata"
+        } else {
+            ""
+        }
+    );
+
+    Some(match selected_thread.status {
+        CursorBridgeThreadStatus::Running => activity_view_with_metadata(
+            "activity_detected",
+            "Activity detected",
+            changed_at,
+            format!("{exact_join} The thread is currently running (bridge checked at {observed_at_ms})."),
+            metadata,
+            None,
+        ),
+        CursorBridgeThreadStatus::Completed => activity_view_with_metadata(
+            "turn_finished",
+            "Turn finished",
+            changed_at,
+            format!("{exact_join} Cursor reports that the thread completed."),
+            metadata,
+            None,
+        ),
+        CursorBridgeThreadStatus::Error => activity_view_with_metadata(
+            "failed_or_interrupted",
+            "Failed/interrupted",
+            changed_at,
+            format!("{exact_join} Cursor reports that the thread ended in an error."),
+            metadata,
+            None,
+        ),
+        CursorBridgeThreadStatus::Idle => activity_view_with_metadata(
+            "unknown",
+            "Idle / needs attention",
+            changed_at,
+            format!("{exact_join} Cursor reports an idle state, which may also mean the thread needs attention."),
+            metadata,
+            None,
+        ),
+        CursorBridgeThreadStatus::Unknown => activity_view_with_metadata(
+            "unknown",
+            "Unknown",
+            changed_at,
+            format!("{exact_join} Cursor did not expose a recognized thread state."),
+            metadata,
+            None,
+        ),
+    })
 }
 
 fn aggregate_activity(
@@ -2279,6 +2493,256 @@ mod tests {
         assert_eq!(diagnostics.valid_cursor_records, 1);
         assert_eq!(diagnostics.malformed_cursor_records, 0);
         assert_eq!(diagnostics.omitted_cursor_records, 0);
+    }
+
+    fn cursor_agents_snapshot(
+        now: i64,
+        session_key: &str,
+        status: CursorBridgeThreadStatus,
+    ) -> CursorAgentsBridgeSnapshot {
+        CursorAgentsBridgeSnapshot {
+            observed_at_ms: now,
+            threads: vec![CursorBridgeThread {
+                session_key: session_key.to_string(),
+                source: crate::cursor_agents_bridge::CursorBridgeThreadSource::Local,
+                status,
+                last_updated_at_ms: now - 5,
+                window_key: "window-key".to_string(),
+            }],
+        }
+    }
+
+    #[test]
+    fn exact_running_cursor_bridge_thread_creates_an_unopenable_open_agents_row() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("cursor-agents-project");
+        fs::create_dir_all(&repo).unwrap();
+        let now = 30_000;
+        write_json(
+            &temp.path().join("cursor/agent.json"),
+            json!({
+                "schemaVersion": 1,
+                "sessionKey": "exact-thread-hash",
+                "cwd": repo,
+                "state": "activity_detected",
+                "changedAtMs": now - 20,
+                "modelName": "gpt-5.2",
+                "agentKind": "Agent"
+            }),
+        );
+        let bridge =
+            cursor_agents_snapshot(now, "exact-thread-hash", CursorBridgeThreadStatus::Running);
+
+        let snapshot = StateStore::new(temp.path().to_path_buf())
+            .snapshot_with_cursor_agents(now, Some(&bridge));
+        assert_eq!(snapshot.workspaces.len(), 1);
+        let workspace = &snapshot.workspaces[0];
+        assert!(workspace.instance_id.starts_with("cursor-agent-thread:"));
+        assert_eq!(workspace.surface, WorkspaceSurface::CursorAgentThread);
+        assert_eq!(workspace.editor_name, "Cursor agent thread (experimental)");
+        assert!(workspace.active);
+        assert!(!workspace.focused);
+        assert!(!workspace.openable);
+        assert_eq!(workspace.last_seen_at_ms, now);
+        let activity = workspace.cursor.as_ref().unwrap();
+        assert_eq!(activity.state, "activity_detected");
+        assert_eq!(activity.label, "Activity detected");
+        assert_eq!(activity.model_name.as_deref(), Some("gpt-5.2"));
+        assert_eq!(activity.agent_kind.as_deref(), Some("Agent"));
+        assert!(activity.detail.contains("exact hook identity match"));
+    }
+
+    #[test]
+    fn completed_bridge_thread_is_recent_and_overrides_a_stale_running_hook() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("cursor-agents-finished");
+        fs::create_dir_all(&repo).unwrap();
+        let now = 30_000;
+        write_json(
+            &temp.path().join("cursor/agent.json"),
+            json!({
+                "schemaVersion": 1,
+                "sessionKey": "finished-thread-hash",
+                "cwd": repo,
+                "state": "activity_detected",
+                "changedAtMs": now - 20
+            }),
+        );
+        let bridge = cursor_agents_snapshot(
+            now,
+            "finished-thread-hash",
+            CursorBridgeThreadStatus::Completed,
+        );
+
+        let snapshot = StateStore::new(temp.path().to_path_buf())
+            .snapshot_with_cursor_agents(now, Some(&bridge));
+        let workspace = &snapshot.workspaces[0];
+        assert_eq!(workspace.surface, WorkspaceSurface::CursorAgentThread);
+        assert!(!workspace.active);
+        assert_eq!(
+            workspace
+                .cursor
+                .as_ref()
+                .map(|activity| activity.state.as_str()),
+            Some("turn_finished")
+        );
+    }
+
+    #[test]
+    fn bridge_identity_mismatch_preserves_the_existing_hook_only_fallback() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("cursor-agents-mismatch");
+        fs::create_dir_all(&repo).unwrap();
+        let now = 30_000;
+        write_json(
+            &temp.path().join("cursor/agent.json"),
+            json!({
+                "schemaVersion": 1,
+                "sessionKey": "hook-thread-hash",
+                "cwd": repo,
+                "state": "activity_detected",
+                "changedAtMs": now
+            }),
+        );
+        let bridge = cursor_agents_snapshot(
+            now,
+            "different-thread-hash",
+            CursorBridgeThreadStatus::Running,
+        );
+
+        let snapshot = StateStore::new(temp.path().to_path_buf())
+            .snapshot_with_cursor_agents(now, Some(&bridge));
+        let workspace = &snapshot.workspaces[0];
+        assert_eq!(workspace.surface, WorkspaceSurface::HookOnly);
+        assert_eq!(workspace.editor_name, "Cursor Agent");
+        assert!(!workspace.active);
+    }
+
+    #[test]
+    fn cursor_ide_heartbeat_wins_when_the_bridge_cannot_disambiguate_the_surface() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("cursor-ide-project");
+        fs::create_dir_all(&repo).unwrap();
+        let now = 30_000;
+        let mut heartbeat = instance("cursor-window", &repo, now, true);
+        heartbeat["editor"] = json!("cursor");
+        write_json(&temp.path().join("instances/cursor-window.json"), heartbeat);
+        write_json(
+            &temp.path().join("cursor/agent.json"),
+            json!({
+                "schemaVersion": 1,
+                "sessionKey": "covered-thread-hash",
+                "cwd": repo,
+                "state": "activity_detected",
+                "changedAtMs": now
+            }),
+        );
+        let bridge = cursor_agents_snapshot(
+            now,
+            "covered-thread-hash",
+            CursorBridgeThreadStatus::Running,
+        );
+
+        let snapshot = StateStore::new(temp.path().to_path_buf())
+            .snapshot_with_cursor_agents(now, Some(&bridge));
+        assert_eq!(snapshot.workspaces.len(), 1);
+        assert_eq!(
+            snapshot.workspaces[0].surface,
+            WorkspaceSurface::EditorWorkspace
+        );
+        assert_eq!(snapshot.workspaces[0].instance_id, "cursor-window");
+    }
+
+    #[test]
+    fn retained_but_inactive_cursor_heartbeat_does_not_hide_a_running_bridge_thread() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("cursor-agents-after-ide-closed");
+        fs::create_dir_all(&repo).unwrap();
+        let now = 100_000;
+        let mut heartbeat = instance(
+            "retained-cursor-window",
+            &repo,
+            now - ACTIVE_TTL_MS - 1,
+            false,
+        );
+        heartbeat["editor"] = json!("cursor");
+        write_json(
+            &temp.path().join("instances/retained-cursor-window.json"),
+            heartbeat,
+        );
+        write_json(
+            &temp.path().join("cursor/agent.json"),
+            json!({
+                "schemaVersion": 1,
+                "sessionKey": "running-after-ide-hash",
+                "cwd": repo,
+                "state": "activity_detected",
+                "changedAtMs": now
+            }),
+        );
+        let bridge = cursor_agents_snapshot(
+            now,
+            "running-after-ide-hash",
+            CursorBridgeThreadStatus::Running,
+        );
+
+        let snapshot = StateStore::new(temp.path().to_path_buf())
+            .snapshot_with_cursor_agents(now, Some(&bridge));
+        assert_eq!(snapshot.workspaces.len(), 2);
+        assert!(snapshot.workspaces.iter().any(|workspace| {
+            workspace.surface == WorkspaceSurface::CursorAgentThread && workspace.active
+        }));
+        assert!(snapshot.workspaces.iter().any(|workspace| {
+            workspace.instance_id == "retained-cursor-window" && !workspace.active
+        }));
+    }
+
+    #[test]
+    fn duplicate_thread_identity_in_two_bridge_windows_does_not_hide_a_running_copy() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("cursor-agents-two-windows");
+        fs::create_dir_all(&repo).unwrap();
+        let now = 30_000;
+        write_json(
+            &temp.path().join("cursor/agent.json"),
+            json!({
+                "schemaVersion": 1,
+                "sessionKey": "shared-thread-hash",
+                "cwd": repo,
+                "state": "activity_detected",
+                "changedAtMs": now - 20
+            }),
+        );
+        let bridge = CursorAgentsBridgeSnapshot {
+            observed_at_ms: now,
+            threads: vec![
+                CursorBridgeThread {
+                    session_key: "shared-thread-hash".to_string(),
+                    source: crate::cursor_agents_bridge::CursorBridgeThreadSource::Local,
+                    status: CursorBridgeThreadStatus::Running,
+                    last_updated_at_ms: now - 100,
+                    window_key: "window-a".to_string(),
+                },
+                CursorBridgeThread {
+                    session_key: "shared-thread-hash".to_string(),
+                    source: crate::cursor_agents_bridge::CursorBridgeThreadSource::Local,
+                    status: CursorBridgeThreadStatus::Completed,
+                    last_updated_at_ms: now - 5,
+                    window_key: "window-b".to_string(),
+                },
+            ],
+        };
+
+        let snapshot = StateStore::new(temp.path().to_path_buf())
+            .snapshot_with_cursor_agents(now, Some(&bridge));
+        assert!(snapshot.workspaces[0].active);
+        assert_eq!(
+            snapshot.workspaces[0]
+                .cursor
+                .as_ref()
+                .map(|activity| activity.state.as_str()),
+            Some("activity_detected")
+        );
     }
 
     #[test]

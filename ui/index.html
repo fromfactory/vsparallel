@@ -278,9 +278,10 @@
             <h3>No workspaces detected</h3>
             <p>
               Open a folder in VS Code, Cursor, or Antigravity IDE with its VSParallel companion
-              enabled. Cursor hooks can also record a recent workspace open, but only the companion
-              reports a live, focused, or openable window. Start a turn in Cursor's Agents Window or
-              an Antigravity workspace to see agent activity.
+              enabled. Cursor hooks can also record a recent workspace open; the optional
+              experimental Cursor desktop bridge can correlate a live agent thread, but it does not
+              provide focus or a safe open target. Start a turn in Cursor's Agents Window or an
+              Antigravity workspace to see agent activity.
             </p>
             <div class="empty-state__actions">
               <button
@@ -381,8 +382,7 @@
               <path d="m5.65 7.9 1.45 1.45 3.25-3.3" />
             </svg>
             <p class="diagnostics-intro">
-              Metadata stays on this device. Prompts, source code, and terminal content are never
-              stored.
+              Local metadata only. Prompts, source code, and terminal content are never stored.
             </p>
           </div>
 
@@ -409,9 +409,7 @@
                 <div>
                   <h3 id="integrationHeading">Integrations</h3>
                   <p id="integrationDescription">
-                    Install at least one editor companion—VS Code, Cursor, or Antigravity IDE—to
-                    track live workspaces. Activity hooks and usage are separate. Hooks report
-                    lifecycle status; usage comes from the provider sources described below.
+                    Companions track live workspaces. Hooks add lifecycle status.
                   </p>
                 </div>
                 <button
@@ -433,9 +431,31 @@
                         <path d="m16.5 3.5-8 7.2v2.6l8 7.2v-17Z" />
                       </svg>
                       <div>
-                        <h4>VS Code companion</h4>
+                        <div class="integration-card__title-row">
+                          <h4>VS Code companion</h4>
+                          <span class="help-popover">
+                            <button
+                              class="help-popover__trigger"
+                              type="button"
+                              aria-label="About the VS Code companion"
+                              aria-describedby="companionHelp"
+                            >?</button>
+                            <span
+                              class="help-popover__content"
+                              id="companionHelp"
+                              role="tooltip"
+                              popover="manual"
+                            >
+                              Reports live VS Code workspaces through the bundled companion. Reload
+                              open VS Code windows after installing or updating it.
+                              <span class="help-popover__status" id="companionHelpStatus">
+                                Checking current status…
+                              </span>
+                            </span>
+                          </span>
+                        </div>
                         <p class="integration-detail" id="companionDetail">
-                          Checking the installed companion…
+                          Live VS Code workspaces
                         </p>
                       </div>
                     </div>
@@ -473,9 +493,34 @@
                         <path d="m8.5 9 5 3-5 3V9Z" />
                       </svg>
                       <div>
-                        <h4>Cursor companion</h4>
+                        <div class="integration-card__title-row">
+                          <h4>Cursor companion</h4>
+                          <span class="help-popover">
+                            <button
+                              class="help-popover__trigger"
+                              type="button"
+                              aria-label="About Cursor monitoring"
+                              aria-describedby="cursorCompanionHelp"
+                            >?</button>
+                            <span
+                              class="help-popover__content"
+                              id="cursorCompanionHelp"
+                              role="tooltip"
+                              popover="manual"
+                            >
+                              Setup manages the Cursor companion and activity hooks together. Reload
+                              Cursor IDE windows before live heartbeats begin. Agents Window activity
+                              is hook-only unless experimental thread monitoring makes an exact match;
+                              even then, VSParallel cannot focus or open it. Removing the companion
+                              leaves activity hooks installed.
+                              <span class="help-popover__status" id="cursorCompanionHelpStatus">
+                                Checking current status…
+                              </span>
+                            </span>
+                          </span>
+                        </div>
                         <p class="integration-detail" id="cursorCompanionDetail">
-                          Checking the Cursor companion…
+                          Live IDE workspaces · recent agent activity
                         </p>
                       </div>
                     </div>
@@ -488,14 +533,6 @@
                     </span>
                   </div>
                   <p class="integration-meta" id="cursorCompanionMeta" hidden></p>
-                  <p class="integration-activity-limitation" role="note">
-                    <strong>Live Cursor IDE and recent agent activity.</strong>
-                    Setup installs or repairs the Cursor companion and activity hooks together.
-                    Reload Cursor IDE windows before live heartbeats begin. The Agents Window remains
-                    hook-only and can report recent activity, not a live or openable window.
-                    Uninstalling the companion removes live IDE support only; hooks are managed
-                    separately below.
-                  </p>
                   <div class="integration-actions">
                     <button
                       class="setup-button setup-button--primary"
@@ -517,6 +554,91 @@
                   </div>
                 </article>
 
+                <article
+                  class="integration-card"
+                  id="cursorAgentsBridgeCard"
+                  aria-describedby="cursorAgentsMonitoringHint"
+                  aria-busy="false"
+                >
+                  <div class="integration-card__header">
+                    <div class="integration-card__identity">
+                      <svg class="integration-card__icon" viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M5 4.5 19 12 5 19.5V4.5Z" />
+                        <path d="M15.5 7.5h4v4M19.5 7.5l-5 5" />
+                      </svg>
+                      <div>
+                        <div class="integration-card__title-row">
+                          <h4>
+                            Cursor Agents Window
+                            <span class="optional-label experimental-label">Experimental</span>
+                          </h4>
+                          <span class="help-popover">
+                            <button
+                              class="help-popover__trigger"
+                              type="button"
+                              aria-label="About experimental Cursor agent-thread monitoring"
+                              aria-describedby="cursorAgentsBridgePrivacy"
+                            >?</button>
+                            <span
+                              class="help-popover__content"
+                              id="cursorAgentsBridgePrivacy"
+                              role="tooltip"
+                              popover="manual"
+                            >
+                              Cursor exposes Desktop Bridge only to a limited server-controlled rollout.
+                              If Cursor shows Settings &gt; Beta &gt; Desktop Bridge &gt; Allow CLI to access
+                              desktop agents, enable it and restart Cursor. If that section is absent,
+                              live agent-thread monitoring is unavailable; Cursor hooks still provide
+                              recent activity. VSParallel requires an exact hook match and never keeps
+                              prompts, responses, credentials, or raw thread and window identifiers.
+                              Cursor changes may break this experimental integration.
+                              <span class="help-popover__status" id="cursorAgentsBridgeHelpStatus">
+                                Checking current status…
+                              </span>
+                            </span>
+                          </span>
+                        </div>
+                        <p class="integration-detail" id="cursorAgentsBridgeDetail">
+                          Optional live thread status
+                        </p>
+                      </div>
+                    </div>
+                    <span
+                      class="integration-status"
+                      id="cursorAgentsBridgeStatus"
+                      data-state="checking"
+                    >
+                      Checking…
+                    </span>
+                  </div>
+                  <label class="cursor-agents-control">
+                    <span class="cursor-agents-control__copy">
+                      <strong>Monitor Cursor agent threads</strong>
+                      <small id="cursorAgentsMonitoringHint">
+                        Off by default. The preference is stored only on this device.
+                      </small>
+                    </span>
+                    <span class="setting-switch">
+                      <input
+                        id="cursorAgentsMonitoringEnabled"
+                        type="checkbox"
+                        role="switch"
+                        aria-describedby="cursorAgentsBridgeDetail cursorAgentsMonitoringHint"
+                      />
+                      <span class="setting-switch__track" aria-hidden="true">
+                        <span class="setting-switch__thumb"></span>
+                      </span>
+                    </span>
+                  </label>
+                  <p
+                    class="setup-message cursor-agents-message"
+                    id="cursorAgentsBridgeMessage"
+                    role="status"
+                    aria-live="polite"
+                    hidden
+                  ></p>
+                </article>
+
                 <article class="integration-card" id="antigravityIdeCard">
                   <div class="integration-card__header">
                     <div class="integration-card__identity">
@@ -525,9 +647,31 @@
                         <path d="m8 9 3 3-3 3M13 15h4" />
                       </svg>
                       <div>
-                        <h4>Antigravity IDE companion</h4>
+                        <div class="integration-card__title-row">
+                          <h4>Antigravity IDE companion</h4>
+                          <span class="help-popover">
+                            <button
+                              class="help-popover__trigger"
+                              type="button"
+                              aria-label="About the Antigravity IDE companion"
+                              aria-describedby="antigravityIdeHelp"
+                            >?</button>
+                            <span
+                              class="help-popover__content"
+                              id="antigravityIdeHelp"
+                              role="tooltip"
+                              popover="manual"
+                            >
+                              Reports live Antigravity IDE workspaces through the bundled companion.
+                              Reload open Antigravity IDE windows after installing or updating it.
+                              <span class="help-popover__status" id="antigravityIdeHelpStatus">
+                                Checking current status…
+                              </span>
+                            </span>
+                          </span>
+                        </div>
                         <p class="integration-detail" id="antigravityIdeDetail">
-                          Checking the Antigravity IDE companion…
+                          Live Antigravity IDE workspaces
                         </p>
                       </div>
                     </div>
@@ -569,12 +713,37 @@
                         <circle cx="10" cy="12" r="2.5" />
                       </svg>
                       <div>
-                        <h4>
-                          Cursor hooks only
-                          <span class="optional-label">Optional</span>
-                        </h4>
+                        <div class="integration-card__title-row">
+                          <h4>
+                            Cursor hooks only
+                            <span class="optional-label">Optional</span>
+                          </h4>
+                          <span class="help-popover">
+                            <button
+                              class="help-popover__trigger"
+                              type="button"
+                              aria-label="About Cursor hooks"
+                              aria-describedby="cursorHooksHelp"
+                            >?</button>
+                            <span
+                              class="help-popover__content"
+                              id="cursorHooksHelp"
+                              role="tooltip"
+                              popover="manual"
+                            >
+                              Hooks observe local workspace opens and agent turns in Cursor IDE and
+                              Agents Window. They create recent evidence, not a focusable or openable
+                              live window. Start a turn to see Activity detected or Turn finished.
+                              Unmatched activity is labeled Cursor Agent because hooks do not identify
+                              its surface. Cloud and remote agents are not covered.
+                              <span class="help-popover__status" id="cursorHooksHelpStatus">
+                                Checking current status…
+                              </span>
+                            </span>
+                          </span>
+                        </div>
                         <p class="integration-detail" id="cursorDetail">
-                          Checking documented Cursor hooks…
+                          Recent workspace and agent activity
                         </p>
                       </div>
                     </div>
@@ -583,18 +752,6 @@
                     </span>
                   </div>
                   <p class="integration-meta" id="cursorMeta" hidden></p>
-                  <p class="integration-activity-limitation" role="note">
-                    <strong>Recent activity only.</strong>
-                    These hooks cover local workspace opens and agent turns in the Cursor IDE and
-                    Agents Window. A workspaceOpen observation creates recent workspace evidence,
-                    not a live, focused, or openable window or an agent-activity card. Start a turn
-                    to see Activity detected or Turn finished. An unmatched lifecycle hook cannot
-                    identify its Cursor surface and is labeled Cursor Agent. If setup offers Update
-                    or Repair, reinstall so all five managed handlers—including workspaceOpen—are
-                    current. VSParallel records workspace roots and bounded agent/model identifiers
-                    when Cursor reports them, but never prompt or response content. Cloud agents are
-                    not covered; remote events are omitted because this release has no remote bridge.
-                  </p>
                   <div class="integration-actions">
                     <button
                       class="setup-button setup-button--primary"
@@ -624,12 +781,36 @@
                         <circle cx="12" cy="12" r="3" />
                       </svg>
                       <div>
-                        <h4>
-                          Antigravity activity hooks
-                          <span class="optional-label">Optional</span>
-                        </h4>
+                        <div class="integration-card__title-row">
+                          <h4>
+                            Antigravity activity hooks
+                            <span class="optional-label">Optional</span>
+                          </h4>
+                          <span class="help-popover">
+                            <button
+                              class="help-popover__trigger"
+                              type="button"
+                              aria-label="About Antigravity activity hooks"
+                              aria-describedby="antigravityHooksHelp"
+                            >?</button>
+                            <span
+                              class="help-popover__content"
+                              id="antigravityHooksHelp"
+                              role="tooltip"
+                              popover="manual"
+                            >
+                              Opening a Project or workspace alone does not fire these hooks; start an
+                              agent turn after installation. A workspace-level .agents/hooks.json can
+                              override the global hook. Events identify the Antigravity 2.0 or IDE
+                              surface and workspace, but not an exact live, focused, or openable window.
+                              <span class="help-popover__status" id="antigravityHooksHelpStatus">
+                                Checking current status…
+                              </span>
+                            </span>
+                          </span>
+                        </div>
                         <p class="integration-detail" id="antigravityDetail">
-                          Checking documented Antigravity hooks…
+                          Recent agent activity · start a turn
                         </p>
                       </div>
                     </div>
@@ -642,14 +823,6 @@
                     </span>
                   </div>
                   <p class="integration-meta" id="antigravityMeta" hidden></p>
-                  <p class="integration-activity-limitation" role="note">
-                    <strong>Recent activity only.</strong>
-                    Start an agent turn after installation. Opening a Project or workspace alone
-                    does not fire these hooks, and a workspace-level
-                    <code>.agents/hooks.json</code> can override the global hook. Events identify
-                    the 2.0 or IDE surface and report workspace paths, but not an exact live
-                    window, focus, or open controls.
-                  </p>
                   <div class="integration-actions">
                     <button
                       class="setup-button setup-button--primary"
@@ -679,12 +852,35 @@
                         <path d="m8 10 2.5 2.5L16 7" />
                       </svg>
                       <div>
-                        <h4>
-                          Codex activity hooks
-                          <span class="optional-label">Optional</span>
-                        </h4>
+                        <div class="integration-card__title-row">
+                          <h4>
+                            Codex activity hooks
+                            <span class="optional-label">Optional</span>
+                          </h4>
+                          <span class="help-popover">
+                            <button
+                              class="help-popover__trigger"
+                              type="button"
+                              aria-label="About Codex monitoring"
+                              aria-describedby="codexUsageHelp"
+                            >?</button>
+                            <span
+                              class="help-popover__content"
+                              id="codexUsageHelp"
+                              role="tooltip"
+                              popover="manual"
+                            >
+                              Activity hooks and usage are separate. Live usage requires a compatible,
+                              signed-in Codex CLI available to VSParallel, either standalone or from a
+                              local Codex extension in VS Code, Cursor, or Antigravity IDE.
+                              <span class="help-popover__status" id="codexUsageHelpStatus">
+                                Checking current status…
+                              </span>
+                            </span>
+                          </span>
+                        </div>
                         <p class="integration-detail" id="codexDetail">
-                          Checking local activity hooks…
+                          Lifecycle hooks · CLI usage
                         </p>
                       </div>
                     </div>
@@ -693,12 +889,6 @@
                     </span>
                   </div>
                   <p class="integration-meta" id="codexMeta" hidden></p>
-                  <p class="integration-usage-requirement" role="note">
-                    <strong>Usage remaining is separate.</strong>
-                    For live usage, VSParallel needs a compatible, signed-in Codex CLI available
-                    to this app, either from a standalone installation or the locally installed
-                    Codex extension in VS Code, Cursor, or Antigravity IDE.
-                  </p>
                   <div class="trust-guidance" id="codexTrustGuidance" role="note" hidden>
                     <strong>Review required</strong>
                     Run <code>/hooks</code> in Codex, then review and trust or re-enable the
@@ -732,12 +922,36 @@
                         <path d="m8 5-5 7 5 7M16 5l5 7-5 7M14 3l-4 18" />
                       </svg>
                       <div>
-                        <h4>
-                          Claude Code activity hooks
-                          <span class="optional-label">Optional</span>
-                        </h4>
+                        <div class="integration-card__title-row">
+                          <h4>
+                            Claude Code activity hooks
+                            <span class="optional-label">Optional</span>
+                          </h4>
+                          <span class="help-popover">
+                            <button
+                              class="help-popover__trigger"
+                              type="button"
+                              aria-label="About Claude Code monitoring"
+                              aria-describedby="claudeUsageHelp"
+                            >?</button>
+                            <span
+                              class="help-popover__content"
+                              id="claudeUsageHelp"
+                              role="tooltip"
+                              popover="manual"
+                            >
+                              Activity hooks and usage are separate. Live usage requires a compatible,
+                              signed-in Claude Code CLI available to VSParallel, either standalone or
+                              from a local Claude Code extension in VS Code, Cursor, or Antigravity IDE.
+                              A recent terminal status-line capture can provide fallback usage.
+                              <span class="help-popover__status" id="claudeUsageHelpStatus">
+                                Checking current status…
+                              </span>
+                            </span>
+                          </span>
+                        </div>
                         <p class="integration-detail" id="claudeDetail">
-                          Checking local activity hooks…
+                          Lifecycle hooks · CLI usage
                         </p>
                       </div>
                     </div>
@@ -746,13 +960,6 @@
                     </span>
                   </div>
                   <p class="integration-meta" id="claudeMeta" hidden></p>
-                  <p class="integration-usage-requirement" role="note">
-                    <strong>Usage remaining is separate.</strong>
-                    For live usage, VSParallel needs a compatible, signed-in Claude Code CLI
-                    available to this app, either from a standalone installation or the locally
-                    installed Claude Code extension in VS Code, Cursor, or Antigravity IDE. A
-                    recent terminal status-line capture can also provide fallback usage.
-                  </p>
                   <div class="integration-actions">
                     <button
                       class="setup-button setup-button--primary"
@@ -781,9 +988,7 @@
                   <path d="M13.1 2.8v2.7h-2.7" />
                 </svg>
                 <span>
-                  Reload affected editor windows and restart provider sessions to apply changes.
-                  Cursor, Antigravity 2.0, and Antigravity IDE report hook activity only after a
-                  new agent turn.
+                  Reload editors and restart provider sessions to apply changes.
                 </span>
               </div>
 

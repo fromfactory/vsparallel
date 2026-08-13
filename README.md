@@ -4,9 +4,11 @@ VSParallel is a local-first desktop companion for developers working across
 multiple VS Code, Cursor, and Antigravity IDE windows. It brings every
 workspace into one clear overview, showing workspace activity, focus, and
 coarse Cursor Agent, Antigravity, Codex, and Claude Code lifecycle status at a
-glance. Cursor IDE is fully supported. Cursor's separate Agents Window and
-Antigravity 2.0 can add recent hook-only activity with the limitations
-described below.
+glance. Cursor IDE is fully supported. Cursor's separate Agents Window has an
+experimental, explicitly enabled local bridge that can correlate a running
+thread with Cursor hook metadata; without that bridge it falls back to recent
+hook-only activity. Antigravity 2.0 can add recent hook-only activity with the
+limitations described below.
 
 Switch between projects instantly, return to the workspace that needs your
 attention, and access active workspaces directly from the native system tray—all
@@ -88,11 +90,14 @@ affected integration.
    is preferred without the companion.
 4. Reload editor windows that were already open and restart affected provider
    sessions.
-5. Cursor IDE windows report live heartbeats after reload. The separate Agents
-   Window remains hook-only: opening a local workspace can create a recent
-   `workspaceOpen` observation, and starting a new turn can add Cursor Agent
-   status. Hook records do not prove that a window is live, focused, or
-   openable.
+5. Cursor IDE windows report live heartbeats after reload. Cursor exposes its
+   experimental Desktop Bridge only to a limited server-controlled rollout. If
+   Cursor shows **Settings > Beta > Desktop Bridge > Allow CLI to access desktop
+   agents**, enable it, restart Cursor, and then enable **Cursor Agents Window
+   (experimental)** in VSParallel. If the Desktop Bridge section is absent,
+   live Agents Window monitoring is unavailable in that Cursor installation;
+   keep the hooks enabled for recent hook-only status. VSParallel cannot enable
+   Cursor's rollout flag and does not modify Cursor's internal feature storage.
 6. For an Antigravity built-in model, open a saved **Project** in Antigravity
    2.0 or a workspace in Antigravity IDE and start a new agent turn. Merely
    opening or selecting it does not fire a lifecycle hook. If that workspace
@@ -109,9 +114,10 @@ submit a prompt from the monitored workspace.
 
 If a Cursor IDE window is open but no live workspace appears, open **Setup & diagnostics**,
 set up or repair **Cursor monitoring**, and reload every affected Cursor
-window. Cursor IDE monitoring is fully supported; the separate Agents Window
-remains limited to recent, non-live native-hook observations. Setup installs or
-repairs the companion and all five managed Cursor handlers,
+window. Cursor IDE monitoring is fully supported. The separate Agents Window
+falls back to recent, non-live native-hook observations unless its experimental
+bridge is enabled as described above. Setup installs or repairs the companion
+and all five managed Cursor handlers,
 including `workspaceOpen`, together. Named-profile users must launch VSParallel
 with the matching `VSPARALLEL_CURSOR_PROFILE` value.
 
@@ -120,7 +126,9 @@ provider-extension presence, and a closed editor identifier through compatible
 VS Code APIs. Installed in VS Code, Cursor IDE, or Antigravity IDE, it provides
 live window tracking and a trusted open target when the host exposes a local
 workspace path. Cursor's separate Agents Window does not activate the
-third-party companion and remains hook-only. Optional lifecycle hooks add
+third-party companion. Its optional experimental bridge can add a conservative
+live-running signal, while native hooks remain the source of workspace and
+agent/model metadata. Optional lifecycle hooks add
 coarse **Activity detected**, **Turn finished**, and
 **Failed/interrupted** states. Before the first matching hook event, the UI says
 **No activity yet**; lifecycle information older than 24 hours becomes
@@ -138,12 +146,10 @@ Cursor's bounded composer-mode/background fields, but remains metadata-only
 until a prompt is submitted. These hooks can run for local Cursor agent
 surfaces, including the VS Code-based IDE and separate Agents Window. They do
 not expose a native window identity, liveness, focus, exact open target, or
-source-surface identifier, and VSParallel does not inspect Cursor processes or
-native-window internals; live state comes only from companion heartbeats. Only
-local paths in the `workspace_roots` values supplied by Cursor can be
-associated; pathless events are omitted. An unmatched `workspaceOpen`
-path appears in **Recent** as a generic **Cursor** workspace row with no
-activity card. An unmatched lifecycle path appears as a generic recent
+source-surface identifier. Only local paths in the `workspace_roots` values
+supplied by Cursor can be associated; pathless events are omitted. An unmatched
+`workspaceOpen` path appears in **Recent** as a generic **Cursor** workspace row
+with no activity card. An unmatched lifecycle path appears as a generic recent
 **Cursor Agent** row rather than being attributed to the IDE, Agents Window, or
 Cursor CLI. Neither kind of hook-only row is live, focused, or openable. When
 exactly one Cursor IDE heartbeat covers the path, that companion-backed window
@@ -162,6 +168,31 @@ reports it in Setup. Setup requires all five current handlers; a four-handler
 installation from an earlier VSParallel build is shown as needing an update or
 repair. Reinstalling preserves unrelated hooks, and uninstall recognizes both
 the current and legacy VSParallel-owned handler sets.
+
+Experimental Cursor Agents Window monitoring is a separate, explicit opt-in
+and limited by Cursor's server-controlled `desktop_bridge` rollout. When Cursor
+shows **Allow CLI to access desktop agents**, that setting is enabled, and
+Cursor is restarted, VSParallel reads Cursor's private local Desktop Bridge
+discovery files and sends only `listThreads` over local inter-process
+communication. It never sends an agent message. A returned thread ID is
+immediately SHA-256 hashed and the raw ID is discarded; VSParallel also does
+not retain the thread title, bridge token, socket path, Cursor user-data path,
+prompt text, or response text. An exact thread hash-to-hook `sessionKey` match
+is required before the thread can be associated with a local workspace or show
+the hook's bounded agent/model label. Unmatched threads are not displayed.
+
+Only a matched bridge status of `running` makes an experimental **Cursor agent
+thread** row appear in **Open**. Observed `completed`, `error`, and `idle` threads remain
+in **Recent** with coarse status, and every such row is non-focused and
+non-openable. This private Cursor interface is undocumented and may change or
+stop working after a Cursor update. It also does not distinguish the standalone
+Agents Window from every other Cursor agent surface, so the label means that a
+matched Cursor thread was observed through the bridge—not that VSParallel
+proved which native surface owns it. If the Desktop Bridge section is absent
+from Cursor Settings > Beta, Cursor has not made the rollout available to that
+installation and VSParallel cannot activate it. In other cases, no discovery
+file can mean Cursor is closed, the setting is disabled, or the bridge has not
+started; VSParallel does not guess among those cases.
 
 Antigravity activity monitoring installs a named `vsparallel` entry in
 Antigravity's documented global `~/.gemini/config/hooks.json`. Its
@@ -263,7 +294,8 @@ installed version is verified. All installations use the extension ID
 The primary **Set up Cursor monitoring** action installs or repairs the Cursor
 companion first and then all five native activity hooks. A hooks-only action is
 also available for users who want the recent, non-live fallback without the
-companion.
+companion. The experimental Cursor Agents Window bridge is configured
+separately and stays off until explicitly enabled.
 
 The Cursor, Antigravity, Codex, and Claude Code integrations merge VSParallel-owned
 handlers into their user configuration. Existing unrelated settings and hooks
@@ -317,6 +349,7 @@ set
 ```text
 VS Code / Cursor IDE / Antigravity IDE companion ─ live workspace heartbeat ──────┐
 Cursor native user hooks ───── recent workspace-open/lifecycle metadata ──────────┤
+Cursor Desktop Bridge (opt-in) ─ matched thread status, memory only ───────────────┤
 Antigravity agent hooks ────── recent product/path lifecycle marker ──────────────┤
 Codex hooks ─────────────────── coarse lifecycle marker ──────────────────────────┤─ local state ─┐
 Claude Code hooks ───────────── coarse lifecycle marker ──────────────────────────┤               │
@@ -336,16 +369,23 @@ and a capture timestamp. The Rust backend validates these records and serves
 UI-safe snapshots to the main window; the workspace snapshot also feeds the
 native tray menu.
 
-Lifecycle state is hook-derived rather than an internal provider progress feed.
+Lifecycle state is normally hook-derived rather than an internal provider
+progress feed. When the experimental Cursor Desktop Bridge is enabled, its
+coarse thread status can refine an exact hash-matched Cursor hook session; it
+does not replace the hook's workspace or agent/model metadata.
+
 Records are associated with workspaces by local path, and exact native-window
 foregrounding remains subject to the companion-backed editor and
 operating-system focus behavior. Cursor IDE heartbeats are fully supported;
-Cursor's separate Agents Window remains hook-only. Cursor hooks identify only
-the local `workspace_roots` Cursor supplies; they cover local agent surfaces
-including the IDE and Agents Window but distinguish neither the source surface
-nor a native window. A `workspaceOpen` observation can add a generic recent
-workspace but cannot establish liveness, focus, an open target, or agent
-activity.
+Cursor's separate Agents Window otherwise remains hook-only. Cursor hooks
+identify only the local `workspace_roots` Cursor supplies; they cover local
+agent surfaces including the IDE and Agents Window but distinguish neither the
+source surface nor a native window. A `workspaceOpen` observation can add a
+generic recent workspace but cannot establish liveness, focus, an open target,
+or agent activity. The opt-in bridge can mark only an exactly correlated
+`running` thread as **Open**; its rows are never focused or openable, and it
+cannot prove that the standalone Agents Window rather than another Cursor agent
+surface owns the thread.
 Antigravity hooks identify their product
 surface only after an agent turn and do not expose exact live-window state, so
 only a companion heartbeat can establish liveness and focus, and only one with
@@ -383,6 +423,11 @@ VSParallel stores only the metadata required for the workspace overview:
 - Cursor Agent lifecycle records containing the same privacy-minimal core,
   plus optional bounded `modelName` and `agentKind` labels selected from the
   native hook payload;
+- when explicitly enabled, an in-memory SHA-256 thread key and coarse status
+  from Cursor's local Desktop Bridge, retained only long enough to match a
+  Cursor hook session, plus a bridge-instance-scoped hash of Cursor's numeric window ID
+  used only to avoid merging duplicate live observations; raw thread IDs,
+  titles, bridge credentials and paths, prompts, and responses are not retained;
 - Antigravity hook execution health containing fixed event, surface, and
   outcome values plus timestamp and validated workspace count, but no model; and
 - Claude Code five-hour and weekly usage percentages, their optional reset

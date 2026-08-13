@@ -204,7 +204,7 @@
                 </svg>
               </div>
               <h3>Agent activity visibility</h3>
-              <p>Optional hooks surface coarse Cursor Agent activity and bounded model or agent labels, Antigravity built-in model signals, plus Codex and Claude Code lifecycle status.</p>
+              <p>Optional hooks surface coarse Cursor Agent activity and bounded model or agent labels, Antigravity built-in model signals, plus Codex and Claude Code lifecycle status. Where Cursor's limited rollout exposes its local Desktop Bridge, an experimental opt-in can correlate running Cursor threads; otherwise Cursor Agents Window activity remains recent and hook-only.</p>
             </article>
 
             <article class="feature-card">
@@ -250,7 +250,10 @@
             <p>
               VSParallel keeps workspace monitoring on your device. It does not extract,
               retain, or transmit prompts, responses, source code, terminal contents,
-              transcripts, or Git data.
+              transcripts, or Git data. If you enable the experimental Cursor bridge,
+              VSParallel sends only <code>listThreads</code> over local IPC, immediately
+              hashes thread IDs, and does not retain titles, bridge credentials, paths,
+              prompts, or responses.
             </p>
             <a class="text-link" href="https://github.com/fromfactory/vsparallel/blob/main/PRIVACY.md">
               Read the privacy details
@@ -294,7 +297,7 @@
           <div class="section-heading section-heading--centered">
             <p class="section-label">Available across your desktop</p>
             <h2 id="platforms-title">Pick your platform. Keep your flow.</h2>
-            <p>VSParallel fully supports Cursor IDE. Cursor's separate Agents Window remains hook-only and can provide recent workspace and agent-status observations rather than live window state. VS Code 1.85+, Antigravity IDE, and hook-only Antigravity 2.0 are also supported.</p>
+            <p>VSParallel fully supports Cursor IDE. Cursor's separate Agents Window has an experimental, off-by-default local bridge: enable Cursor's “Allow CLI to access desktop agents” beta setting, restart Cursor, and opt in from VSParallel. Only exact hook-matched running threads appear as open; rows cannot be focused or opened. VS Code 1.85+, Antigravity IDE, and hook-only Antigravity 2.0 are also supported.</p>
           </div>
 
           <div class="platform-grid">
@@ -404,7 +407,7 @@
             <div>
               <p class="section-label">Ready when you are</p>
               <h2>Bring your workspaces together.</h2>
-              <p>Choose your platform above, add an editor companion, and enable the activity hooks you want to see. Cursor setup installs its companion and native hooks together.</p>
+              <p>Choose your platform above, add an editor companion, and enable the activity hooks you want to see. Cursor setup installs its companion and native hooks together; experimental Agents Window monitoring is a separate explicit opt-in.</p>
             </div>
             <div class="download-panel__actions">
               <a

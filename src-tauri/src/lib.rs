@@ -2,6 +2,7 @@ mod antigravity_integration;
 mod claude_integration;
 mod codex_integration;
 mod companion_integration;
+mod cursor_agents_bridge;
 mod cursor_integration;
 mod opener;
 mod state;
@@ -182,7 +183,26 @@ async fn get_usage() -> Result<usage::UsageSnapshot, String> {
 }
 
 fn current_snapshot() -> Result<Snapshot, String> {
-    Ok(StateStore::from_environment()?.snapshot(now_ms()))
+    let now_ms = now_ms();
+    let cursor_agents = cursor_agents_bridge::poll(now_ms, false);
+    let store = StateStore::from_environment()?;
+    Ok(match cursor_agents.snapshot.as_ref() {
+        Some(snapshot) => store.snapshot_with_cursor_agents(now_ms, Some(snapshot)),
+        None => store.snapshot(now_ms),
+    })
+}
+
+#[tauri::command]
+async fn get_cursor_agents_bridge_status(
+) -> Result<cursor_agents_bridge::CursorAgentsBridgeStatusView, String> {
+    run_background(|| Ok(cursor_agents_bridge::poll(now_ms(), false).status)).await
+}
+
+#[tauri::command]
+async fn set_cursor_agents_monitoring_enabled(
+    enabled: bool,
+) -> Result<cursor_agents_bridge::CursorAgentsBridgeStatusView, String> {
+    run_background(move || Ok(cursor_agents_bridge::set_enabled(enabled, now_ms())?.status)).await
 }
 
 #[tauri::command]
@@ -2483,6 +2503,7 @@ pub fn run() {
             get_usage,
             get_diagnostics,
             get_integration_status,
+            get_cursor_agents_bridge_status,
             install_companion,
             uninstall_companion,
             install_cursor_companion,
@@ -2504,7 +2525,8 @@ pub fn run() {
             toggle_window_maximize,
             restore_full_window,
             close_window,
-            set_window_chrome_theme
+            set_window_chrome_theme,
+            set_cursor_agents_monitoring_enabled
         ])
         .build(tauri::generate_context!())
         .expect("error while building VSParallel")

@@ -20,6 +20,13 @@
   type IntegrationOperation = "install" | "uninstall";
   type IntegrationVisualState = "missing" | "ready" | "warning" | "error";
   type ActivityKind = "activity" | "finished" | "failure" | "unknown";
+  type WorkspaceSurface = "editor_workspace" | "hook_only" | "cursor_agent_thread";
+  type CursorAgentsBridgeAvailability =
+    | "disabled"
+    | "connected"
+    | "waiting"
+    | "unsupported"
+    | "error";
   type AntigravityModelKind =
     | "automatic"
     | "gemini"
@@ -50,6 +57,7 @@
     | "failed";
   type TauriCommand =
     | "close_window"
+    | "get_cursor_agents_bridge_status"
     | "get_diagnostics"
     | "get_integration_status"
     | "get_snapshot"
@@ -67,6 +75,7 @@
     | "is_release_build"
     | "open_workspace"
     | "restore_full_window"
+    | "set_cursor_agents_monitoring_enabled"
     | "set_window_chrome_theme"
     | "toggle_window_maximize"
     | "uninstall_claude_hooks"
@@ -95,6 +104,7 @@
     instanceId: string;
     editor: "vscode" | "cursor" | "antigravity_ide" | "antigravity_2";
     editorName: string;
+    surface: WorkspaceSurface;
     name: string;
     path: string;
     openable: boolean;
@@ -175,6 +185,18 @@
     requiresRestart: boolean;
   }
 
+  interface CursorAgentsBridgeStatus {
+    schemaVersion: 1;
+    enabled: boolean;
+    availability: CursorAgentsBridgeAvailability;
+    connected: boolean;
+    instanceCount: number;
+    threadCount: number;
+    lastCheckedAtMs: number | null;
+    errorCode: string;
+    detail: string;
+  }
+
   interface IntegrationAction {
     kind: IntegrationActionKind;
     operation: IntegrationOperation;
@@ -184,6 +206,7 @@
     card: HTMLElement;
     status: HTMLSpanElement;
     detail: HTMLParagraphElement;
+    helpDetail: HTMLSpanElement;
     meta: HTMLParagraphElement;
     installButton: HTMLButtonElement;
     uninstallButton: HTMLButtonElement;
@@ -234,11 +257,13 @@
     diagnosticsUnavailable: boolean;
     diagnosticWarningCount: number;
     setupRefreshPending: boolean;
-    setupRefreshPromise: Promise<[void, void]> | null;
+    setupRefreshPromise: Promise<[void, void, void]> | null;
     integrationPending: boolean;
     integrationLoaded: boolean;
     integrationStatus: IntegrationStatus | null;
     integrationAction: IntegrationAction | null;
+    cursorAgentsBridgePending: boolean;
+    cursorAgentsBridgeStatus: CursorAgentsBridgeStatus | null;
     pendingUninstall: IntegrationKind | null;
     openingInstanceId: string | null;
     lastGoodSnapshot: Snapshot | null;
@@ -365,12 +390,16 @@
     companionCard: requiredElement<HTMLElement>("#companionCard"),
     companionStatus: requiredElement<HTMLSpanElement>("#companionStatus"),
     companionDetail: requiredElement<HTMLParagraphElement>("#companionDetail"),
+    companionHelpStatus: requiredElement<HTMLSpanElement>("#companionHelpStatus"),
     companionMeta: requiredElement<HTMLParagraphElement>("#companionMeta"),
     companionInstallButton: requiredElement<HTMLButtonElement>("#companionInstallButton"),
     companionUninstallButton: requiredElement<HTMLButtonElement>("#companionUninstallButton"),
     cursorCompanionCard: requiredElement<HTMLElement>("#cursorCompanionCard"),
     cursorCompanionStatus: requiredElement<HTMLSpanElement>("#cursorCompanionStatus"),
     cursorCompanionDetail: requiredElement<HTMLParagraphElement>("#cursorCompanionDetail"),
+    cursorCompanionHelpStatus: requiredElement<HTMLSpanElement>(
+      "#cursorCompanionHelpStatus",
+    ),
     cursorCompanionMeta: requiredElement<HTMLParagraphElement>("#cursorCompanionMeta"),
     cursorCompanionInstallButton: requiredElement<HTMLButtonElement>(
       "#cursorCompanionInstallButton",
@@ -378,9 +407,24 @@
     cursorCompanionUninstallButton: requiredElement<HTMLButtonElement>(
       "#cursorCompanionUninstallButton",
     ),
+    cursorAgentsBridgeCard: requiredElement<HTMLElement>("#cursorAgentsBridgeCard"),
+    cursorAgentsBridgeStatus: requiredElement<HTMLSpanElement>("#cursorAgentsBridgeStatus"),
+    cursorAgentsBridgeDetail: requiredElement<HTMLParagraphElement>("#cursorAgentsBridgeDetail"),
+    cursorAgentsBridgeHelpStatus: requiredElement<HTMLSpanElement>(
+      "#cursorAgentsBridgeHelpStatus",
+    ),
+    cursorAgentsBridgeMessage: requiredElement<HTMLParagraphElement>(
+      "#cursorAgentsBridgeMessage",
+    ),
+    cursorAgentsMonitoringEnabled: requiredElement<HTMLInputElement>(
+      "#cursorAgentsMonitoringEnabled",
+    ),
     antigravityIdeCard: requiredElement<HTMLElement>("#antigravityIdeCard"),
     antigravityIdeStatus: requiredElement<HTMLSpanElement>("#antigravityIdeStatus"),
     antigravityIdeDetail: requiredElement<HTMLParagraphElement>("#antigravityIdeDetail"),
+    antigravityIdeHelpStatus: requiredElement<HTMLSpanElement>(
+      "#antigravityIdeHelpStatus",
+    ),
     antigravityIdeMeta: requiredElement<HTMLParagraphElement>("#antigravityIdeMeta"),
     antigravityIdeInstallButton: requiredElement<HTMLButtonElement>(
       "#antigravityIdeInstallButton",
@@ -391,12 +435,16 @@
     cursorCard: requiredElement<HTMLElement>("#cursorCard"),
     cursorStatus: requiredElement<HTMLSpanElement>("#cursorStatus"),
     cursorDetail: requiredElement<HTMLParagraphElement>("#cursorDetail"),
+    cursorHooksHelpStatus: requiredElement<HTMLSpanElement>("#cursorHooksHelpStatus"),
     cursorMeta: requiredElement<HTMLParagraphElement>("#cursorMeta"),
     cursorInstallButton: requiredElement<HTMLButtonElement>("#cursorInstallButton"),
     cursorUninstallButton: requiredElement<HTMLButtonElement>("#cursorUninstallButton"),
     antigravityCard: requiredElement<HTMLElement>("#antigravityCard"),
     antigravityStatus: requiredElement<HTMLSpanElement>("#antigravityStatus"),
     antigravityDetail: requiredElement<HTMLParagraphElement>("#antigravityDetail"),
+    antigravityHooksHelpStatus: requiredElement<HTMLSpanElement>(
+      "#antigravityHooksHelpStatus",
+    ),
     antigravityMeta: requiredElement<HTMLParagraphElement>("#antigravityMeta"),
     antigravityInstallButton: requiredElement<HTMLButtonElement>(
       "#antigravityInstallButton",
@@ -407,6 +455,7 @@
     codexCard: requiredElement<HTMLElement>("#codexCard"),
     codexStatus: requiredElement<HTMLSpanElement>("#codexStatus"),
     codexDetail: requiredElement<HTMLParagraphElement>("#codexDetail"),
+    codexUsageHelpStatus: requiredElement<HTMLSpanElement>("#codexUsageHelpStatus"),
     codexMeta: requiredElement<HTMLParagraphElement>("#codexMeta"),
     codexInstallButton: requiredElement<HTMLButtonElement>("#codexInstallButton"),
     codexUninstallButton: requiredElement<HTMLButtonElement>("#codexUninstallButton"),
@@ -414,6 +463,7 @@
     claudeCard: requiredElement<HTMLElement>("#claudeCard"),
     claudeStatus: requiredElement<HTMLSpanElement>("#claudeStatus"),
     claudeDetail: requiredElement<HTMLParagraphElement>("#claudeDetail"),
+    claudeUsageHelpStatus: requiredElement<HTMLSpanElement>("#claudeUsageHelpStatus"),
     claudeMeta: requiredElement<HTMLParagraphElement>("#claudeMeta"),
     claudeInstallButton: requiredElement<HTMLButtonElement>("#claudeInstallButton"),
     claudeUninstallButton: requiredElement<HTMLButtonElement>("#claudeUninstallButton"),
@@ -447,6 +497,8 @@
     integrationLoaded: false,
     integrationStatus: null,
     integrationAction: null,
+    cursorAgentsBridgePending: false,
+    cursorAgentsBridgeStatus: null,
     pendingUninstall: null,
     openingInstanceId: null,
     lastGoodSnapshot: null,
@@ -467,6 +519,150 @@
   };
 
   const dialogReturnFocus = new WeakMap<HTMLDialogElement, HTMLElement>();
+  const HELP_POPOVER_GAP_PX = 7;
+  const HELP_POPOVER_GUTTER_PX = 10;
+
+  interface ActiveHelpPopover {
+    trigger: HTMLButtonElement;
+    content: HTMLElement;
+    pinned: boolean;
+  }
+
+  let activeHelpPopover: ActiveHelpPopover | null = null;
+
+  function helpPopoverIsOpen(content: HTMLElement): boolean {
+    if (typeof content.showPopover === "function") {
+      return content.matches(":popover-open");
+    }
+    return content.dataset.fallbackOpen === "true";
+  }
+
+  function positionHelpPopover(trigger: HTMLButtonElement, content: HTMLElement): void {
+    if (!helpPopoverIsOpen(content)) {
+      return;
+    }
+
+    const triggerRect = trigger.getBoundingClientRect();
+    const contentRect = content.getBoundingClientRect();
+    const maximumLeft = Math.max(
+      HELP_POPOVER_GUTTER_PX,
+      window.innerWidth - contentRect.width - HELP_POPOVER_GUTTER_PX,
+    );
+    const centeredLeft = triggerRect.left + (triggerRect.width - contentRect.width) / 2;
+    const left = Math.min(
+      Math.max(centeredLeft, HELP_POPOVER_GUTTER_PX),
+      maximumLeft,
+    );
+    const preferredTop = triggerRect.top - contentRect.height - HELP_POPOVER_GAP_PX;
+    const belowTop = triggerRect.bottom + HELP_POPOVER_GAP_PX;
+    const maximumTop = Math.max(
+      HELP_POPOVER_GUTTER_PX,
+      window.innerHeight - contentRect.height - HELP_POPOVER_GUTTER_PX,
+    );
+    const top = Math.min(
+      Math.max(
+        preferredTop >= HELP_POPOVER_GUTTER_PX ? preferredTop : belowTop,
+        HELP_POPOVER_GUTTER_PX,
+      ),
+      maximumTop,
+    );
+    content.style.left = `${Math.round(left)}px`;
+    content.style.top = `${Math.round(top)}px`;
+  }
+
+  function closeActiveHelpPopover(): boolean {
+    const active = activeHelpPopover;
+    if (!active) {
+      return false;
+    }
+    activeHelpPopover = null;
+    if (typeof active.content.hidePopover === "function") {
+      if (active.content.matches(":popover-open")) {
+        active.content.hidePopover();
+      }
+    } else {
+      delete active.content.dataset.fallbackOpen;
+    }
+    return true;
+  }
+
+  function openHelpPopover(
+    trigger: HTMLButtonElement,
+    content: HTMLElement,
+    pinned: boolean,
+  ): void {
+    if (activeHelpPopover?.content !== content) {
+      closeActiveHelpPopover();
+    }
+    activeHelpPopover = { trigger, content, pinned };
+    if (typeof content.showPopover === "function") {
+      if (!content.matches(":popover-open")) {
+        content.showPopover();
+      }
+    } else {
+      content.dataset.fallbackOpen = "true";
+    }
+    positionHelpPopover(trigger, content);
+  }
+
+  function initializeHelpPopovers(): void {
+    document.querySelectorAll<HTMLElement>(".help-popover").forEach((wrapper) => {
+      const trigger = wrapper.querySelector<HTMLButtonElement>(".help-popover__trigger");
+      const describedId = trigger?.getAttribute("aria-describedby") || "";
+      const content = describedId
+        ? document.getElementById(describedId)
+        : null;
+      if (!trigger || !content || !content.classList.contains("help-popover__content")) {
+        return;
+      }
+
+      wrapper.addEventListener("pointerenter", () => {
+        openHelpPopover(trigger, content, false);
+      });
+      wrapper.addEventListener("pointerleave", () => {
+        if (
+          activeHelpPopover?.trigger === trigger
+          && !activeHelpPopover.pinned
+          && document.activeElement !== trigger
+        ) {
+          closeActiveHelpPopover();
+        }
+      });
+      trigger.addEventListener("focus", () => {
+        openHelpPopover(trigger, content, false);
+      });
+      trigger.addEventListener("blur", () => {
+        window.setTimeout(() => {
+          if (activeHelpPopover?.trigger === trigger && !activeHelpPopover.pinned) {
+            closeActiveHelpPopover();
+          }
+        }, 0);
+      });
+      trigger.addEventListener("click", (event) => {
+        event.preventDefault();
+        if (activeHelpPopover?.trigger === trigger && activeHelpPopover.pinned) {
+          closeActiveHelpPopover();
+        } else {
+          openHelpPopover(trigger, content, true);
+        }
+      });
+    });
+
+    document.addEventListener("pointerdown", (event) => {
+      if (
+        activeHelpPopover
+        && event.target instanceof Node
+        && !activeHelpPopover.trigger.contains(event.target)
+      ) {
+        closeActiveHelpPopover();
+      }
+    }, true);
+    elements.settingsDialog.addEventListener("scroll", () => {
+      if (activeHelpPopover) {
+        positionHelpPopover(activeHelpPopover.trigger, activeHelpPopover.content);
+      }
+    }, true);
+  }
 
   function isObject(value: unknown): value is JsonObject {
     return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -646,6 +842,39 @@
     };
   }
 
+  function normalizeCursorAgentsBridgeStatus(rawValue: unknown): CursorAgentsBridgeStatus {
+    const raw = parseBridgeValue(rawValue);
+    if (!isObject(raw)) {
+      throw new Error("VSParallel returned invalid Cursor agent-thread status.");
+    }
+    if (raw.schemaVersion !== SCHEMA_VERSION) {
+      throw new Error("VSParallel returned an unsupported Cursor agent-thread status version.");
+    }
+
+    const availabilityToken = normalizeStateToken(raw.availability);
+    const availability: CursorAgentsBridgeAvailability = [
+      "disabled",
+      "connected",
+      "waiting",
+      "unsupported",
+      "error",
+    ].includes(availabilityToken)
+      ? availabilityToken as CursorAgentsBridgeAvailability
+      : "error";
+
+    return {
+      schemaVersion: SCHEMA_VERSION,
+      enabled: raw.enabled === true,
+      availability,
+      connected: availability === "connected" && raw.connected === true,
+      instanceCount: asNonNegativeInteger(raw.instanceCount),
+      threadCount: asNonNegativeInteger(raw.threadCount),
+      lastCheckedAtMs: asTimestamp(raw.lastCheckedAtMs),
+      errorCode: asString(raw.errorCode),
+      detail: asString(raw.detail),
+    };
+  }
+
   function describeActivityState(token: string): Pick<ActivityView, "kind" | "label"> {
     if (token === "activity_detected") {
       return {
@@ -791,7 +1020,15 @@
         : editorToken === "antigravity_2"
           ? "antigravity_2"
           : "vscode";
-    const defaultEditorName = editor === "cursor"
+    const surfaceToken = normalizeStateToken(raw.surface);
+    const surface: WorkspaceSurface = surfaceToken === "hook_only"
+      ? "hook_only"
+      : surfaceToken === "cursor_agent_thread"
+        ? "cursor_agent_thread"
+        : "editor_workspace";
+    const defaultEditorName = surface === "cursor_agent_thread"
+      ? "Cursor agent thread (experimental)"
+      : editor === "cursor"
       ? "Cursor"
       : editor === "antigravity_ide"
         ? "Antigravity IDE"
@@ -803,9 +1040,12 @@
       instanceId,
       editor,
       editorName: asString(raw.editorName, defaultEditorName),
+      surface,
       name,
       path,
-      openable: raw.openable === true && Boolean(instanceId),
+      openable: surface !== "cursor_agent_thread"
+        && raw.openable === true
+        && Boolean(instanceId),
       active: raw.active === true,
       focused: raw.focused === true,
       recentlyActive: raw.recentlyActive === true,
@@ -1265,9 +1505,11 @@
     } else if (lifecycleSource) {
       const source = createElement("span", "provider-extension", lifecycleSource);
       source.dataset.state = "present";
-      source.title = lifecycleSource === "Cursor hooks"
-        ? "Lifecycle activity reported by Cursor's documented agent hooks."
-        : "Lifecycle activity reported by Antigravity's built-in model hook.";
+      source.title = lifecycleSource === "Cursor desktop bridge"
+        ? "Live thread state reported by Cursor's experimental read-only Desktop Bridge and correlated with bounded Cursor hook metadata."
+        : lifecycleSource === "Cursor hooks"
+          ? "Lifecycle activity reported by Cursor's documented agent hooks."
+          : "Lifecycle activity reported by Antigravity's built-in model hook.";
       body.append(source);
       presenceLabel = lifecycleSource;
     }
@@ -1287,6 +1529,7 @@
     row.classList.toggle("is-inactive", !workspace.active);
     row.classList.toggle("is-opening", opening);
     row.dataset.openable = String(openable);
+    row.dataset.surface = workspace.surface;
 
     const primary = createElement("div", "workspace-primary");
     const application = createElement(
@@ -1295,6 +1538,9 @@
       workspace.editorName,
     );
     application.dataset.editor = workspace.editor;
+    if (workspace.surface === "cursor_agent_thread") {
+      application.title = "Correlated through Cursor's experimental local Desktop Bridge.";
+    }
     const titleLine = createElement("div", "workspace-title-line");
     const name = createElement("h4", "workspace-name", workspace.name);
     name.title = workspace.name;
@@ -1348,6 +1594,9 @@
       const cursorDetails = [workspace.cursor.agentKind, workspace.cursor.modelName]
         .filter(Boolean)
         .join(" · ");
+      const cursorSource = workspace.surface === "cursor_agent_thread"
+        ? "Cursor desktop bridge"
+        : "Cursor hooks";
       providers.append(
         createProviderState(
           "Cursor Agent",
@@ -1358,13 +1607,16 @@
           workspace.editorName,
           false,
           false,
-          "Cursor hooks",
+          cursorSource,
           cursorDetails,
           cursorDetails ? `Latest Cursor agent and model: ${cursorDetails}` : "",
         ),
       );
     }
-    if (workspace.editor !== "antigravity_2") {
+    if (
+      workspace.editor !== "antigravity_2"
+      && workspace.surface !== "cursor_agent_thread"
+    ) {
       providers.append(
         createProviderState(
           "Codex",
@@ -1396,7 +1648,9 @@
     openButton.setAttribute("aria-label", accessibleActionLabel);
     openButton.setAttribute("aria-busy", String(opening));
     if (!workspace.openable) {
-      openButton.title = workspace.recentlyActive
+      openButton.title = workspace.surface === "cursor_agent_thread"
+        ? "Cursor's experimental desktop bridge reports agent-thread status but does not provide a safe window activation target"
+        : workspace.recentlyActive
         ? `${workspace.editorName} hook activity does not identify a live window or exact open target`
         : "This workspace cannot currently be opened";
     } else {
@@ -2235,6 +2489,7 @@
         card: elements.companionCard,
         status: elements.companionStatus,
         detail: elements.companionDetail,
+        helpDetail: elements.companionHelpStatus,
         meta: elements.companionMeta,
         installButton: elements.companionInstallButton,
         uninstallButton: elements.companionUninstallButton,
@@ -2246,6 +2501,7 @@
         card: elements.cursorCompanionCard,
         status: elements.cursorCompanionStatus,
         detail: elements.cursorCompanionDetail,
+        helpDetail: elements.cursorCompanionHelpStatus,
         meta: elements.cursorCompanionMeta,
         installButton: elements.cursorCompanionInstallButton,
         uninstallButton: elements.cursorCompanionUninstallButton,
@@ -2257,6 +2513,7 @@
         card: elements.antigravityIdeCard,
         status: elements.antigravityIdeStatus,
         detail: elements.antigravityIdeDetail,
+        helpDetail: elements.antigravityIdeHelpStatus,
         meta: elements.antigravityIdeMeta,
         installButton: elements.antigravityIdeInstallButton,
         uninstallButton: elements.antigravityIdeUninstallButton,
@@ -2268,6 +2525,7 @@
         card: elements.antigravityCard,
         status: elements.antigravityStatus,
         detail: elements.antigravityDetail,
+        helpDetail: elements.antigravityHooksHelpStatus,
         meta: elements.antigravityMeta,
         installButton: elements.antigravityInstallButton,
         uninstallButton: elements.antigravityUninstallButton,
@@ -2279,6 +2537,7 @@
         card: elements.cursorCard,
         status: elements.cursorStatus,
         detail: elements.cursorDetail,
+        helpDetail: elements.cursorHooksHelpStatus,
         meta: elements.cursorMeta,
         installButton: elements.cursorInstallButton,
         uninstallButton: elements.cursorUninstallButton,
@@ -2290,6 +2549,7 @@
         card: elements.claudeCard,
         status: elements.claudeStatus,
         detail: elements.claudeDetail,
+        helpDetail: elements.claudeUsageHelpStatus,
         meta: elements.claudeMeta,
         installButton: elements.claudeInstallButton,
         uninstallButton: elements.claudeUninstallButton,
@@ -2300,6 +2560,7 @@
       card: elements.codexCard,
       status: elements.codexStatus,
       detail: elements.codexDetail,
+      helpDetail: elements.codexUsageHelpStatus,
       meta: elements.codexMeta,
       installButton: elements.codexInstallButton,
       uninstallButton: elements.codexUninstallButton,
@@ -2311,7 +2572,7 @@
     componentElements.card.dataset.state = component.visualState;
     componentElements.status.dataset.state = component.visualState;
     componentElements.status.textContent = component.label;
-    componentElements.detail.textContent = component.detail;
+    componentElements.detail.textContent = integrationPurpose(component.kind);
     const installButtonLabel = integrationInstallButtonLabel(component);
     componentElements.installButton.textContent = installButtonLabel;
     const componentName = component.kind === "companion"
@@ -2347,8 +2608,30 @@
     } else if (component.configPath) {
       meta = `Configuration: ${component.configPath}`;
     }
-    componentElements.meta.textContent = meta;
-    componentElements.meta.hidden = !meta;
+    componentElements.meta.textContent = "";
+    componentElements.meta.hidden = true;
+    const helpDetails = [component.detail, meta].filter(Boolean);
+    componentElements.helpDetail.textContent = helpDetails.length
+      ? `Current status: ${helpDetails.join(" · ")}`
+      : "Current status details are unavailable.";
+  }
+
+  function integrationPurpose(kind: IntegrationKind): string {
+    switch (kind) {
+      case "companion":
+        return "Live VS Code workspaces";
+      case "cursorCompanion":
+        return "Live IDE workspaces · recent agent activity";
+      case "antigravityIde":
+        return "Live Antigravity IDE workspaces";
+      case "cursor":
+        return "Recent workspace and agent activity";
+      case "antigravity":
+        return "Recent agent activity · start a turn";
+      case "codex":
+      case "claude":
+        return "Lifecycle hooks · CLI usage";
+    }
   }
 
   function integrationInstallButtonLabel(component: IntegrationComponent): string {
@@ -2514,6 +2797,145 @@
     updateSetupSummary();
   }
 
+  function describeCursorAgentsBridgeStatus(
+    status: CursorAgentsBridgeStatus,
+  ): { state: "neutral" | "ready" | "warning" | "error"; label: string; detail: string } {
+    if (status.availability === "disabled") {
+      return {
+        state: "neutral",
+        label: "Off",
+        detail: "Off by default",
+      };
+    }
+
+    if (status.availability === "connected" && status.connected) {
+      const instances = `${status.instanceCount} instance${status.instanceCount === 1 ? "" : "s"}`;
+      const threads = `${status.threadCount} thread${status.threadCount === 1 ? "" : "s"}`;
+      const checked = status.lastCheckedAtMs === null
+        ? ""
+        : formatRelativeTime(status.lastCheckedAtMs).toLowerCase();
+      return {
+        state: "ready",
+        label: "Connected",
+        detail: [`${instances} · ${threads}`, checked].filter(Boolean).join(" · "),
+      };
+    }
+
+    if (status.availability === "waiting") {
+      return {
+        state: "warning",
+        label: "Not connected",
+        detail: "Desktop Bridge is not available",
+      };
+    }
+
+    if (status.availability === "unsupported") {
+      return {
+        state: "warning",
+        label: "Unavailable",
+        detail: "Unsupported in this build or platform",
+      };
+    }
+
+    return {
+      state: "error",
+      label: "Check failed",
+      detail: "Could not safely check Desktop Bridge",
+    };
+  }
+
+  function updateCursorAgentsBridgeControls(): void {
+    const pending = state.cursorAgentsBridgePending;
+    elements.cursorAgentsBridgeCard.setAttribute("aria-busy", String(pending));
+    elements.cursorAgentsMonitoringEnabled.disabled = pending;
+  }
+
+  function renderCursorAgentsBridgeStatus(status: CursorAgentsBridgeStatus): void {
+    state.cursorAgentsBridgeStatus = status;
+    const description = describeCursorAgentsBridgeStatus(status);
+    elements.cursorAgentsBridgeCard.dataset.state = description.state;
+    elements.cursorAgentsBridgeStatus.dataset.state = description.state;
+    elements.cursorAgentsBridgeStatus.textContent = description.label;
+    elements.cursorAgentsBridgeDetail.textContent = description.detail;
+    elements.cursorAgentsBridgeHelpStatus.textContent = status.detail
+      ? `Current status: ${status.detail}`
+      : "Current status details are unavailable.";
+    elements.cursorAgentsMonitoringEnabled.checked = status.enabled;
+    updateCursorAgentsBridgeControls();
+  }
+
+  function setCursorAgentsBridgeMessage(message: string, error = false): void {
+    elements.cursorAgentsBridgeMessage.textContent = message;
+    elements.cursorAgentsBridgeMessage.hidden = !message;
+    elements.cursorAgentsBridgeMessage.classList.toggle("has-error", error);
+    elements.cursorAgentsBridgeMessage.classList.toggle("has-success", Boolean(message) && !error);
+  }
+
+  async function refreshCursorAgentsBridgeStatus(): Promise<void> {
+    if (state.cursorAgentsBridgePending) {
+      return;
+    }
+
+    state.cursorAgentsBridgePending = true;
+    updateCursorAgentsBridgeControls();
+    try {
+      const raw = await invoke("get_cursor_agents_bridge_status", {});
+      renderCursorAgentsBridgeStatus(normalizeCursorAgentsBridgeStatus(raw));
+      setCursorAgentsBridgeMessage("");
+    } catch (_error) {
+      const previous = state.cursorAgentsBridgeStatus;
+      renderCursorAgentsBridgeStatus({
+        schemaVersion: SCHEMA_VERSION,
+        enabled: previous?.enabled ?? false,
+        availability: "error",
+        connected: false,
+        instanceCount: 0,
+        threadCount: 0,
+        lastCheckedAtMs: null,
+        errorCode: "",
+        detail: "VSParallel could not check experimental Cursor agent-thread monitoring.",
+      });
+    } finally {
+      state.cursorAgentsBridgePending = false;
+      updateCursorAgentsBridgeControls();
+    }
+  }
+
+  async function setCursorAgentsMonitoringEnabled(enabled: boolean): Promise<void> {
+    if (state.cursorAgentsBridgePending) {
+      return;
+    }
+
+    const previous = state.cursorAgentsBridgeStatus;
+    state.cursorAgentsBridgePending = true;
+    setCursorAgentsBridgeMessage("");
+    updateCursorAgentsBridgeControls();
+    try {
+      const raw = await invoke("set_cursor_agents_monitoring_enabled", { enabled });
+      const status = normalizeCursorAgentsBridgeStatus(raw);
+      renderCursorAgentsBridgeStatus(status);
+      setCursorAgentsBridgeMessage(
+        status.enabled
+          ? "Experimental Cursor agent-thread monitoring enabled."
+          : "Experimental Cursor agent-thread monitoring disabled.",
+      );
+      await refreshSnapshot();
+    } catch (_error) {
+      if (previous) {
+        renderCursorAgentsBridgeStatus(previous);
+      } else {
+        elements.cursorAgentsMonitoringEnabled.checked = false;
+      }
+      setCursorAgentsBridgeMessage(
+        "VSParallel could not save the Cursor agent-thread monitoring preference.",
+        true,
+      );
+    } finally {
+      state.cursorAgentsBridgePending = false;
+      updateCursorAgentsBridgeControls();
+    }
+  }
+
   function setIntegrationMessage(
     message: string,
     kind: IntegrationMessageKind = "neutral",
@@ -2568,13 +2990,13 @@
   ): string {
     if (operation === "uninstall") {
       if (kind === "companion") {
-        return "VS Code companion uninstalled. Existing stale heartbeats will age out automatically.";
+        return "VS Code companion uninstalled. Existing records will age out.";
       }
       if (kind === "cursorCompanion") {
-        return "Cursor companion uninstalled. Existing stale heartbeats will age out automatically.";
+        return "Cursor companion uninstalled. Existing records will age out.";
       }
       if (kind === "antigravityIde") {
-        return "Antigravity IDE companion uninstalled. Existing stale heartbeats will age out automatically.";
+        return "Antigravity IDE companion uninstalled. Existing records will age out.";
       }
       const provider = kind === "cursor"
         ? "Cursor"
@@ -2583,26 +3005,26 @@
           : kind === "codex"
             ? "Codex"
             : "Claude Code";
-      return `${provider} activity hooks uninstalled. Existing stale activity markers will age out automatically.`;
+      return `${provider} activity hooks uninstalled. Existing records will age out.`;
     }
     if (kind === "companion") {
-      return "VS Code companion installed. Reload open VS Code windows to start reporting heartbeats.";
+      return "VS Code companion installed. Reload open VS Code windows.";
     }
     if (kind === "cursorCompanion") {
-      return "Cursor monitoring installed. Reload open Cursor IDE windows; live IDE heartbeats begin after reload. The Agents Window remains hook-only and reports recent activity, not a live or openable window.";
+      return "Cursor monitoring installed. Reload open Cursor IDE windows.";
     }
     if (kind === "antigravityIde") {
-      return "Antigravity IDE companion installed. Reload open Antigravity IDE windows to start reporting heartbeats.";
+      return "Antigravity IDE companion installed. Reload open Antigravity IDE windows.";
     }
     if (kind === "antigravity") {
-      return "Antigravity activity hooks installed. Start a new agent turn in an Antigravity 2.0 Project or Antigravity IDE workspace; opening it alone does not fire a hook.";
+      return "Antigravity hooks installed. Start a new agent turn.";
     }
     if (kind === "cursor") {
-      return "Cursor hooks only installed. Opening a local workspace can create recent workspace evidence; start a new turn in the Cursor IDE or Agents Window for lifecycle status. Hooks do not establish a live or openable window.";
+      return "Cursor hooks installed. Open a workspace or start a new turn.";
     }
     return kind === "codex"
-      ? "Codex activity hooks installed. Usage remaining is separate; see the requirement above. In Codex, run /hooks and complete the required security review."
-      : "Claude Code activity hooks installed. Usage remaining is separate; see the requirement above. Restart affected Claude Code sessions to load the new lifecycle handlers.";
+      ? "Codex hooks installed. Review /hooks in Codex."
+      : "Claude Code hooks installed. Restart active sessions.";
   }
 
   async function runIntegrationAction(
@@ -2804,12 +3226,9 @@
 
     if (unconfirmed.length === 0) {
       const editorNames = editorSteps.map((step) => step.editorName);
-      const cursorReloadNote = editorKinds.includes("cursorCompanion")
-        ? " Live Cursor IDE heartbeats begin after reload; the Agents Window remains hook-only."
-        : "";
       const successMessage = editorNames.length
-        ? `${formatNaturalList(editorNames)} companion${editorNames.length === 1 ? "" : "s"} and activity hooks are installed. Reload ${formatNaturalList(editorNames)}.${cursorReloadNote} Restart affected provider sessions, then run /hooks in Codex and complete its required security review.`
-        : "Activity hooks are installed. No available editor companion CLI was detected, so editor setup was skipped. Restart affected provider sessions, then run /hooks in Codex and complete its required security review.";
+        ? "Monitoring installed. Reload affected editors, restart provider sessions, and review /hooks in Codex."
+        : "Activity hooks installed. No editor companion was available; restart provider sessions and review /hooks in Codex.";
       setIntegrationMessage(
         successMessage,
         "success",
@@ -2844,6 +3263,7 @@
   }
 
   function closeSettingsDialog(): void {
+    closeActiveHelpPopover();
     closeAccessibleDialog(elements.settingsDialog);
   }
 
@@ -2931,10 +3351,10 @@
       return `${activeRecords} active · ${retainedRecords} retained · latest ${latestDescription}`;
     }
     if (retainedRecords > 0) {
-      return `No active Cursor IDE heartbeat · ${retainedRecords} retained · latest ${latestDescription} · Agents Window is hook-only`;
+      return `No active Cursor IDE heartbeat · ${retainedRecords} retained · latest ${latestDescription} · unmatched Agents Window evidence is hook-only`;
     }
     if (recentWorkspaceOpens > 0) {
-      return "No live Cursor IDE heartbeat · the hook source may be the hook-only Agents Window; reload Cursor IDE for OPEN";
+      return "No live Cursor IDE heartbeat · the hook source may be Agents Window; an exact experimental bridge match is required for live thread status";
     }
     return "Not observed · set up Cursor monitoring and reload Cursor IDE";
   }
@@ -3110,14 +3530,14 @@
     updateSetupSummary();
     elements.diagnosticsStatus.classList.remove("has-error");
     elements.diagnosticsStatus.textContent = validInstances || validAntigravity || validCursor
-      ? "One or more editor heartbeats, Cursor hook records, or Antigravity activity records are available."
+      ? "Local monitoring data is available."
       : antigravityHookHealthUnreadable
-        ? "VSParallel could not read one or more Antigravity hook execution-health records."
+        ? "Some Antigravity hook health records are unreadable."
         : !antigravityHookObserved
-          ? "No workspace source is present yet. Opening an Antigravity 2.0 Project or Antigravity IDE workspace does not fire hooks; start an agent turn to create recent activity."
+          ? "No workspace activity observed yet."
           : antigravityHookWarning
-            ? "Antigravity invoked VSParallel, but a latest surface event did not create a workspace record."
-            : "No valid workspace source is present yet. Check an editor companion, Cursor activity hooks, or Antigravity activity hooks.";
+            ? "The latest Antigravity event was not recorded."
+            : "No valid workspace source found.";
   }
 
   async function refreshDiagnostics(): Promise<void> {
@@ -3145,7 +3565,7 @@
     }
   }
 
-  async function refreshSetup(): Promise<[void, void] | undefined> {
+  async function refreshSetup(): Promise<[void, void, void] | undefined> {
     if (state.setupRefreshPromise) {
       return state.setupRefreshPromise;
     }
@@ -3161,6 +3581,7 @@
 
     state.setupRefreshPromise = Promise.all([
       refreshIntegrationStatus(),
+      refreshCursorAgentsBridgeStatus(),
       refreshDiagnostics(),
     ]).finally(() => {
       state.setupRefreshPending = false;
@@ -3313,6 +3734,9 @@
     }
 
     event.preventDefault();
+    if (closeActiveHelpPopover()) {
+      return;
+    }
     if (isDialogOpen(elements.uninstallDialog)) {
       closeUninstallDialog();
     } else if (isDialogOpen(elements.settingsDialog)) {
@@ -3322,6 +3746,8 @@
       hideAction();
     }
   }
+
+  initializeHelpPopovers();
 
   elements.refreshButton.addEventListener("click", refreshAll);
   elements.emptySetupButton.addEventListener("click", openSettingsDialog);
@@ -3342,6 +3768,9 @@
         applyThemePreference(input.value);
       }
     });
+  });
+  elements.cursorAgentsMonitoringEnabled.addEventListener("change", () => {
+    void setCursorAgentsMonitoringEnabled(elements.cursorAgentsMonitoringEnabled.checked);
   });
   elements.diagnosticsRefreshButton.addEventListener("click", refreshSetup);
   elements.setupAllButton.addEventListener("click", setupAllIntegrations);
@@ -3409,14 +3838,21 @@
     refreshUsageIfDue();
     if (isDialogOpen(elements.settingsDialog)) {
       refreshIntegrationStatus();
+      refreshCursorAgentsBridgeStatus();
     }
     scheduleWindowChromeRefresh();
   });
   window.addEventListener("blur", () => {
     document.documentElement.dataset.windowFocused = "false";
+    closeActiveHelpPopover();
     scheduleWindowChromeRefresh();
   });
   window.addEventListener("resize", scheduleWindowChromeRefresh);
+  window.addEventListener("resize", () => {
+    if (activeHelpPopover) {
+      positionHelpPopover(activeHelpPopover.trigger, activeHelpPopover.content);
+    }
+  });
   window.addEventListener("keydown", handleGlobalKeydown);
   if (typeof lightThemeQuery.addEventListener === "function") {
     lightThemeQuery.addEventListener("change", handleSystemThemeChange);

@@ -62,8 +62,9 @@ a locally configured launcher but never contains an executable or command
 path. Older heartbeats without `editor` remain valid and use the historical VS
 Code behavior. `antigravity_2` and a separate Cursor Agents Window value are
 not accepted from a companion heartbeat. Cursor's separate Agents Window does
-not activate the third-party companion and remains represented only through
-the hook-record protocol below.
+not activate the third-party companion. It is represented through the
+hook-record protocol below, optionally refined in memory by the experimental
+Cursor Desktop Bridge observation described below.
 
 `active` is the VS Code-compatible host's recent-interaction hint; it is not
 used as liveness. VSParallel derives liveness only from `lastSeenAtMs`.
@@ -103,7 +104,8 @@ from UI-supplied path or command data. `vscode` selects
 prefer an existing exact-target window. A retained but inactive heartbeat uses
 `--new-window` for the exact target. The target must still be an existing local
 absolute path. Hook-only Cursor workspace, Cursor Agent, Antigravity 2.0, and
-Antigravity IDE rows never produce an open target.
+Antigravity IDE rows never produce an open target. Experimental bridge-refined
+Cursor Agent rows are also non-openable.
 
 ## Hook observations and lifecycle records (schema version 1)
 
@@ -266,9 +268,53 @@ Lifecycle records are first reduced to the newest marker per hashed session;
 any remaining fresh active session takes priority over another session's
 terminal marker.
 Stale and pathless hook records do not produce hook-only rows. No Cursor process
-or native-window scraping is performed; live state comes only from companion
-heartbeats. User-level hooks do not cover cloud agents, and remote hook
-executions are suppressed as described above.
+or native-window scraping is performed. User-level hooks do not cover cloud
+agents, and remote hook executions are suppressed as described above.
+
+### Cursor Desktop Bridge observation (experimental; memory only)
+
+This integration is disabled by default and has no public or stable Cursor
+protocol guarantee. Cursor renders **Settings > Beta > Desktop Bridge > Allow
+CLI to access desktop agents** only for installations included in its limited,
+server-controlled `desktop_bridge` rollout. If present, the user can enable it,
+restart Cursor, and then enable the separate experimental option in VSParallel.
+If absent, VSParallel cannot activate or bypass the rollout and remains on the
+recent, hook-only fallback. Bridge discovery absence is not treated as proof
+that Cursor or its Agents Window is closed: the private feature may be gated,
+the visible user setting may be disabled, or the bridge may not have started.
+
+When enabled, VSParallel reads Cursor's private local Desktop Bridge discovery
+files and uses the discovered local IPC endpoint to send this read-only request:
+
+```json
+{"type":"listThreads"}
+```
+
+VSParallel does not call the bridge's send-message operation. Discovery tokens,
+socket paths, Cursor user-data paths, app details, and process details are used
+only transiently to validate and reach the local endpoint; they are not copied
+into the metadata protocol, logs, diagnostics, or UI. Response size, field
+shape, identifiers, timestamps, source, and status are bounded and validated.
+
+For each accepted response item, VSParallel immediately computes
+`sha256(thread.id)` and discards the raw ID and title. The hash, closed source,
+coarse status (`running`, `completed`, `error`, `idle`, or unknown), update
+time, and a bridge-instance-scoped hash of Cursor's numeric window ID exist in process
+memory only. The last value prevents distinct observations from being merged
+and is never persisted or exposed. A thread is eligible for display only when
+that hash exactly equals an existing Cursor hook record's `sessionKey`; the
+hook record supplies the normalized workspace and any bounded agent/model
+metadata. There is deliberately no path or time heuristic, and unmatched
+bridge threads are not shown.
+
+Bridge matching does not override a Cursor IDE workspace already covered by a
+companion heartbeat. For an otherwise unmatched hook workspace, a matched
+`running` thread produces a non-focused, non-openable experimental **Cursor
+agent thread** row in **Open**. Matched `completed`, `error`, and `idle` observations
+remain in **Recent** with a coarse lifecycle label. The bridge does not expose
+a trustworthy native-window identity or exact surface discriminator, so this
+row indicates a correlated Cursor agent thread, not proof that the standalone
+Agents Window rather than another Cursor agent surface owns it.
 
 ### Cursor hook installation
 
@@ -574,7 +620,12 @@ only normalized local workspace roots and a timestamp, uses a path-derived
 one-way key, and contains no agent/model metadata. The adapter discards prompts,
 responses, email fields, transcripts, token data, and other unselected
 native-hook fields, and does not write a record when Cursor supplies no usable
-local workspace root. The
+local workspace root. The experimental Cursor Desktop Bridge writes no thread
+record: it hashes each bounded raw thread ID immediately, discards the raw ID
+and title, and retains only the hash and validated coarse fields in process
+memory for exact hook-session matching. Discovery tokens, socket paths, Cursor
+user-data paths, prompt text, and response text never enter the metadata
+protocol. The
 Claude status-line adapter
 likewise creates the minimal usage record shown above and does not represent or
 persist the accompanying session ID, working directory, model, cost,

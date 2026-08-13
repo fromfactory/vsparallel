@@ -537,7 +537,7 @@ fn escape_menu_mnemonics(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{ActivityView, WorkspaceView};
+    use crate::state::{ActivityView, WorkspaceSurface, WorkspaceView};
 
     fn icon_pixel(rgba: &[u8], width: u32, x: u32, y: u32) -> &[u8] {
         let offset = ((y * width + x) * 4) as usize;
@@ -573,6 +573,7 @@ mod tests {
             instance_id: instance_id.to_string(),
             editor: crate::opener::EditorKind::VsCode,
             editor_name: "VS Code".to_string(),
+            surface: WorkspaceSurface::EditorWorkspace,
             name: name.to_string(),
             path: Some("/private/project-path".to_string()),
             openable,
