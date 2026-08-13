@@ -378,6 +378,23 @@ test("floating mode is compact translucent glass with an opaque fallback", () =>
     css,
     /data-window-mode="floating"\][^{}]*\.activity-providers\s*\{[^}]*display:\s*none/,
   );
+  assert.match(css, /\.workspace-compact-status\s*\{[^}]*display:\s*none/s);
+  assert.match(
+    css,
+    /data-window-mode="floating"\][^{}]*\.workspace-row\s*\{[^}]*grid-template-columns:\s*minmax\(0,\s*1fr\)\s+auto/,
+  );
+  assert.match(
+    css,
+    /data-window-mode="floating"\][^{}]*\.workspace-compact-status\s*\{[^}]*display:\s*inline-flex[^}]*justify-self:\s*end/s,
+  );
+  assert.match(
+    css,
+    /data-window-mode="floating"\][^{}]*\.workspace-compact-status\[data-state="activity"\]\s*\{[^}]*color:\s*var\(--accent-text\)/s,
+  );
+  assert.match(
+    css,
+    /data-window-mode="floating"\][^{}]*\.workspace-compact-status\[data-state="finished"\]\s*\{[^}]*color:\s*var\(--green-text\)/s,
+  );
   assert.match(
     css,
     /data-window-mode="floating"\][^{}]*\.usage-overview\s*\{[^}]*padding:\s*5px 6px 6px/,

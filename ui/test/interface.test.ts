@@ -327,6 +327,67 @@ test("workspace normalization preserves Antigravity source and recent hook activ
   assert.equal(workspace.antigravity?.modelKind, "gemini_3_6_flash_medium");
 });
 
+test("workspace activity aggregation keeps the highest-priority lifecycle state", () => {
+  const javascript = read("ui/generated/app.js");
+  const context = {} as {
+    aggregateActivity(workspace: {
+      codex: Activity;
+      claude: Activity;
+      antigravity: Activity | null;
+    }): Activity;
+  };
+  interface Activity {
+    kind: "activity" | "finished" | "failure" | "unknown";
+    label: string;
+    modelKind?: string | null;
+  }
+  const activity = (
+    kind: Activity["kind"],
+    label: string,
+    modelKind: string | null = null,
+  ): Activity => ({ kind, label, modelKind });
+  vm.runInNewContext(appFunction(javascript, "aggregateActivity"), context);
+
+  const active = context.aggregateActivity({
+    codex: activity("finished", "Turn finished"),
+    claude: activity("activity", "Activity detected"),
+    antigravity: activity("failure", "Failed/interrupted"),
+  });
+  assert.equal(active.kind, "activity");
+  assert.equal(active.label, "Activity detected");
+
+  const finished = context.aggregateActivity({
+    codex: activity("unknown", "No activity yet"),
+    claude: activity("finished", "Turn finished"),
+    antigravity: null,
+  });
+  assert.equal(finished.kind, "finished");
+  assert.equal(finished.label, "Turn finished");
+
+  const antigravity = activity(
+    "activity",
+    "Activity detected",
+    "gemini_3_6_flash_medium",
+  );
+  assert.equal(
+    context.aggregateActivity({
+      codex: activity("finished", "Turn finished"),
+      claude: activity("unknown", "No activity yet"),
+      antigravity,
+    }),
+    antigravity,
+    "Antigravity lifecycle activity should participate without synthesizing a model label",
+  );
+
+  const failure = context.aggregateActivity({
+    codex: activity("finished", "Turn finished"),
+    claude: activity("failure", "Failed/interrupted"),
+    antigravity: activity("unknown", "Unknown"),
+  });
+  assert.equal(failure.kind, "failure");
+  assert.equal(failure.label, "Failed/interrupted");
+});
+
 test("workspaces render as cards in single Open and Recent sections", () => {
   const html = read("ui/index.html");
   const javascript = read("ui/generated/app.js");
@@ -826,6 +887,35 @@ test("workspace rows omit redundant leading status icons while keeping provider 
   const providerName = css.match(/\.provider-name\s*\{([^}]*)\}/i)?.[1];
   assert.ok(providerName, "provider names should have dedicated styling");
   assert.match(providerName, /text-overflow\s*:\s*ellipsis/i);
+});
+
+test("workspace rows render one model-free status for the compact panel", () => {
+  const javascript = read("ui/generated/app.js");
+  const createRow = sliceBetween(
+    javascript,
+    /function\s+createWorkspaceRow\s*\(/,
+    /function\s+groupWorkspaces\s*\(/,
+    "createWorkspaceRow",
+  );
+  const compactStatus = sliceBetween(
+    createRow,
+    /const\s+aggregate\s*=\s*aggregateActivity\(workspace\)\s*;/,
+    /const\s+providers\s*=/,
+    "compact workspace status",
+  );
+
+  assert.equal(
+    Array.from(createRow.matchAll(/["']workspace-compact-status["']/g)).length,
+    1,
+    "each workspace row should contain one compact status",
+  );
+  assert.match(
+    compactStatus,
+    /createElement\(\s*["']span["']\s*,\s*["']workspace-compact-status["']\s*,\s*aggregate\.label\s*\)/,
+  );
+  assert.match(compactStatus, /compactStatus\.dataset\.state\s*=\s*aggregate\.kind/);
+  assert.match(compactStatus, /row\.append\(compactStatus\)/);
+  assert.doesNotMatch(compactStatus, /modelKind|modelLabel|providerName/i);
 });
 
 test("platform, tray, UI, and companion icon assets use the complete size set", () => {

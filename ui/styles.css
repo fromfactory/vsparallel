@@ -987,6 +987,10 @@ main {
   white-space: nowrap;
 }
 
+.workspace-compact-status {
+  display: none;
+}
+
 .activity-providers {
   display: grid;
   min-width: 0;
@@ -2250,7 +2254,7 @@ html[data-workspace-opening="true"] .app-shell {
 }
 
 :root[data-window-mode="floating"] .workspace-row {
-  grid-template-columns: minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr) auto;
   gap: 7px;
   min-height: 58px;
   padding: 4px 7px;
@@ -2299,6 +2303,41 @@ html[data-workspace-opening="true"] .app-shell {
 :root[data-window-mode="floating"] .workspace-path {
   font-size: 9px;
   line-height: 11px;
+}
+
+:root[data-window-mode="floating"] .workspace-compact-status {
+  display: inline-flex;
+  max-width: 100%;
+  align-items: center;
+  justify-self: end;
+  padding: 0 6px;
+  overflow: hidden;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  color: var(--text-muted);
+  font-size: 9px;
+  font-weight: 650;
+  line-height: 18px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+:root[data-window-mode="floating"] .workspace-compact-status[data-state="activity"] {
+  border-color: var(--accent-border);
+  background: var(--accent-soft);
+  color: var(--accent-text);
+}
+
+:root[data-window-mode="floating"] .workspace-compact-status[data-state="finished"] {
+  border-color: var(--green-border);
+  background: var(--green-soft);
+  color: var(--green-text);
+}
+
+:root[data-window-mode="floating"] .workspace-compact-status[data-state="failure"] {
+  border-color: var(--red-border);
+  background: var(--red-soft);
+  color: var(--red-text);
 }
 
 :root[data-window-mode="floating"] .activity-providers {

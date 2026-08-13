@@ -1069,6 +1069,20 @@
     return element;
   }
 
+  function aggregateActivity(workspace: Workspace): ActivityView {
+    const priority: Record<ActivityKind, number> = {
+      activity: 4,
+      failure: 3,
+      finished: 2,
+      unknown: 1,
+    };
+    return [workspace.codex, workspace.claude, workspace.antigravity]
+      .filter((activity): activity is ActivityView => activity !== null)
+      .reduce((current, candidate) =>
+        priority[candidate.kind] > priority[current.kind] ? candidate : current,
+      );
+  }
+
   function describeExtensionPresence(
     activity: ActivityView,
     remoteWindow = false,
@@ -1245,6 +1259,15 @@
     metaLine.append(path);
     primary.append(application, titleLine, metaLine);
     row.append(primary);
+
+    const aggregate = aggregateActivity(workspace);
+    const compactStatus = createElement(
+      "span",
+      "workspace-compact-status",
+      aggregate.label,
+    );
+    compactStatus.dataset.state = aggregate.kind;
+    row.append(compactStatus);
 
     const providers = createElement("div", "activity-providers");
     providers.setAttribute("aria-label", "Agent lifecycle and IDE extension status");
