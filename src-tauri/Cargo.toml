@@ -1,6 +1,6 @@
 [package]
 name = "vsparallel"
-version = "0.2.0"
+version = "0.2.1"
 description = "A compact local monitor for VS Code and Antigravity workspaces and agent activity"
 authors = ["VSParallel contributors"]
 edition = "2021"
