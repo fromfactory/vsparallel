@@ -19,6 +19,7 @@
     | "automatic"
     | "gemini"
     | "gemini_3_6_flash_medium"
+    | "gemini_3_6_flash_high"
     | "gemini_3_5_flash"
     | "gemini_3_1_pro_high"
     | "gemini_3_1_pro_low"
@@ -27,7 +28,8 @@
     | "claude_sonnet_4_6_thinking"
     | "claude_opus_4_6_thinking"
     | "gpt_oss"
-    | "gpt_oss_120b";
+    | "gpt_oss_120b"
+    | "gpt_oss_120b_medium";
   type UsageKind = "codex" | "claude";
   type UsageState = "available" | "stale" | "unavailable";
   type NoticeKind = "error" | "warning";
@@ -638,6 +640,7 @@
       case "automatic":
       case "gemini":
       case "gemini_3_6_flash_medium":
+      case "gemini_3_6_flash_high":
       case "gemini_3_5_flash":
       case "gemini_3_1_pro_high":
       case "gemini_3_1_pro_low":
@@ -647,6 +650,7 @@
       case "claude_opus_4_6_thinking":
       case "gpt_oss":
       case "gpt_oss_120b":
+      case "gpt_oss_120b_medium":
         return token;
       default:
         return null;
@@ -659,6 +663,8 @@
         return "Auto model";
       case "gemini_3_6_flash_medium":
         return "Gemini 3.6 Flash (Medium)";
+      case "gemini_3_6_flash_high":
+        return "Gemini 3.6 Flash (High)";
       case "gemini_3_5_flash":
         return "Gemini 3.5 Flash";
       case "gemini_3_1_pro_high":
@@ -672,12 +678,39 @@
       case "claude_opus_4_6_thinking":
         return "Claude Opus 4.6 (Thinking)";
       case "gpt_oss_120b":
-        return "GPT-OSS-120b";
+        return "GPT-OSS 120B";
+      case "gpt_oss_120b_medium":
+        return "GPT-OSS 120B (Medium)";
       case "gemini":
         return "Gemini";
       case "claude":
         return "Claude";
       case "gpt_oss":
+        return "GPT-OSS";
+      default:
+        return "";
+    }
+  }
+
+  function antigravityModelFamilyLabel(kind: AntigravityModelKind | null): string {
+    switch (kind) {
+      case "automatic":
+        return "Auto";
+      case "gemini":
+      case "gemini_3_6_flash_medium":
+      case "gemini_3_6_flash_high":
+      case "gemini_3_5_flash":
+      case "gemini_3_1_pro_high":
+      case "gemini_3_1_pro_low":
+      case "gemini_3_flash":
+        return "Gemini";
+      case "claude":
+      case "claude_sonnet_4_6_thinking":
+      case "claude_opus_4_6_thinking":
+        return "Claude";
+      case "gpt_oss":
+      case "gpt_oss_120b":
+      case "gpt_oss_120b_medium":
         return "GPT-OSS";
       default:
         return "";
@@ -1117,11 +1150,23 @@
     editorName = "VS Code",
     remoteWindow = false,
     showExtensionPresence = true,
+    lifecycleSource = "",
+    providerNameDetail = "",
+    providerNameDetailTitle = providerNameDetail,
   ): HTMLDivElement {
     const provider = createElement("div", "provider-state");
     provider.dataset.state = activity.kind;
 
     const name = createElement("span", "provider-name", providerName);
+    if (providerNameDetail) {
+      const detail = createElement(
+        "span",
+        "provider-name-detail",
+        `(${providerNameDetail})`,
+      );
+      detail.title = providerNameDetailTitle;
+      name.append(detail);
+    }
     if (accessibleProviderName !== providerName) {
       name.title = accessibleProviderName;
     }
@@ -1152,6 +1197,12 @@
       extension.title = presence.title;
       body.append(extension);
       presenceLabel = presence.label;
+    } else if (lifecycleSource) {
+      const source = createElement("span", "provider-extension", lifecycleSource);
+      source.dataset.state = "present";
+      source.title = "Lifecycle activity reported by Antigravity's built-in model hook.";
+      body.append(source);
+      presenceLabel = lifecycleSource;
     }
     provider.append(name, body);
     provider.setAttribute(
@@ -1199,16 +1250,20 @@
     providers.setAttribute("aria-label", "Agent lifecycle and IDE extension status");
     if (workspace.antigravity) {
       const modelLabel = antigravityModelLabel(workspace.antigravity.modelKind);
+      const modelFamily = antigravityModelFamilyLabel(workspace.antigravity.modelKind);
       providers.append(
         createProviderState(
-          modelLabel || "Antigravity",
+          "Antigravity",
           workspace.antigravity,
           modelLabel
-            ? `${modelLabel}, latest model reported by Antigravity`
+            ? `Antigravity (${modelLabel}), latest model reported by Antigravity`
             : "Antigravity",
           workspace.editorName,
           false,
           false,
+          "Antigravity built-in model",
+          modelFamily,
+          modelLabel,
         ),
       );
     }
@@ -2383,7 +2438,7 @@
       return "Antigravity IDE companion installed. Reload open Antigravity IDE windows to start reporting heartbeats.";
     }
     if (kind === "antigravity") {
-      return "Antigravity activity hooks installed. In Antigravity 2.0, open a saved Project and start an agent turn; opening the Project alone does not fire a hook.";
+      return "Antigravity activity hooks installed. Start a new agent turn in an Antigravity 2.0 Project or Antigravity IDE workspace; opening it alone does not fire a hook.";
     }
     return kind === "codex"
       ? "Codex activity hooks installed. Usage remaining is separate; see the requirement above. In Codex, run /hooks and complete the required security review."
@@ -2651,6 +2706,47 @@
     elements.diagnosticsList.append(term, description);
   }
 
+  function describeAntigravityHookExecution(
+    raw: JsonObject,
+    fieldPrefix: "antigravityTwoHook" | "antigravityIdeHook",
+    surfaceName: "Antigravity 2.0" | "Antigravity IDE",
+  ): { outcome: string; warning: boolean; detail: string } {
+    const rawOutcome = raw[`${fieldPrefix}Outcome`];
+    const outcome = rawOutcome === undefined
+      ? "not_observed"
+      : normalizeStateToken(rawOutcome);
+    const event = asString(raw[`${fieldPrefix}Event`]).replaceAll("-", " ");
+    const observedAt = asTimestamp(raw[`${fieldPrefix}ObservedAtMs`]);
+    const workspaceCount = asNonNegativeInteger(raw[`${fieldPrefix}WorkspaceCount`]);
+    const warning = !["not_observed", "recorded"].includes(outcome);
+    let detail = `Not observed · start an ${surfaceName} agent turn`;
+
+    if (outcome === "recorded") {
+      const observed = formatRelativeTime(observedAt).toLowerCase();
+      detail = [
+        event || "agent event",
+        observed,
+        `${workspaceCount} workspace path${workspaceCount === 1 ? "" : "s"} recorded`,
+      ].join(" · ");
+    } else if (outcome === "no_workspace") {
+      detail = "Observed, but no usable local workspace path was reported";
+    } else if (outcome === "missing_conversation") {
+      detail = "Observed, but no conversation identifier was reported";
+    } else if (outcome === "persist_failed") {
+      detail = "Observed, but VSParallel could not save workspace activity";
+    } else if (outcome === "health_unreadable") {
+      detail = "The local hook execution-health record is unreadable";
+    } else if (outcome !== "not_observed") {
+      detail = "Observed, but the event could not be used for workspace activity";
+    }
+
+    return { outcome, warning, detail };
+  }
+
+  function antigravityHookWasObserved(outcome: string): boolean {
+    return !["not_observed", "health_unreadable"].includes(outcome);
+  }
+
   function renderDiagnostics(rawValue: unknown): void {
     const raw = parseBridgeValue(rawValue);
     if (!isObject(raw)) {
@@ -2672,38 +2768,21 @@
     const validCodex = asNonNegativeInteger(raw.validCodexRecords);
     const validClaude = asNonNegativeInteger(raw.validClaudeRecords);
     const validAntigravity = asNonNegativeInteger(raw.validAntigravityRecords);
-    const antigravityHookOutcome = normalizeStateToken(raw.antigravityTwoHookOutcome);
-    const antigravityHookEvent = asString(raw.antigravityTwoHookEvent)
-      .replaceAll("-", " ");
-    const antigravityHookObservedAt = asTimestamp(raw.antigravityTwoHookObservedAtMs);
-    const antigravityHookWorkspaceCount = asNonNegativeInteger(
-      raw.antigravityTwoHookWorkspaceCount,
+    const antigravityTwoHook = describeAntigravityHookExecution(
+      raw,
+      "antigravityTwoHook",
+      "Antigravity 2.0",
     );
-    const antigravityHookWarning = ![
-      "not_observed",
-      "recorded",
-    ].includes(antigravityHookOutcome);
-    let antigravityHookDetail = "Not observed · start an Antigravity 2.0 agent turn";
-    if (antigravityHookOutcome === "recorded") {
-      const observed = formatRelativeTime(antigravityHookObservedAt).toLowerCase();
-      antigravityHookDetail = [
-        antigravityHookEvent || "agent event",
-        observed,
-        `${antigravityHookWorkspaceCount} workspace path${
-          antigravityHookWorkspaceCount === 1 ? "" : "s"
-        } recorded`,
-      ].join(" · ");
-    } else if (antigravityHookOutcome === "no_workspace") {
-      antigravityHookDetail = "Observed, but no usable local Project workspace path was reported";
-    } else if (antigravityHookOutcome === "missing_conversation") {
-      antigravityHookDetail = "Observed, but no conversation identifier was reported";
-    } else if (antigravityHookOutcome === "persist_failed") {
-      antigravityHookDetail = "Observed, but VSParallel could not save workspace activity";
-    } else if (antigravityHookOutcome === "health_unreadable") {
-      antigravityHookDetail = "The local hook execution-health record is unreadable";
-    } else if (antigravityHookOutcome !== "not_observed") {
-      antigravityHookDetail = "Observed, but the event could not be used for workspace activity";
-    }
+    const antigravityIdeHook = describeAntigravityHookExecution(
+      raw,
+      "antigravityIdeHook",
+      "Antigravity IDE",
+    );
+    const antigravityHookWarning = antigravityTwoHook.warning || antigravityIdeHook.warning;
+    const antigravityHookHealthUnreadable = [antigravityTwoHook, antigravityIdeHook]
+      .some((hook) => hook.outcome === "health_unreadable");
+    const antigravityHookObserved = [antigravityTwoHook, antigravityIdeHook]
+      .some((hook) => antigravityHookWasObserved(hook.outcome));
     const totalMalformed = malformedInstances
       + malformedCodex
       + malformedClaude
@@ -2739,8 +2818,13 @@
     );
     appendDiagnostic(
       "Antigravity 2.0 hook execution",
-      antigravityHookDetail,
-      antigravityHookWarning,
+      antigravityTwoHook.detail,
+      antigravityTwoHook.warning,
+    );
+    appendDiagnostic(
+      "Antigravity IDE hook execution",
+      antigravityIdeHook.detail,
+      antigravityIdeHook.warning,
     );
     appendDiagnostic("Active heartbeat window", formatDuration(raw.activeTtlMs));
     appendDiagnostic("Inactive record retention", formatDuration(raw.staleRetentionMs));
@@ -2758,11 +2842,13 @@
     elements.diagnosticsStatus.classList.remove("has-error");
     elements.diagnosticsStatus.textContent = validInstances || validAntigravity
       ? "One or more editor heartbeats or Antigravity activity records are available."
-      : antigravityHookOutcome === "not_observed"
-        ? "No workspace source is present yet. Opening an Antigravity 2.0 Project does not fire hooks; start an agent turn to create recent activity."
-        : antigravityHookWarning
-          ? "Antigravity 2.0 invoked VSParallel, but the latest event did not create a workspace record."
-          : "No valid workspace source is present yet. Check an editor companion or Antigravity activity hooks.";
+      : antigravityHookHealthUnreadable
+        ? "VSParallel could not read one or more Antigravity hook execution-health records."
+        : !antigravityHookObserved
+          ? "No workspace source is present yet. Opening an Antigravity 2.0 Project or Antigravity IDE workspace does not fire hooks; start an agent turn to create recent activity."
+          : antigravityHookWarning
+            ? "Antigravity invoked VSParallel, but a latest surface event did not create a workspace record."
+            : "No valid workspace source is present yet. Check an editor companion or Antigravity activity hooks.";
   }
 
   async function refreshDiagnostics(): Promise<void> {

@@ -484,19 +484,44 @@ test("Antigravity model labels accept only the public closed model set", () => {
     "normalizeStateToken",
     "normalizeAntigravityModelKind",
     "antigravityModelLabel",
+    "antigravityModelFamilyLabel",
   ].map((name) => appFunction(javascript, name)).join("\n");
   const context = {} as {
     normalizeAntigravityModelKind(value: unknown): string | null;
     antigravityModelLabel(value: string | null): string;
+    antigravityModelFamilyLabel(value: string | null): string;
   };
   vm.runInNewContext(functions, context);
 
   const gemini = context.normalizeAntigravityModelKind("gemini_3_6_flash_medium");
   assert.equal(context.antigravityModelLabel(gemini), "Gemini 3.6 Flash (Medium)");
+  const geminiHigh = context.normalizeAntigravityModelKind("gemini_3_6_flash_high");
+  assert.equal(context.antigravityModelLabel(geminiHigh), "Gemini 3.6 Flash (High)");
+  assert.equal(context.antigravityModelFamilyLabel(geminiHigh), "Gemini");
+  const claude = context.normalizeAntigravityModelKind("claude_sonnet_4_6_thinking");
+  assert.equal(context.antigravityModelLabel(claude), "Claude Sonnet 4.6 (Thinking)");
+  assert.equal(context.antigravityModelFamilyLabel(claude), "Claude");
+  const gptOss = context.normalizeAntigravityModelKind("gpt_oss_120b_medium");
+  assert.equal(context.antigravityModelLabel(gptOss), "GPT-OSS 120B (Medium)");
+  assert.equal(context.antigravityModelFamilyLabel(gptOss), "GPT-OSS");
   const automatic = context.normalizeAntigravityModelKind("automatic");
   assert.equal(context.antigravityModelLabel(automatic), "Auto model");
   assert.equal(context.normalizeAntigravityModelKind("private-future-model"), null);
   assert.equal(context.antigravityModelLabel(null), "");
+  assert.equal(context.antigravityModelFamilyLabel(null), "");
+});
+
+test("an unreadable Antigravity health receipt is not treated as an observed hook", () => {
+  const javascript = read("ui/generated/app.js");
+  const context = {} as {
+    antigravityHookWasObserved(outcome: string): boolean;
+  };
+  vm.runInNewContext(appFunction(javascript, "antigravityHookWasObserved"), context);
+
+  assert.equal(context.antigravityHookWasObserved("recorded"), true);
+  assert.equal(context.antigravityHookWasObserved("no_workspace"), true);
+  assert.equal(context.antigravityHookWasObserved("not_observed"), false);
+  assert.equal(context.antigravityHookWasObserved("health_unreadable"), false);
 });
 
 test("legacy companion heartbeats give an actionable IDE extension status", () => {
@@ -697,7 +722,7 @@ test("setup separates activity hooks from provider usage requirements", () => {
   assert.match(integrationText, /Antigravity activity hooks/i);
   assert.match(integrationText, /Recent activity only/i);
   assert.match(integrationText, /Start an agent turn after installation/i);
-  assert.match(integrationText, /Project-level \.agents\/hooks\.json can override/i);
+  assert.match(integrationText, /workspace-level \.agents\/hooks\.json can override/i);
   assert.match(
     integrationText,
     /Install at least one editor companion—VS Code or Antigravity IDE—to track live workspaces/i,
@@ -729,7 +754,11 @@ test("setup separates activity hooks from provider usage requirements", () => {
   assert.match(javascript, /Codex activity hooks installed\. Usage remaining is separate/);
   assert.match(javascript, /Claude Code activity hooks installed\. Usage remaining is separate/);
   assert.match(javascript, /Antigravity 2\.0 hook execution/);
-  assert.match(javascript, /Opening an Antigravity 2\.0 Project does not fire hooks/);
+  assert.match(javascript, /Antigravity IDE hook execution/);
+  assert.match(
+    javascript,
+    /Opening an Antigravity 2\.0 Project or Antigravity IDE workspace does not fire hooks/,
+  );
   assert.match(javascript, /No available editor companion CLI was detected/);
   assert.doesNotMatch(javascript, /All integrations are installed|still needs/i);
 });
@@ -774,8 +803,15 @@ test("workspace rows omit redundant leading status icons while keeping provider 
     /createProviderState\(\s*"Claude"\s*,\s*workspace\.claude\s*,\s*"Claude Code"\s*,\s*workspace\.editorName\s*,\s*workspace\.remoteWindow\s*\)/,
   );
   assert.match(javascript, /antigravityModelLabel\(workspace\.antigravity\.modelKind\)/);
-  assert.match(javascript, /modelLabel\s*\|\|\s*"Antigravity"/);
+  assert.match(javascript, /antigravityModelFamilyLabel\(workspace\.antigravity\.modelKind\)/);
+  assert.match(javascript, /createProviderState\(\s*"Antigravity",\s*workspace\.antigravity,/);
+  assert.match(javascript, /`Antigravity \(\$\{modelLabel\}\), latest model reported by Antigravity`/);
+  assert.match(javascript, /"Antigravity built-in model",\s*modelFamily,\s*modelLabel/);
   assert.match(javascript, /latest model reported by Antigravity/);
+  assert.match(javascript, /Antigravity built-in model/);
+  assert.match(css, /\.provider-name-detail\s*\{[^}]*display:\s*block/s);
+  assert.match(css, /\.provider-name-detail\s*\{[^}]*text-overflow:\s*ellipsis/s);
+  assert.match(css, /\.provider-name-detail\s*\{[^}]*text-transform:\s*none/s);
   assert.doesNotMatch(javascript, /createProviderState\(\s*"Claude Code"\s*,/);
   assert.doesNotMatch(createRow, /status-mark/);
   assert.doesNotMatch(css, /\.status-mark\b/);

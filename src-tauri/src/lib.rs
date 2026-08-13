@@ -664,42 +664,87 @@ fn antigravity_view() -> LifecycleIntegrationView {
 }
 
 fn antigravity_installed_copy() -> (String, String) {
-    const FIRST_TURN_GUIDANCE: &str = "Opening a Project alone does not run lifecycle hooks; start a new Antigravity 2.0 agent turn. A Project-level .agents/hooks.json can override this global hook.";
-    let observation = state::state_dir_from_environment().and_then(|root| {
-        antigravity_integration::antigravity_two_hook_observation(&root, now_ms())
-    });
-    match observation {
-        Ok(Some(observation))
+    const FIRST_TURN_GUIDANCE: &str = "Opening a Project or workspace alone does not run lifecycle hooks; start a new Antigravity 2.0 or Antigravity IDE agent turn. A workspace-level .agents/hooks.json can override this global hook.";
+    let root = match state::state_dir_from_environment() {
+        Ok(root) => root,
+        Err(_) => {
+            return (
+                "Installed · observation unavailable".to_string(),
+                format!(
+                    "Antigravity activity monitoring is configured, but its local execution-health record could not be read. {FIRST_TURN_GUIDANCE}"
+                ),
+            )
+        }
+    };
+    antigravity_installed_copy_from_root(&root, now_ms(), FIRST_TURN_GUIDANCE)
+}
+
+fn antigravity_installed_copy_from_root(
+    root: &std::path::Path,
+    now: i64,
+    first_turn_guidance: &str,
+) -> (String, String) {
+    let observations = [
+        (
+            "Antigravity 2.0",
+            antigravity_integration::antigravity_two_hook_observation(root, now),
+        ),
+        (
+            "Antigravity IDE",
+            antigravity_integration::antigravity_ide_hook_observation(root, now),
+        ),
+    ];
+    let mut latest: Option<(&str, antigravity_integration::AntigravityHookObservation)> = None;
+    let mut read_failed = false;
+    for (surface, result) in observations {
+        match result {
+            Ok(Some(observation))
+                if latest.as_ref().is_none_or(|(_, current)| {
+                    observation.observed_at_ms > current.observed_at_ms
+                }) =>
+            {
+                latest = Some((surface, observation));
+            }
+            Ok(_) => {}
+            Err(_) => read_failed = true,
+        }
+    }
+
+    if read_failed {
+        return (
+            "Installed · observation unavailable".to_string(),
+            format!(
+                "Antigravity activity monitoring is configured, but at least one local surface execution-health record could not be read. {first_turn_guidance}"
+            ),
+        );
+    }
+
+    match latest {
+        Some((surface, observation))
             if observation.outcome
                 == antigravity_integration::AntigravityHookOutcome::Recorded =>
         {
             (
                 "Installed · event observed".to_string(),
                 format!(
-                    "Antigravity 2.0 activity monitoring is installed; the latest {} event recorded {} workspace path{}. Hook rows show recent agent activity, not a live window.",
+                    "{surface} activity monitoring is installed; the latest {} event recorded {} workspace path{}. Hook rows show recent agent activity, not a live window.",
                     observation.event,
                     observation.workspace_count,
                     if observation.workspace_count == 1 { "" } else { "s" },
                 ),
             )
         }
-        Ok(Some(observation)) => (
+        Some((surface, observation)) => (
             "Installed · hook issue".to_string(),
             format!(
-                "Antigravity 2.0 ran the hook, but {}; {}",
+                "{surface} ran the hook, but {}; {}",
                 observation.outcome.user_message(),
-                FIRST_TURN_GUIDANCE
+                first_turn_guidance
             ),
         ),
-        Ok(None) => (
+        None => (
             "Installed · awaiting agent turn".to_string(),
-            format!("Antigravity activity monitoring is configured. {FIRST_TURN_GUIDANCE}"),
-        ),
-        Err(_) => (
-            "Installed · observation unavailable".to_string(),
-            format!(
-                "Antigravity activity monitoring is configured, but its local execution-health record could not be read. {FIRST_TURN_GUIDANCE}"
-            ),
+            format!("Antigravity activity monitoring is configured. {first_turn_guidance}"),
         ),
     }
 }
@@ -2698,6 +2743,51 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("Rename"));
+    }
+
+    #[test]
+    fn antigravity_setup_uses_the_latest_two_or_ide_hook_receipt() {
+        let temp = TempDir::new().unwrap();
+        let health = temp.path().join("antigravity-hook-health");
+        std::fs::create_dir(&health).unwrap();
+        std::fs::write(
+            health.join("antigravity-2.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 1,
+                "event": "pre-invocation",
+                "surface": "antigravity_2",
+                "outcome": "no_workspace",
+                "observedAtMs": 10,
+                "workspaceCount": 0
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            health.join("antigravity-ide.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 1,
+                "event": "stop",
+                "surface": "antigravity_ide",
+                "outcome": "recorded",
+                "observedAtMs": 20,
+                "workspaceCount": 1
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let (label, detail) = antigravity_installed_copy_from_root(temp.path(), 20, "start a turn");
+
+        assert_eq!(label, "Installed · event observed");
+        assert!(detail.contains("Antigravity IDE"));
+        assert!(detail.contains("latest stop event"));
+        assert!(!detail.contains("Antigravity 2.0 ran the hook"));
+
+        std::fs::write(health.join("antigravity-2.json"), b"{not json").unwrap();
+        let (label, detail) = antigravity_installed_copy_from_root(temp.path(), 20, "start a turn");
+        assert_eq!(label, "Installed · observation unavailable");
+        assert!(detail.contains("at least one local surface"));
     }
 
     #[test]

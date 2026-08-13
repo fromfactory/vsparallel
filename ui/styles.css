@@ -1020,6 +1020,18 @@ main {
   white-space: nowrap;
 }
 
+.provider-name-detail {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  font-size: 8px;
+  font-weight: 560;
+  letter-spacing: 0;
+  text-overflow: ellipsis;
+  text-transform: none;
+  white-space: nowrap;
+}
+
 .provider-body {
   min-width: 0;
 }

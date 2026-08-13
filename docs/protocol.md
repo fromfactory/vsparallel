@@ -119,23 +119,31 @@ use the same five-core-field structure at
 }
 ```
 
-Antigravity records may add an optional `modelKind` field derived from the
-documented hook `modelName`, for example
+Antigravity records may add an optional `modelKind` field when a hook supplies
+`modelName` or Antigravity IDE exposes a recognized current-model enum in its
+latest bounded per-conversation user-input step. Bounded execution metadata and
+the selected-model preference are compatibility fallbacks, for example
 `"modelKind": "gemini_3_6_flash_medium"`.
 
-The allowed values are `automatic`, `gemini`,
-`gemini_3_6_flash_medium`, `gemini_3_5_flash`,
-`gemini_3_1_pro_high`, `gemini_3_1_pro_low`, `gemini_3_flash`, `claude`,
-`claude_sonnet_4_6_thinking`, `claude_opus_4_6_thinking`, `gpt_oss`, and
-`gpt_oss_120b`. Specific recognized names use their specific token; other
-recognized Gemini, Claude, or GPT-OSS family names use the corresponding family
-token. `auto` is stored as `automatic` and displayed honestly as **Auto model**
-rather than guessing the routed model. Unrecognized, invalid, and oversized
-model names are omitted. The raw `modelName` is never stored.
+Antigravity IDE records may also add `ideModelRevision`, an opaque lowercase
+SHA-256 revision derived from the selected bounded model signal. It is used
+only to tell a new turn or execution row from the previous one and is never
+presented to the UI.
 
-This optional field is an additive, backward-compatible part of schema version
+The allowed values are `automatic`, `gemini`,
+`gemini_3_6_flash_medium`, `gemini_3_6_flash_high`,
+`gemini_3_5_flash`, `gemini_3_1_pro_high`, `gemini_3_1_pro_low`,
+`gemini_3_flash`, `claude`, `claude_sonnet_4_6_thinking`,
+`claude_opus_4_6_thinking`, `gpt_oss`, `gpt_oss_120b`, and
+`gpt_oss_120b_medium`. Specific recognized names use their specific token;
+other recognized Gemini, Claude, or GPT-OSS family names use the corresponding
+family token. `auto` is stored as `automatic` and displayed honestly as **Auto
+model** rather than guessing the routed model. Unrecognized, invalid, and
+oversized model names are omitted. The raw `modelName` is never stored.
+
+These optional fields are additive, backward-compatible parts of schema version
 1. Codex and Claude records, older Antigravity records, and Antigravity events
-without a recognized model continue to contain only the five core fields.
+without IDE model metadata continue to contain only the five core fields.
 
 Allowed on-disk states across the three adapters are `activity_detected`,
 `turn_finished`, `session_ended`, `failed_or_interrupted`, `failed`, and
@@ -158,8 +166,7 @@ The adapters map only documented lifecycle events:
 | Claude | `StopFailure` | `failed_or_interrupted` |
 | Claude | `SessionEnd` | `session_ended` |
 | Antigravity | `PreInvocation` | `activity_detected` |
-| Antigravity | `PostToolUse` without an error | `activity_detected` |
-| Antigravity | `PostToolUse` with an error | `failed` |
+| Antigravity | `PostToolUse` | no activity-record write |
 | Antigravity | `Stop` with an error or error termination | `failed` |
 | Antigravity | Otherwise `Stop`, interrupted/cancelled | `interrupted` |
 | Antigravity | Otherwise `Stop`, `fullyIdle: false` | `activity_detected` |
@@ -167,15 +174,57 @@ The adapters map only documented lifecycle events:
 
 Codex and Claude hash the provider session ID and do not retain the raw session
 or turn ID. The Antigravity adapter selects documented `conversationId`,
-`workspacePaths`, `transcriptPath`, `artifactDirectoryPath`, and `modelName`
-fields, plus `error` for `PostToolUse`/`Stop` and
-`terminationReason`/`fullyIdle` for `Stop`. It reduces the transcript path, or
+`workspacePaths`, `transcriptPath`, and `artifactDirectoryPath` fields, plus the
+optional `modelName` when supplied, plus `error`, `terminationReason`, and
+`fullyIdle` for `Stop`. It reduces the transcript path, or
 the artifact directory as a fallback, to the bounded surface `antigravity` or
 `antigravity-ide` and immediately discards both paths; CLI, conflicting, and
 unrecognized surfaces are not recorded. It independently reduces a recognized
 model name to the closed `modelKind` token above and immediately discards the
-raw value. It hashes `conversationId`, writes one record for each distinct
-valid local path in `workspacePaths`, and discards all other payload fields.
+raw value. Because the IDE hook contract omits `modelName`, each IDE
+`PreInvocation` and `Stop` first open that conversation's local IDE database
+read-only and select metadata for the newest `steps` row whose `step_type` is
+`USER_INPUT`. The newest row is rejected rather than bypassed when its
+`step_payload` is absent, non-BLOB, queued, malformed, or larger than 1 MiB.
+For a usable row, SQLite's incremental BLOB API follows protobuf field path
+`19 → 12 → 1 → 15 → 1` to the current model enum. The streaming scanner reads
+and immediately discards bounded tags, lengths, and scalar varints encountered
+while locating the path; it uses only the queued flag and model enum and seeks
+over all unrelated length-delimited bodies without reading or copying prompt or
+context bytes. It never materializes the full step and deliberately ignores the
+prior config in field 13. Because Antigravity commits this row before
+`PreInvocation`, the closed model classification is available when **Activity
+detected** begins.
+
+When the current-turn table or row is absent, the adapter may select the latest
+`executor_metadata.data` value by `idx` as a compatibility fallback. An
+unusable newest user-input row instead preserves the last correlated model and
+is never bypassed for an older row. The executor blob is capped at 64 KiB; only
+protobuf field path `10 → 1 → 28` (the bounded model name) is selected, reduced
+to a closed token, and immediately discarded. At `PreInvocation`, the fixed
+`antigravityUnifiedStateSync.modelPreferences` key in the local editor
+`state.vscdb` is a final bounded compatibility fallback. A successfully decoded
+unknown current model clears the qualifier rather than borrowing an older
+classification. The adapter does not read generation metadata, response bodies,
+trajectory blobs, transcripts, OAuth, or user-status data.
+
+Snapshot generation repeats the same narrow per-conversation read: it hashes
+conversation database filename stems in memory, matches them to the stored
+`sessionKey`, and exposes only the resulting closed classification. The
+hook-time read instead uses the validated documented `conversationId` directly
+to select that conversation's database. The raw filename stem, conversation ID,
+executor blob, step payload, and model name or enum are not retained. An opaque
+revision of the selected model signal is stored with the closed model. A
+snapshot does not adopt a differing current-turn revision until `PreInvocation`
+has correlated it with the lifecycle record; matching revisions preserve the
+hook's model, so refresh cannot revert **Activity detected** to the preceding
+execution's model.
+`PostToolUse` events do not write an activity record and therefore cannot race a
+newer or terminal `Stop`; terminal error/interruption classification comes from
+`Stop`. A delayed event timestamp cannot replace a newer record.
+Events without a trustworthy model stay generic Antigravity activity. The
+adapter hashes `conversationId`, writes one record for each distinct valid local
+path in `workspacePaths`, and discards all other payload fields.
 Its `sessionKey` is the conversation hash; including the normalized path in the
 filename prevents one multi-folder project path from replacing another.
 
@@ -206,14 +255,16 @@ recognized VSParallel-owned entry and deliberately retains the backup. After
 uninstalling the integration and confirming the remaining hook configuration,
 the user may delete that backup manually. Existing files under the shared
 state root's `antigravity/`, `antigravity-ide/`, and
-`antigravity-hook-health/` directories are likewise not deleted automatically.
+`antigravity-hook-health/` directories
+are likewise not deleted automatically.
 
 ### Antigravity hook execution health
 
 Because a valid installation proves only that the global JSON was written,
 each invocation also atomically replaces one product-specific record in
-`antigravity-hook-health/`. For Antigravity 2.0 the file is
-`antigravity-hook-health/antigravity-2.json`:
+`antigravity-hook-health/`. Antigravity 2.0 uses
+`antigravity-hook-health/antigravity-2.json`; Antigravity IDE uses
+`antigravity-hook-health/antigravity-ide.json`. Both have the same shape:
 
 ```json
 {
@@ -230,10 +281,13 @@ The fixed outcomes are `recorded`, `invalid_payload`, `unsupported_surface`,
 `missing_conversation`, `no_workspace`, and `persist_failed`. Health records
 never contain a conversation identifier, workspace path, transcript or
 artifact path, model name or `modelKind`, error text, prompt, or response.
-Setup and diagnostics use this record to distinguish **awaiting agent turn**
-from a hook that executed but could not produce an activity row. If the shared
-state root itself is unavailable, the hook remains fail-open and cannot write
-either the activity or health record.
+`workspaceCount` is the number of validated workspace associations observed;
+for a state-neutral `PostToolUse`, it does not imply an activity-file write.
+Setup reads both supported surface records, and diagnostics reports them
+separately. This distinguishes **awaiting agent turn** from a hook that executed
+but could not produce an activity row, including for IDE-only use. If the
+shared state root itself is unavailable, the hook remains fail-open and cannot
+write either the activity or health record.
 
 ## Claude Code status-line fallback record (schema version 1)
 
@@ -372,7 +426,13 @@ and placement fields shown above; it never reads extension exports or private
 state. The lifecycle adapters receive richer documented hook payloads but
 create new objects with the five core fields and discard the input before
 writing. Antigravity may add only the optional closed `modelKind` described
-above; it never writes the raw model identifier. The Claude status-line adapter
+above; its IDE reconciliation incrementally reads only the structural bytes and
+fixed current-model enum from the bounded latest user-input step, seeking over
+prompt and context bodies, with the bounded executor field as a fallback. It
+never writes the raw conversation filename, model identifier, or step payload.
+Only the closed `modelKind` and an opaque SHA-256 model-signal revision may
+survive that reduction. The
+Claude status-line adapter
 likewise creates the minimal usage record shown above and does not represent or
 persist the accompanying session ID, working directory, model, cost,
 repository data, or transcript path. Live Codex and Claude usage remains in

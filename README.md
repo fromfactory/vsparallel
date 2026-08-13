@@ -24,12 +24,17 @@ source code, terminal contents, transcripts, or Git data. Optional lifecycle
 hooks receive documented provider event payloads and construct new,
 privacy-minimal records containing only a hashed session/conversation key,
 local workspace path, coarse state, and timestamp. Antigravity activity records
-may also include an optional closed model classification derived from the
-documented `modelName`; the raw identifier is discarded and never persisted.
+may also include an optional closed model classification from hook `modelName`
+or, for IDE hooks that omit it, the bounded current-model enum embedded in that
+conversation's latest user-input step. Bounded execution metadata and the
+IDE's last-selected-model preference remain compatibility fallbacks. Raw model
+identifiers are discarded and never persisted. IDE records may also carry an
+opaque SHA-256 model-signal revision so a new turn can be distinguished from
+the preceding execution; the revision is not shown in the UI.
 Live provider usage handling and Claude Code's local status-line fallback
 similarly retain only rate-limit percentages and reset times. Antigravity also
 writes a path- and model-free hook-health receipt containing fixed
-event/surface/outcome values, a timestamp, and record count so Setup can
+event/surface/outcome values, a timestamp, and validated workspace count so Setup can
 distinguish configured from observed execution. See
 [PRIVACY.md](PRIVACY.md) for the complete local-data and cleanup policy.
 
@@ -73,11 +78,11 @@ affected integration.
    hooks**, **Claude Code lifecycle hooks**, or any combination of them.
 4. Reload editor windows that were already open and restart affected provider
    sessions.
-5. For Antigravity 2.0, open a saved **Project** and start a new agent turn.
-   Merely opening or selecting the Project does not fire a lifecycle hook. If
-   that Project has `.agents/hooks.json`, its workspace hooks take precedence
-   over the global hook, so add the VSParallel handlers there as well or remove
-   the override.
+5. For an Antigravity built-in model, open a saved **Project** in Antigravity
+   2.0 or a workspace in Antigravity IDE and start a new agent turn. Merely
+   opening or selecting it does not fire a lifecycle hook. If that workspace
+   has `.agents/hooks.json`, its hooks take precedence over the global hook, so
+   add the VSParallel handlers there as well or remove the override.
 6. After installing Codex hooks, run `/hooks` in Codex, review the three
    VSParallel handlers, and trust them.
 
@@ -103,16 +108,37 @@ workspace activity from `workspacePaths`. Antigravity 2.0, Antigravity IDE, and
 the Antigravity CLI share this hook file. VSParallel reduces the documented
 `transcriptPath` or fallback `artifactDirectoryPath` root to a bounded product
 label and immediately discards the path; CLI and unrecognized events are
-ignored. A recognized `modelName` is likewise reduced to a closed label such as
-**Gemini 3.6 Flash (Medium)**, **Claude**, or **GPT-OSS** before the raw value is
-discarded. The workspace row shows the model from the lifecycle record it is
-currently presenting. **Auto model** remains explicit rather than guessing the
-routed model, and a label means only “latest model reported by Antigravity”—it
-does not prove that inference is live. These lifecycle hooks begin with an
-agent/model invocation—they do not run when the standalone app merely opens or
-selects a Project. Setup therefore distinguishes a configured hook that is
-**awaiting agent turn** from one whose execution has been observed. A
-Project-level `.agents/hooks.json` can override the global configuration. A
+ignored. A recognized hook `modelName` is reduced to a closed classification
+before the raw value is discarded. Because the Antigravity IDE hook contract
+omits that field, each `PreInvocation` reads the current model enum from the
+latest user-input step in that hook's local IDE conversation database. That row
+exists before the hook runs, so **Activity detected** shows a newly selected
+model without waiting for completion. The incremental, size-bounded parser
+reads bounded protobuf structural varints, uses only the queued flag and model
+enum, and seeks over prompt and context bodies without reading or copying them.
+The bounded model-name field from the latest `executor_metadata` row and the
+IDE's last-selected preference remain compatibility fallbacks for an older
+schema or absent user-input row. An unusable newest row instead preserves the
+last correlated model. The desktop refresh repeats the narrow
+per-conversation read but waits for the lifecycle hook before adopting a
+different current-turn revision, avoiding a relabel in the brief interval
+before `PreInvocation`. A decoded unknown model clears the qualifier. Raw step
+data, generated responses, prompts, trajectory data, transcripts, executor
+blobs, and model names are never retained. Tool-completion hooks are
+state-neutral, so `PostToolUse` does not write
+the activity file and cannot replace a completed `Stop` marker. An opaque
+per-conversation model-signal revision prevents refreshes from restoring the
+model associated with the preceding execution.
+The workspace row keeps **Antigravity** as the provider and adds a family label,
+such as **(Gemini)**, **(Claude)**, or **(GPT-OSS)**, when recognized; otherwise
+it remains generic. **Auto** remains explicit rather than guessing the routed
+model, and a label means only “latest model associated with this Antigravity
+lifecycle record”—it does not prove that inference is live. These lifecycle
+hooks begin with an agent/model invocation—they do not run when Antigravity
+merely opens or selects a Project or workspace. Setup therefore distinguishes a
+configured hook that is **awaiting agent turn** from one whose execution has
+been observed in Antigravity 2.0 or Antigravity IDE. A
+workspace-level `.agents/hooks.json` can override the global configuration. A
 hook-only **Antigravity 2.0** or **Antigravity IDE** row is evidence of recent
 activity only: it is never marked live or focused and cannot be opened by
 VSParallel. If the same IDE path has a companion heartbeat, the activity is
@@ -263,9 +289,12 @@ VSParallel stores only the metadata required for the workspace overview:
 - coarse lifecycle state, a one-way hash of the provider session or
   conversation identifier, working directory, and timestamp when optional
   hooks are enabled, plus an optional closed Antigravity model classification
-  when recognized;
+  when recognized; for IDE activity, this is derived from the bounded current
+  model enum in the latest per-conversation user-input step, with bounded
+  executor metadata and the last-selected-model preference as compatibility
+  fallbacks; IDE records may contain an opaque SHA-256 model-signal revision;
 - Antigravity hook execution health containing fixed event, surface, and
-  outcome values plus timestamp and workspace-record count, but no model; and
+  outcome values plus timestamp and validated workspace count, but no model; and
 - Claude Code five-hour and weekly usage percentages, their optional reset
   times, and the local capture timestamp only when the managed status-line
   fallback cache is available.

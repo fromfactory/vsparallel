@@ -2,7 +2,7 @@ use crate::antigravity_integration::AntigravityModelKind;
 use crate::opener::EditorKind;
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
-use std::collections::{hash_map::DefaultHasher, BinaryHeap, HashMap};
+use std::collections::{hash_map::DefaultHasher, BTreeSet, BinaryHeap, HashMap};
 use std::env;
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -109,6 +109,8 @@ struct ActivityRecord {
     changed_at_ms: i64,
     #[serde(default)]
     model_kind: Option<AntigravityModelKind>,
+    #[serde(default)]
+    ide_model_revision: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
@@ -199,6 +201,10 @@ pub struct Diagnostics {
     pub antigravity_two_hook_event: Option<String>,
     pub antigravity_two_hook_outcome: String,
     pub antigravity_two_hook_workspace_count: Option<u32>,
+    pub antigravity_ide_hook_observed_at_ms: Option<i64>,
+    pub antigravity_ide_hook_event: Option<String>,
+    pub antigravity_ide_hook_outcome: String,
+    pub antigravity_ide_hook_workspace_count: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -211,15 +217,31 @@ struct LoadResult<T> {
 #[derive(Debug, Clone)]
 pub struct StateStore {
     root: PathBuf,
+    antigravity_ide_conversations: Option<PathBuf>,
 }
 
 impl StateStore {
     pub fn from_environment() -> Result<Self, String> {
-        state_dir_from_environment().map(Self::new)
+        Ok(Self {
+            root: state_dir_from_environment()?,
+            antigravity_ide_conversations: crate::antigravity_integration::antigravity_ide_conversations_directory_from_environment().ok(),
+        })
     }
 
+    #[cfg(test)]
     pub fn new(root: PathBuf) -> Self {
-        Self { root }
+        Self {
+            root,
+            antigravity_ide_conversations: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn new_with_antigravity_ide_conversations(root: PathBuf, conversations: PathBuf) -> Self {
+        Self {
+            root,
+            antigravity_ide_conversations: Some(conversations),
+        }
     }
 
     pub fn snapshot(&self, now_ms: i64) -> Snapshot {
@@ -227,7 +249,8 @@ impl StateStore {
         let codex = self.load_codex(now_ms);
         let claude = self.load_claude(now_ms);
         let antigravity = self.load_antigravity(now_ms);
-        let antigravity_ide = self.load_antigravity_ide(now_ms);
+        let mut antigravity_ide = self.load_antigravity_ide(now_ms);
+        self.reconcile_antigravity_ide_models(&mut antigravity_ide.records, now_ms);
         let mut latest_by_id: HashMap<String, InstanceRecord> = HashMap::new();
 
         for record in instances.records {
@@ -324,6 +347,23 @@ impl StateStore {
             Ok(None) => (None, None, "not_observed".to_string(), None),
             Err(_) => (None, None, "health_unreadable".to_string(), None),
         };
+        let antigravity_ide_hook =
+            crate::antigravity_integration::antigravity_ide_hook_observation(&self.root, now_ms);
+        let (
+            antigravity_ide_hook_observed_at_ms,
+            antigravity_ide_hook_event,
+            antigravity_ide_hook_outcome,
+            antigravity_ide_hook_workspace_count,
+        ) = match antigravity_ide_hook {
+            Ok(Some(observation)) => (
+                Some(observation.observed_at_ms),
+                Some(observation.event),
+                observation.outcome.as_str().to_string(),
+                Some(observation.workspace_count),
+            ),
+            Ok(None) => (None, None, "not_observed".to_string(), None),
+            Err(_) => (None, None, "health_unreadable".to_string(), None),
+        };
         Diagnostics {
             schema_version: SCHEMA_VERSION,
             state_directory: self.root.to_string_lossy().into_owned(),
@@ -355,6 +395,10 @@ impl StateStore {
             antigravity_two_hook_event,
             antigravity_two_hook_outcome,
             antigravity_two_hook_workspace_count,
+            antigravity_ide_hook_observed_at_ms,
+            antigravity_ide_hook_event,
+            antigravity_ide_hook_outcome,
+            antigravity_ide_hook_workspace_count,
         }
     }
 
@@ -602,6 +646,45 @@ impl StateStore {
         self.load_activity("antigravity-ide", now_ms)
     }
 
+    fn reconcile_antigravity_ide_models(&self, records: &mut [ActivityRecord], now_ms: i64) {
+        let Some(directory) = self.antigravity_ide_conversations.as_deref() else {
+            return;
+        };
+        let session_keys: BTreeSet<_> = records
+            .iter()
+            .filter(|record| now_ms.saturating_sub(record.changed_at_ms) <= ACTIVITY_STALE_MS)
+            .map(|record| record.session_key.clone())
+            .collect();
+        let models = crate::antigravity_integration::antigravity_ide_execution_models(
+            directory,
+            &session_keys,
+        );
+        for record in records {
+            if let Some(model) = models.get(&record.session_key) {
+                if record.ide_model_revision.as_deref() != Some(model.revision.as_str()) {
+                    // A USER_INPUT row appears just before its PreInvocation.
+                    // Only that hook can correlate the row to an activity
+                    // boundary; adopting it here could relabel the preceding
+                    // turn during that narrow window. Execution metadata is
+                    // safe to reconcile after the fact, while a matching
+                    // current-turn revision simply preserves the hook result.
+                    if model.source == crate::antigravity_integration::IdeModelSource::CurrentTurn {
+                        continue;
+                    }
+                    record.model_kind = match model.preference {
+                        crate::antigravity_integration::IdeSelectedModelPreference::Recognized(
+                            kind,
+                        ) => Some(kind),
+                        crate::antigravity_integration::IdeSelectedModelPreference::Unrecognized => {
+                            None
+                        }
+                    };
+                    record.ide_model_revision = Some(model.revision.clone());
+                }
+            }
+        }
+    }
+
     fn load_activity(&self, provider: &str, now_ms: i64) -> LoadResult<ActivityRecord> {
         let supports_model = matches!(provider, "antigravity" | "antigravity-ide");
         load_records(&self.root.join(provider), |record: &mut ActivityRecord| {
@@ -620,6 +703,14 @@ impl StateStore {
             record.cwd.clear();
             if !supports_model || record.model_kind == Some(AntigravityModelKind::Unknown) {
                 record.model_kind = None;
+            }
+            if !supports_model
+                || record
+                    .ide_model_revision
+                    .as_deref()
+                    .is_some_and(|revision| !valid_sha256_token(revision))
+            {
+                record.ide_model_revision = None;
             }
             true
         })
@@ -684,6 +775,13 @@ fn nonempty_env_path(key: &str) -> Option<PathBuf> {
 
 fn valid_timestamp(timestamp: i64, now_ms: i64) -> bool {
     timestamp >= 0 && timestamp <= now_ms.saturating_add(MAX_FUTURE_SKEW_MS)
+}
+
+fn valid_sha256_token(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 fn load_records<T, F>(directory: &Path, validate: F) -> LoadResult<T>
@@ -941,10 +1039,20 @@ fn aggregate_activity(
     }
 
     matching.sort_by_key(|record| record.changed_at_ms);
-    let fresh_activity = matching.iter().rev().copied().find(|record| {
-        record.state == ActivityRecordState::ActivityDetected
-            && now_ms.saturating_sub(record.changed_at_ms) <= ACTIVITY_STALE_MS
-    });
+    let newest = *matching.last().expect("matching is not empty");
+    let fresh_activity = if provider == "Antigravity" {
+        // Antigravity's model qualifier and lifecycle status must describe the
+        // same most-recent record. An older unfinished conversation must not
+        // mask a newer Stop marker (or supply its stale model) for 24 hours.
+        (newest.state == ActivityRecordState::ActivityDetected
+            && now_ms.saturating_sub(newest.changed_at_ms) <= ACTIVITY_STALE_MS)
+            .then_some(newest)
+    } else {
+        matching.iter().rev().copied().find(|record| {
+            record.state == ActivityRecordState::ActivityDetected
+                && now_ms.saturating_sub(record.changed_at_ms) <= ACTIVITY_STALE_MS
+        })
+    };
     if let Some(record) = fresh_activity {
         return activity_view(
             "activity_detected",
@@ -958,7 +1066,6 @@ fn aggregate_activity(
         );
     }
 
-    let newest = *matching.last().expect("matching is not empty");
     if now_ms.saturating_sub(newest.changed_at_ms) > ACTIVITY_STALE_MS {
         return activity_view(
             "unknown",
@@ -1094,6 +1201,78 @@ mod tests {
         fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
     }
 
+    fn push_test_varint(mut value: u64, output: &mut Vec<u8>) {
+        loop {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            output.push(byte);
+            if value == 0 {
+                break;
+            }
+        }
+    }
+
+    fn test_length_delimited_field(field: u64, value: &[u8]) -> Vec<u8> {
+        let mut output = Vec::new();
+        push_test_varint((field << 3) | 2, &mut output);
+        push_test_varint(value.len() as u64, &mut output);
+        output.extend_from_slice(value);
+        output
+    }
+
+    fn test_varint_field(field: u64, value: u64) -> Vec<u8> {
+        let mut output = Vec::new();
+        push_test_varint(field << 3, &mut output);
+        push_test_varint(value, &mut output);
+        output
+    }
+
+    fn write_test_ide_executor_model(database: &Path, index: i64, model_name: &str) {
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        let planner = test_length_delimited_field(28, model_name.as_bytes());
+        let cascade = test_length_delimited_field(1, &planner);
+        let executor = test_length_delimited_field(10, &cascade);
+        let connection = rusqlite::Connection::open(database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS executor_metadata \
+                 (idx INTEGER PRIMARY KEY, data BLOB);",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO executor_metadata (idx, data) VALUES (?1, ?2)",
+                rusqlite::params![index, executor],
+            )
+            .unwrap();
+    }
+
+    fn write_test_ide_turn_model(database: &Path, index: i64, model_enum: u64) {
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        let requested_model = test_varint_field(1, model_enum);
+        let planner_config = test_length_delimited_field(15, &requested_model);
+        let user_config = test_length_delimited_field(1, &planner_config);
+        let user_input = test_length_delimited_field(12, &user_config);
+        let step = test_length_delimited_field(19, &user_input);
+        let connection = rusqlite::Connection::open(database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS steps \
+                 (idx INTEGER PRIMARY KEY, step_type INTEGER, step_payload BLOB);",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO steps (idx, step_type, step_payload) \
+                 VALUES (?1, 14, ?2)",
+                rusqlite::params![index, step],
+            )
+            .unwrap();
+    }
+
     fn instance(id: &str, path: &Path, seen: i64, focused: bool) -> serde_json::Value {
         json!({
             "schemaVersion": 1,
@@ -1200,6 +1379,8 @@ mod tests {
         assert_eq!(serialized["omittedClaudeRecords"], 0);
         assert_eq!(serialized["antigravityTwoHookOutcome"], "not_observed");
         assert!(serialized["antigravityTwoHookObservedAtMs"].is_null());
+        assert_eq!(serialized["antigravityIdeHookOutcome"], "not_observed");
+        assert!(serialized["antigravityIdeHookObservedAtMs"].is_null());
     }
 
     #[test]
@@ -1218,6 +1399,19 @@ mod tests {
                 "workspaceCount": 0
             }),
         );
+        write_json(
+            &temp
+                .path()
+                .join("antigravity-hook-health/antigravity-ide.json"),
+            json!({
+                "schemaVersion": 1,
+                "event": "stop",
+                "surface": "antigravity_ide",
+                "outcome": "recorded",
+                "observedAtMs": 19_000,
+                "workspaceCount": 1
+            }),
+        );
         let store = StateStore::new(temp.path().to_path_buf());
 
         let observed = store.diagnostics(20_000, "code".into(), "antigravity-ide".into());
@@ -1228,6 +1422,10 @@ mod tests {
         assert_eq!(observed.antigravity_two_hook_outcome, "no_workspace");
         assert_eq!(observed.antigravity_two_hook_observed_at_ms, Some(20_000));
         assert_eq!(observed.antigravity_two_hook_workspace_count, Some(0));
+        assert_eq!(observed.antigravity_ide_hook_event.as_deref(), Some("stop"));
+        assert_eq!(observed.antigravity_ide_hook_outcome, "recorded");
+        assert_eq!(observed.antigravity_ide_hook_observed_at_ms, Some(19_000));
+        assert_eq!(observed.antigravity_ide_hook_workspace_count, Some(1));
 
         fs::write(
             temp.path()
@@ -1237,6 +1435,7 @@ mod tests {
         .unwrap();
         let unreadable = store.diagnostics(20_000, "code".into(), "antigravity-ide".into());
         assert_eq!(unreadable.antigravity_two_hook_outcome, "health_unreadable");
+        assert_eq!(unreadable.antigravity_ide_hook_outcome, "recorded");
     }
 
     #[test]
@@ -1482,7 +1681,8 @@ mod tests {
                 "sessionKey": "hashed-conversation",
                 "cwd": repo,
                 "state": "activity_detected",
-                "changedAtMs": now
+                "changedAtMs": now,
+                "modelKind": "claude_sonnet_4_6_thinking"
             }),
         );
 
@@ -1501,13 +1701,184 @@ mod tests {
                 .antigravity
                 .as_ref()
                 .and_then(|activity| activity.model_kind),
-            None,
-            "legacy records without modelKind remain valid"
+            Some(AntigravityModelKind::ClaudeSonnet46Thinking)
         );
     }
 
     #[test]
-    fn antigravity_model_follows_the_lifecycle_record_selected_for_display() {
+    fn antigravity_ide_snapshot_reconciles_each_turn_from_execution_metadata() {
+        let temp = TempDir::new().unwrap();
+        let state_root = temp.path().join("state");
+        let conversations = temp.path().join("conversations");
+        let repo = temp.path().join("model-switch-project");
+        fs::create_dir_all(&repo).unwrap();
+        let now = 30_000;
+        let conversation_id = "403467f7-041a-420e-84cb-87da2ba51959";
+        let session_key = "d6c372f338b5498e87ad5de82285727934ecc5db005e1aea4e5ae308f6f8555e";
+        write_json(
+            &state_root.join("antigravity-ide/conversation.json"),
+            json!({
+                "schemaVersion": 1,
+                "sessionKey": session_key,
+                "cwd": repo,
+                "state": "activity_detected",
+                "changedAtMs": now,
+                "modelKind": "gemini_3_6_flash_medium"
+            }),
+        );
+        let conversation_database = conversations.join(format!("{conversation_id}.db"));
+        write_test_ide_executor_model(&conversation_database, 0, "claude-sonnet-4-6");
+        let store =
+            StateStore::new_with_antigravity_ide_conversations(state_root, conversations.clone());
+
+        let first = store.snapshot(now);
+        assert_eq!(
+            first.workspaces[0]
+                .antigravity
+                .as_ref()
+                .map(|activity| activity.state.as_str()),
+            Some("activity_detected")
+        );
+        assert_eq!(
+            first.workspaces[0]
+                .antigravity
+                .as_ref()
+                .and_then(|activity| activity.model_kind),
+            Some(AntigravityModelKind::ClaudeSonnet46Thinking)
+        );
+        let claude_revision = crate::antigravity_integration::antigravity_ide_execution_models(
+            &conversations,
+            &BTreeSet::from([session_key.to_string()]),
+        )
+        .remove(session_key)
+        .unwrap()
+        .revision;
+        assert_eq!(claude_revision.len(), 64);
+
+        // A record already associated with this executor revision must retain
+        // its model while the next row is still pending.
+        write_json(
+            &store.root.join("antigravity-ide/conversation.json"),
+            json!({
+                "schemaVersion": 1,
+                "sessionKey": session_key,
+                "cwd": repo,
+                "state": "activity_detected",
+                "changedAtMs": now,
+                "modelKind": "gpt_oss_120b_medium",
+                "ideModelRevision": &claude_revision
+            }),
+        );
+        let pending = store.snapshot(now);
+        assert_eq!(
+            pending.workspaces[0]
+                .antigravity
+                .as_ref()
+                .and_then(|activity| activity.model_kind),
+            Some(AntigravityModelKind::GptOss120bMedium)
+        );
+
+        write_json(
+            &store.root.join("antigravity-ide/conversation.json"),
+            json!({
+                "schemaVersion": 1,
+                "sessionKey": session_key,
+                "cwd": repo,
+                "state": "turn_finished",
+                "changedAtMs": now,
+                "modelKind": "gpt_oss_120b_medium",
+                "ideModelRevision": &claude_revision
+            }),
+        );
+        write_test_ide_executor_model(&conversation_database, 1, "gpt-oss-120b-medium");
+        let switched = store.snapshot(now);
+        assert_eq!(
+            switched.workspaces[0]
+                .antigravity
+                .as_ref()
+                .map(|activity| activity.state.as_str()),
+            Some("turn_finished")
+        );
+        assert_eq!(
+            switched.workspaces[0]
+                .antigravity
+                .as_ref()
+                .and_then(|activity| activity.model_kind),
+            Some(AntigravityModelKind::GptOss120bMedium)
+        );
+    }
+
+    #[test]
+    fn antigravity_ide_snapshot_waits_for_the_hook_before_adopting_a_turn_model() {
+        let temp = TempDir::new().unwrap();
+        let state_root = temp.path().join("state");
+        let conversations = temp.path().join("conversations");
+        let repo = temp.path().join("model-switch-project");
+        fs::create_dir_all(&repo).unwrap();
+        let now = 30_000;
+        let conversation_id = "403467f7-041a-420e-84cb-87da2ba51959";
+        let session_key = "d6c372f338b5498e87ad5de82285727934ecc5db005e1aea4e5ae308f6f8555e";
+        write_json(
+            &state_root.join("antigravity-ide/conversation.json"),
+            json!({
+                "schemaVersion": 1,
+                "sessionKey": session_key,
+                "cwd": repo,
+                "state": "turn_finished",
+                "changedAtMs": now,
+                "modelKind": "gemini_3_6_flash_medium",
+                "ideModelRevision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }),
+        );
+        let conversation_database = conversations.join(format!("{conversation_id}.db"));
+        write_test_ide_turn_model(&conversation_database, 1, 1035);
+        let store =
+            StateStore::new_with_antigravity_ide_conversations(state_root, conversations.clone());
+
+        // The USER_INPUT row precedes PreInvocation by a few milliseconds.
+        // A background refresh in that interval must keep the prior terminal
+        // label rather than assigning Claude to a turn that has not started.
+        let before_hook = store.snapshot(now);
+        let before_hook_activity = before_hook.workspaces[0].antigravity.as_ref().unwrap();
+        assert_eq!(before_hook_activity.state, "turn_finished");
+        assert_eq!(
+            before_hook_activity.model_kind,
+            Some(AntigravityModelKind::Gemini36FlashMedium)
+        );
+
+        let current = crate::antigravity_integration::antigravity_ide_execution_models(
+            &conversations,
+            &BTreeSet::from([session_key.to_string()]),
+        )
+        .remove(session_key)
+        .unwrap();
+        assert_eq!(
+            current.source,
+            crate::antigravity_integration::IdeModelSource::CurrentTurn
+        );
+        write_json(
+            &store.root.join("antigravity-ide/conversation.json"),
+            json!({
+                "schemaVersion": 1,
+                "sessionKey": session_key,
+                "cwd": repo,
+                "state": "activity_detected",
+                "changedAtMs": now + 1,
+                "modelKind": "claude_sonnet_4_6_thinking",
+                "ideModelRevision": current.revision
+            }),
+        );
+        let after_hook = store.snapshot(now + 1);
+        let after_hook_activity = after_hook.workspaces[0].antigravity.as_ref().unwrap();
+        assert_eq!(after_hook_activity.state, "activity_detected");
+        assert_eq!(
+            after_hook_activity.model_kind,
+            Some(AntigravityModelKind::ClaudeSonnet46Thinking)
+        );
+    }
+
+    #[test]
+    fn antigravity_uses_the_newest_lifecycle_state_and_its_model() {
         let temp = TempDir::new().unwrap();
         let repo = temp.path().join("model-project");
         fs::create_dir_all(&repo).unwrap();
@@ -1537,11 +1908,11 @@ mod tests {
 
         let snapshot = StateStore::new(temp.path().to_path_buf()).snapshot(now);
         let activity = snapshot.workspaces[0].antigravity.as_ref().unwrap();
-        assert_eq!(activity.state, "activity_detected");
-        assert_eq!(activity.changed_at_ms, Some(now - 100));
+        assert_eq!(activity.state, "turn_finished");
+        assert_eq!(activity.changed_at_ms, Some(now - 10));
         assert_eq!(
             activity.model_kind,
-            Some(AntigravityModelKind::Gemini31ProHigh)
+            Some(AntigravityModelKind::ClaudeSonnet46Thinking)
         );
     }
 
@@ -1594,6 +1965,14 @@ mod tests {
         assert_eq!(workspace.editor_name, "Antigravity IDE");
         assert!(!workspace.openable);
         assert!(workspace.recently_active);
+        assert_eq!(
+            workspace
+                .antigravity
+                .as_ref()
+                .and_then(|activity| activity.model_kind),
+            None,
+            "IDE events without modelName remain generic Antigravity activity"
+        );
     }
 
     #[test]

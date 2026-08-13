@@ -26,14 +26,19 @@ files, terminal contents, transcripts, or Git data. Optional lifecycle hooks
 receive documented provider event payloads and construct new records containing
 only five core fields: a schema version, one-way session/conversation key,
 local workspace path, coarse state, and timestamp. Antigravity activity records
-may add one optional closed `modelKind` classification derived from documented
-`modelName`; the raw model identifier and unrecognized values are immediately
-discarded. Antigravity hooks additionally replace a product-specific,
-model-free execution-health record containing only fixed event/surface/outcome
-values, a timestamp, and the number of workspace records written. The live
-Claude response parser and status-line receiver represent only percentage and
-reset fields; account, session, behavior-attribution, and other unselected
-response fields are discarded and never reach the UI or storage.
+may add one optional closed `modelKind` classification from hook `modelName` or
+the bounded current-model enum in the IDE conversation's latest user-input
+step, with bounded execution metadata and the last-selected-model preference as
+compatibility fallbacks; raw model identifiers and unrecognized values are
+immediately discarded. An IDE activity record may also contain an opaque
+SHA-256 model-signal revision so a new turn can be distinguished from the
+preceding execution. Antigravity hooks additionally
+replace a product-specific, model-free execution-health record containing only
+fixed event/surface/outcome values, a timestamp, and the number of validated
+workspace associations. The live Claude response parser and status-line receiver
+represent only percentage and reset fields; account, session,
+behavior-attribution, and other unselected response fields are discarded and
+never reach the UI or storage.
 Provider stderr and raw failure messages are also discarded. When usage is
 unavailable, the UI receives only a fixed source/category explanation such as
 could not start, timed out, rejected, or incompatible response.
@@ -53,8 +58,24 @@ current device:
   hooks are installed;
 - Antigravity hook-derived activity records under `antigravity/` or
   `antigravity-ide/`, containing the five core fields above and, when
-  recognized, an optional closed `modelKind`, with one record per documented
-  local `workspacePaths` entry;
+  recognized, an optional closed `modelKind` and opaque `ideModelRevision`,
+  with one record per documented local `workspacePaths` entry;
+- for IDE hook activity only, metadata for the latest `USER_INPUT` row in the
+  local Antigravity IDE conversation database selected directly from the
+  validated hook `conversationId`, or hash-matched in memory during a desktop
+  refresh; VSParallel opens its at-most-1-MiB `step_payload` through SQLite's
+  incremental BLOB API and reads bounded protobuf tags, lengths, and scalar
+  varints encountered while locating fixed current-model enum path
+  `19 → 12 → 1 → 15 → 1`; it immediately discards unrelated scalar values,
+  uses only the queued flag and model enum, and seeks over all unrelated
+  length-delimited bodies without reading or copying their bytes;
+- as compatibility fallbacks, the latest at-most-64-KiB `executor_metadata`
+  row's fixed model-name field and one bounded `ItemTable` last-selected-model
+  preference from the local editor `state.vscdb`; none of these queries reads
+  generation metadata, response bodies, trajectory data, transcripts, OAuth, or
+  user-status data. SQLite is opened in logical read-only/query-only mode; for
+  WAL databases, SQLite itself may maintain its normal reader-coordination
+  sidecar;
 - Antigravity hook execution health under `antigravity-hook-health/`, containing
   only schema version, fixed event/surface/outcome values, timestamp, and
   workspace count—never a model name or classification; and
@@ -87,16 +108,44 @@ event fires merely because a Project was opened or selected. VSParallel reduces
 the transcript path—or documented artifact-directory fallback—to a bounded
 product label and immediately discards it. CLI, conflicting, and unrecognized
 surfaces are ignored; supported hook-only paths remain recent and non-openable
-rather than claiming a live window. A Project-level `.agents/hooks.json` can
+rather than claiming a live window. A workspace-level `.agents/hooks.json` can
 take precedence over the global hook.
 
 The Antigravity adapter admits documented `conversationId`, `workspacePaths`,
-`transcriptPath`, `artifactDirectoryPath`, and `modelName` values, plus the
-minimum `error`, `terminationReason`, and `fullyIdle` fields needed to select a
-coarse state for applicable events. It reduces a recognized model to one of the
-closed `modelKind` values documented in the
+`transcriptPath`, and `artifactDirectoryPath` values, optional `modelName` when
+supplied, plus the minimum `error`, `terminationReason`, and `fullyIdle` fields
+needed to select a coarse state for `Stop`. It reduces a recognized
+model to one of the closed `modelKind` values documented in the
 [metadata protocol](docs/protocol.md), and retains neither the raw model value,
-product path, nor those error/reason values. The stored `sessionKey` is a
+product path, nor those error/reason values. When an IDE hook omits `modelName`,
+VSParallel opens only that validated conversation's local IDE database in
+logical read-only/query-only mode and selects metadata for its newest
+`USER_INPUT` step. It rejects an absent, non-BLOB, queued, or larger-than-1-MiB
+newest row rather than scanning backward. For a usable row, SQLite's incremental
+BLOB API and a streaming protobuf parser read only structural varints, the
+queued flag, and the current model enum at `19 → 12 → 1 → 15 → 1`. It
+immediately discards unrelated scalar values; all unrelated length-delimited
+bodies—including the user input and context—are crossed with seeks, so their
+bytes are never read or copied. The full step payload is never materialized.
+This row is committed before `PreInvocation`, allowing the model shown with
+**Activity detected** to change immediately.
+
+If the current-turn table or row is absent, VSParallel may parse only the fixed
+model-name field in the latest bounded `executor_metadata` blob or, as a final
+compatibility fallback, the fixed
+`antigravityUnifiedStateSync.modelPreferences` key in the local editor
+`state.vscdb`. A decoded unknown current model clears the qualifier. The desktop
+snapshot repeats the narrow per-conversation read; raw conversation identifiers
+are hashed in memory while matching database filenames and are never retained.
+It does not adopt a differing current-turn revision until the lifecycle hook
+has correlated that row with `PreInvocation`.
+Only an opaque SHA-256 revision derived from the selected bounded model signal
+may be stored in the activity record. These queries do not inspect generation
+metadata, response bodies, trajectory data, transcripts, OAuth state, or user
+status. `PostToolUse` events do not write the
+activity record, so they cannot replace a terminal state; terminal failure and
+interruption classification comes from `Stop`. All other hook fields are
+discarded. The stored `sessionKey` is a
 SHA-256 hash of `conversationId`; the filename additionally hashes the
 normalized workspace path so a multi-folder project gets one independent
 record per path. Its execution-health record does not contain either

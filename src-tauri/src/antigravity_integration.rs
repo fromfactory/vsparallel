@@ -3,9 +3,14 @@
 //! Antigravity 2.0, Antigravity IDE, and the Antigravity CLI discover the
 //! same global customization file at `~/.gemini/config/hooks.json`. This
 //! module owns one named entry in that file and records only coarse lifecycle
-//! state plus local workspace paths. It never reads Antigravity's private
-//! project, conversation, transcript, or database storage.
+//! state plus local workspace paths. For IDE hooks that omit `modelName`, a
+//! turn-start hook incrementally scans protobuf structure in the conversation's
+//! latest user-input step and uses only its current model enum, while seeking
+//! past all prompt and context bodies. Bounded execution metadata and editor
+//! preference values are compatibility fallbacks; raw model identifiers and
+//! conversation content are never persisted.
 
+use rusqlite::{Connection, OpenFlags, MAIN_DB};
 use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
@@ -13,9 +18,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::Builder as TempFileBuilder;
 
 #[cfg(unix)]
@@ -33,6 +38,16 @@ const SCHEMA_VERSION: u32 = 1;
 const MAX_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_HOOK_HEALTH_BYTES: u64 = 8 * 1024;
 const MAX_HOOK_INPUT_BYTES: usize = 1024 * 1024;
+const MAX_IDE_STATE_DB_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_IDE_MODEL_PREFERENCES_BYTES: usize = 64 * 1024;
+const MAX_IDE_CONVERSATION_DB_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_IDE_CONVERSATION_AUX_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_IDE_USER_INPUT_BYTES: u64 = 1024 * 1024;
+const MAX_IDE_PROTOBUF_STRUCTURE_BYTES: usize = 4 * 1024;
+const MAX_IDE_EXECUTOR_METADATA_BYTES: usize = 64 * 1024;
+const MAX_IDE_CONVERSATION_DATABASES: usize = 4_096;
+const IDE_DB_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
+const MAX_EXISTING_HOOK_RECORD_BYTES: u64 = 64 * 1024;
 const MAX_CONVERSATION_ID_BYTES: usize = 16 * 1024;
 const MAX_MODEL_NAME_BYTES: usize = 128;
 const MAX_WORKSPACE_PATH_BYTES: usize = 32 * 1024;
@@ -141,7 +156,7 @@ pub struct AntigravityIntegrationChange {
 /// A multi-folder Antigravity project produces one record per workspace path,
 /// keeping the on-disk schema compatible with VSParallel's existing coarse
 /// activity records. The raw conversation ID is replaced with a SHA-256 key.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct HookRecord {
     schema_version: u32,
@@ -151,6 +166,21 @@ struct HookRecord {
     changed_at_ms: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     model_kind: Option<AntigravityModelKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ide_model_revision: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExistingHookRecord {
+    schema_version: u32,
+    session_key: String,
+    state: String,
+    changed_at_ms: i64,
+    #[serde(default)]
+    model_kind: Option<AntigravityModelKind>,
+    #[serde(default)]
+    ide_model_revision: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -159,10 +189,52 @@ struct HookPayload {
     workspace_paths: Vec<String>,
     surface: AntigravitySurface,
     surface_conflict: bool,
+    model_name_present: bool,
     model_kind: Option<AntigravityModelKind>,
     had_error: bool,
     termination_reason: Option<String>,
     fully_idle: Option<bool>,
+    ide_model_revision: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IdeExecutionModel {
+    pub(crate) revision: String,
+    pub(crate) preference: IdeSelectedModelPreference,
+    pub(crate) source: IdeModelSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdeModelSource {
+    CurrentTurn,
+    Execution,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IdeCurrentTurnModel {
+    Missing,
+    Available(IdeExecutionModel),
+    Unusable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HookModelUpdate {
+    Preserve,
+    Replace {
+        model_kind: Option<AntigravityModelKind>,
+        ide_model_revision: Option<String>,
+    },
+    Ide {
+        current_turn_model: Option<IdeExecutionModel>,
+        execution_model: Option<IdeExecutionModel>,
+        selected_model: Option<IdeSelectedModelPreference>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdeSelectedModelPreference {
+    Recognized(AntigravityModelKind),
+    Unrecognized,
 }
 
 /// Closed, privacy-safe model classifications derived from Antigravity's raw
@@ -174,6 +246,8 @@ pub enum AntigravityModelKind {
     Gemini,
     #[serde(rename = "gemini_3_6_flash_medium")]
     Gemini36FlashMedium,
+    #[serde(rename = "gemini_3_6_flash_high")]
+    Gemini36FlashHigh,
     #[serde(rename = "gemini_3_5_flash")]
     Gemini35Flash,
     #[serde(rename = "gemini_3_1_pro_high")]
@@ -190,6 +264,8 @@ pub enum AntigravityModelKind {
     GptOss,
     #[serde(rename = "gpt_oss_120b")]
     GptOss120b,
+    #[serde(rename = "gpt_oss_120b_medium")]
+    GptOss120bMedium,
     #[serde(other)]
     Unknown,
 }
@@ -275,7 +351,7 @@ impl AntigravityHookOutcome {
             Self::Recorded => "the latest agent event produced workspace activity",
             Self::InvalidPayload => "the latest event payload was not valid documented JSON",
             Self::UnsupportedSurface => {
-                "the latest event did not identify the Antigravity 2.0 surface"
+                "the latest event did not identify a supported Antigravity surface"
             }
             Self::MissingConversation => {
                 "the latest event did not include a conversation identifier"
@@ -415,15 +491,13 @@ impl<'de> Visitor<'de> for HookPayloadVisitor<'_> {
                     }
                     model_seen = true;
                     let value: Option<String> = map.next_value()?;
+                    self.payload.model_name_present = value
+                        .as_deref()
+                        .is_some_and(|value| !value.trim().is_empty());
                     self.payload.model_kind =
                         value.as_deref().and_then(classify_antigravity_model_name);
                 }
-                "error"
-                    if matches!(
-                        self.event,
-                        AntigravityHookEvent::PostToolUse | AntigravityHookEvent::Stop
-                    ) =>
-                {
+                "error" if self.event == AntigravityHookEvent::Stop => {
                     if error_seen {
                         return Err(serde::de::Error::duplicate_field("error"));
                     }
@@ -604,7 +678,18 @@ pub fn run_antigravity_hook<R: Read, W: Write>(
     writer: W,
 ) -> i32 {
     let root = crate::state::state_dir_from_environment();
-    run_antigravity_hook_with(event, reader, writer, root.as_deref(), unix_time_ms())
+    let ide_state_database = antigravity_ide_state_database_from_environment().ok();
+    let ide_conversations_directory =
+        antigravity_ide_conversations_directory_from_environment().ok();
+    run_antigravity_hook_with(
+        event,
+        reader,
+        writer,
+        root.as_deref(),
+        ide_state_database.as_deref(),
+        ide_conversations_directory.as_deref(),
+        unix_time_ms(),
+    )
 }
 
 fn run_antigravity_hook_with<R: Read, W: Write>(
@@ -612,6 +697,8 @@ fn run_antigravity_hook_with<R: Read, W: Write>(
     reader: R,
     mut writer: W,
     state_root: Result<&Path, &String>,
+    ide_state_database: Option<&Path>,
+    ide_conversations_directory: Option<&Path>,
     changed_at_ms: i64,
 ) -> i32 {
     let capped = CappedReader::new(reader, MAX_HOOK_INPUT_BYTES);
@@ -623,6 +710,94 @@ fn run_antigravity_hook_with<R: Read, W: Write>(
     }
     .deserialize(&mut deserializer)
     .and_then(|()| deserializer.end());
+
+    let model_update = if parsed.is_err() {
+        HookModelUpdate::Preserve
+    } else if payload.model_name_present {
+        // A hook-supplied identifier is authoritative, including an explicit
+        // but unrecognized value, which clears any stale closed classification.
+        let ide_model_revision = (payload.surface == AntigravitySurface::Ide)
+            .then(|| {
+                payload
+                    .conversation_id
+                    .as_deref()
+                    .and_then(|conversation_id| {
+                        ide_conversations_directory.and_then(|directory| {
+                            read_antigravity_ide_conversation_model(directory, conversation_id)
+                                .ok()
+                                .flatten()
+                                .map(|model| model.revision)
+                        })
+                    })
+            })
+            .flatten();
+        payload.ide_model_revision = ide_model_revision.clone();
+        HookModelUpdate::Replace {
+            model_kind: payload.model_kind,
+            ide_model_revision,
+        }
+    } else if payload.surface == AntigravitySurface::Ide
+        && matches!(
+            event,
+            AntigravityHookEvent::PreInvocation | AntigravityHookEvent::Stop
+        )
+    {
+        // Antigravity commits the current user-input step immediately before
+        // the first PreInvocation. Its embedded user_config therefore gives
+        // Activity detected the model for this turn without waiting for the
+        // executor row written near completion.
+        let current_turn_signal = match (
+            payload.conversation_id.as_deref(),
+            ide_conversations_directory,
+        ) {
+            (Some(conversation_id), Some(directory)) => {
+                read_antigravity_ide_current_turn_model(directory, conversation_id)
+                    .unwrap_or(IdeCurrentTurnModel::Unusable)
+            }
+            _ => IdeCurrentTurnModel::Missing,
+        };
+        let current_turn_model = match &current_turn_signal {
+            IdeCurrentTurnModel::Available(model) => Some(model.clone()),
+            IdeCurrentTurnModel::Missing | IdeCurrentTurnModel::Unusable => None,
+        };
+        let allow_compatibility_fallback = current_turn_signal == IdeCurrentTurnModel::Missing;
+        // Execution metadata remains a compatibility fallback for older IDE
+        // schemas or a transient failure to read the current step.
+        let execution_model = allow_compatibility_fallback
+            .then(|| {
+                payload
+                    .conversation_id
+                    .as_deref()
+                    .and_then(|conversation_id| {
+                        ide_conversations_directory.and_then(|directory| {
+                            read_antigravity_ide_execution_model(directory, conversation_id)
+                                .ok()
+                                .flatten()
+                        })
+                    })
+            })
+            .flatten();
+        // The global preference can lag model switches, so consult it only as
+        // a compatibility fallback when the per-turn signal is unavailable.
+        let selected_model = allow_compatibility_fallback
+            .then(|| {
+                (event == AntigravityHookEvent::PreInvocation || execution_model.is_none())
+                    .then(|| {
+                        ide_state_database.and_then(|database| {
+                            read_antigravity_ide_selected_model(database).ok().flatten()
+                        })
+                    })
+                    .flatten()
+            })
+            .flatten();
+        HookModelUpdate::Ide {
+            current_turn_model,
+            execution_model,
+            selected_model,
+        }
+    } else {
+        HookModelUpdate::Preserve
+    };
 
     let surface = payload.surface;
     let (outcome, workspace_count) = if parsed.is_err() {
@@ -639,12 +814,25 @@ fn run_antigravity_hook_with<R: Read, W: Write>(
         let records = records_from_payload(event, &payload, changed_at_ms);
         if records.is_empty() {
             (AntigravityHookOutcome::NoWorkspace, 0)
+        } else if event == AntigravityHookEvent::PostToolUse {
+            // Tool completion is not a terminal lifecycle transition. Do not
+            // launch a competing read/merge/write that could race a Stop
+            // process and reopen or replace a completed turn.
+            (AntigravityHookOutcome::Recorded, records.len() as u32)
         } else if let (Ok(root), Some(directory)) = (state_root, surface.state_directory()) {
             let attempted = records.len();
             let recorded = records
                 .into_iter()
                 .filter(|(record_key, record)| {
-                    persist_record(root, directory, record_key, record).is_ok()
+                    persist_record(
+                        root,
+                        directory,
+                        record_key,
+                        record,
+                        event,
+                        model_update.clone(),
+                    )
+                    .is_ok()
                 })
                 .count();
             if recorded == attempted {
@@ -713,6 +901,7 @@ fn records_from_payload(
                 state: state.to_string(),
                 changed_at_ms,
                 model_kind: payload.model_kind,
+                ide_model_revision: payload.ide_model_revision.clone(),
             };
             (record_key, record)
         })
@@ -722,7 +911,6 @@ fn records_from_payload(
 fn activity_state(event: AntigravityHookEvent, payload: &HookPayload) -> &'static str {
     match event {
         AntigravityHookEvent::PreInvocation => "activity_detected",
-        AntigravityHookEvent::PostToolUse if payload.had_error => "failed",
         AntigravityHookEvent::PostToolUse => "activity_detected",
         AntigravityHookEvent::Stop if payload.had_error => "failed",
         AntigravityHookEvent::Stop => {
@@ -749,6 +937,8 @@ fn persist_record(
     directory_name: &str,
     record_key: &str,
     record: &HookRecord,
+    event: AntigravityHookEvent,
+    model_update: HookModelUpdate,
 ) -> Result<(), String> {
     if !is_sha256_key(record_key) || !is_sha256_key(&record.session_key) {
         return Err("invalid Antigravity record key".to_string());
@@ -761,10 +951,177 @@ fn persist_record(
     ensure_private_directory(&directory)?;
 
     let target = directory.join(format!("{record_key}.json"));
-    let mut bytes = serde_json::to_vec(record)
+    let mut persisted = record.clone();
+    if let Some(existing) =
+        read_existing_hook_record(&target, &record.session_key, record.changed_at_ms)
+    {
+        // Hook commands run as separate processes. Never let a delayed older
+        // command replace a lifecycle event that has already been recorded.
+        if existing.changed_at_ms > record.changed_at_ms {
+            return Ok(());
+        }
+
+        apply_hook_model_update(&mut persisted, Some(&existing), event, model_update);
+    } else {
+        apply_hook_model_update(&mut persisted, None, event, model_update);
+    }
+    let mut bytes = serde_json::to_vec(&persisted)
         .map_err(|error| format!("could not serialize Antigravity state: {error}"))?;
     bytes.push(b'\n');
     atomic_write_bytes(&target, &bytes, Some(0o600))
+}
+
+fn apply_hook_model_update(
+    persisted: &mut HookRecord,
+    existing: Option<&ExistingHookRecord>,
+    event: AntigravityHookEvent,
+    update: HookModelUpdate,
+) {
+    match update {
+        HookModelUpdate::Preserve => {
+            persisted.model_kind = existing.and_then(|record| record.model_kind);
+            persisted.ide_model_revision =
+                existing.and_then(|record| record.ide_model_revision.clone());
+        }
+        HookModelUpdate::Replace {
+            model_kind,
+            ide_model_revision,
+        } => {
+            persisted.model_kind = model_kind;
+            persisted.ide_model_revision = ide_model_revision
+                .or_else(|| existing.and_then(|record| record.ide_model_revision.clone()));
+        }
+        HookModelUpdate::Ide {
+            current_turn_model,
+            execution_model,
+            selected_model,
+        } => {
+            if let Some(current_turn_model) = current_turn_model {
+                // This revision belongs to the user input that triggered the
+                // hook, so it takes precedence over both the previous turn's
+                // executor row and the IDE's eventually-consistent global
+                // preference.
+                persisted.model_kind = model_kind_from_preference(current_turn_model.preference);
+                persisted.ide_model_revision = Some(current_turn_model.revision);
+                return;
+            }
+            let existing_revision =
+                existing.and_then(|record| record.ide_model_revision.as_deref());
+            let execution_is_new = execution_model
+                .as_ref()
+                .is_some_and(|model| Some(model.revision.as_str()) != existing_revision);
+            if event == AntigravityHookEvent::PreInvocation
+                && existing.is_none_or(|record| terminal_antigravity_state(&record.state))
+            {
+                // At a new turn boundary the latest committed execution row
+                // normally still belongs to the turn that just finished. Use
+                // the current selection for the active label, while recording
+                // that latest revision as the baseline. A later executor row
+                // can then confirm or correct the model without reverting to
+                // the previous turn during the pending window.
+                if let Some(selected_model) = selected_model {
+                    persisted.model_kind = model_kind_from_preference(selected_model);
+                    persisted.ide_model_revision = execution_model
+                        .map(|model| model.revision)
+                        .or_else(|| existing.and_then(|record| record.ide_model_revision.clone()));
+                } else if let Some(execution_model) = execution_model {
+                    persisted.model_kind = model_kind_from_preference(execution_model.preference);
+                    persisted.ide_model_revision = Some(execution_model.revision);
+                } else if let Some(existing) = existing {
+                    persisted.model_kind = existing.model_kind;
+                    persisted.ide_model_revision = existing.ide_model_revision.clone();
+                }
+            } else if execution_is_new {
+                let execution_model = execution_model.expect("checked as present");
+                persisted.model_kind = model_kind_from_preference(execution_model.preference);
+                persisted.ide_model_revision = Some(execution_model.revision);
+            } else if let Some(selected_model) = selected_model {
+                // This path is reached only when the conversation database has
+                // no USER_INPUT schema. It preserves compatibility with older
+                // IDE builds; an unusable or contended current schema does not
+                // permit this eventually-consistent fallback.
+                persisted.model_kind = model_kind_from_preference(selected_model);
+                persisted.ide_model_revision =
+                    existing.and_then(|record| record.ide_model_revision.clone());
+            } else if let Some(existing) = existing {
+                // Repeated invocations and Stop for the same turn retain the
+                // model already chosen at its first invocation.
+                persisted.model_kind = existing.model_kind;
+                persisted.ide_model_revision = existing.ide_model_revision.clone();
+            } else {
+                persisted.model_kind = selected_model.and_then(model_kind_from_preference);
+                persisted.ide_model_revision = None;
+            }
+        }
+    }
+}
+
+fn model_kind_from_preference(
+    preference: IdeSelectedModelPreference,
+) -> Option<AntigravityModelKind> {
+    match preference {
+        IdeSelectedModelPreference::Recognized(kind) => Some(kind),
+        IdeSelectedModelPreference::Unrecognized => None,
+    }
+}
+
+fn read_existing_hook_record(
+    path: &Path,
+    expected_session_key: &str,
+    event_time_ms: i64,
+) -> Option<ExistingHookRecord> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if is_link_or_reparse_point(&metadata)
+        || !metadata.is_file()
+        || metadata.len() > MAX_EXISTING_HOOK_RECORD_BYTES
+    {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    File::open(path)
+        .ok()?
+        .take(MAX_EXISTING_HOOK_RECORD_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > MAX_EXISTING_HOOK_RECORD_BYTES {
+        return None;
+    }
+    let mut record: ExistingHookRecord = serde_json::from_slice(&bytes).ok()?;
+    if record.schema_version != SCHEMA_VERSION
+        || record.session_key != expected_session_key
+        || record.changed_at_ms < 0
+        || record.changed_at_ms > event_time_ms.saturating_add(MAX_FUTURE_SKEW_MS)
+        || !known_antigravity_state(&record.state)
+        || record
+            .ide_model_revision
+            .as_deref()
+            .is_some_and(|revision| !is_sha256_key(revision))
+    {
+        return None;
+    }
+    if record.model_kind == Some(AntigravityModelKind::Unknown) {
+        record.model_kind = None;
+    }
+    Some(record)
+}
+
+fn known_antigravity_state(state: &str) -> bool {
+    matches!(
+        state,
+        "activity_detected"
+            | "turn_finished"
+            | "session_ended"
+            | "failed_or_interrupted"
+            | "failed"
+            | "interrupted"
+    )
+}
+
+fn terminal_antigravity_state(state: &str) -> bool {
+    matches!(
+        state,
+        "turn_finished" | "session_ended" | "failed_or_interrupted" | "failed" | "interrupted"
+    )
 }
 
 fn persist_hook_observation(
@@ -787,6 +1144,13 @@ pub(crate) fn antigravity_two_hook_observation(
     now_ms: i64,
 ) -> Result<Option<AntigravityHookObservation>, String> {
     read_hook_observation(root, AntigravitySurface::Two, now_ms)
+}
+
+pub(crate) fn antigravity_ide_hook_observation(
+    root: &Path,
+    now_ms: i64,
+) -> Result<Option<AntigravityHookObservation>, String> {
+    read_hook_observation(root, AntigravitySurface::Ide, now_ms)
 }
 
 fn read_hook_observation(
@@ -874,6 +1238,806 @@ fn classify_antigravity_surface(transcript_path: &str) -> AntigravitySurface {
     AntigravitySurface::Unknown
 }
 
+fn antigravity_ide_state_database_from_environment() -> Result<PathBuf, String> {
+    #[cfg(target_os = "windows")]
+    let config = nonempty_env_path("APPDATA")
+        .or_else(|| nonempty_env_path("LOCALAPPDATA"))
+        .ok_or_else(|| "the Windows application-data directory is unavailable".to_string())?;
+    #[cfg(target_os = "macos")]
+    let config = home_directory()?
+        .join("Library")
+        .join("Application Support");
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    let config = nonempty_env_path("XDG_CONFIG_HOME")
+        .filter(|path| path.is_absolute())
+        .unwrap_or(home_directory()?.join(".config"));
+
+    Ok(config
+        .join("Antigravity IDE")
+        .join("User")
+        .join("globalStorage")
+        .join("state.vscdb"))
+}
+
+pub(crate) fn antigravity_ide_conversations_directory_from_environment() -> Result<PathBuf, String>
+{
+    Ok(home_directory()?
+        .join(".gemini")
+        .join("antigravity-ide")
+        .join("conversations"))
+}
+
+/// Resolve the latest current-turn model, with execution metadata as a
+/// compatibility fallback, for each requested opaque conversation hash.
+/// Database filename stems are hashed in memory and discarded; callers never
+/// receive or persist Antigravity's raw conversation identifiers.
+pub(crate) fn antigravity_ide_execution_models(
+    directory: &Path,
+    session_keys: &BTreeSet<String>,
+) -> BTreeMap<String, IdeExecutionModel> {
+    let mut models = BTreeMap::new();
+    if session_keys.is_empty() || !bounded_directory(directory) {
+        return models;
+    }
+    let Ok(entries) = fs::read_dir(directory) else {
+        return models;
+    };
+
+    let mut database_count = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("db") {
+            continue;
+        }
+        database_count = database_count.saturating_add(1);
+        if database_count > MAX_IDE_CONVERSATION_DATABASES {
+            break;
+        }
+        let Some(conversation_id) = path.file_stem().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !valid_ide_conversation_id(conversation_id) {
+            continue;
+        }
+        let session_key = sha256_hex(conversation_id.as_bytes());
+        if !session_keys.contains(&session_key) {
+            continue;
+        }
+        if let Ok(Some(model)) = read_antigravity_ide_conversation_model_path(&path) {
+            models.insert(session_key, model);
+        }
+    }
+    models
+}
+
+fn read_antigravity_ide_conversation_model(
+    directory: &Path,
+    conversation_id: &str,
+) -> Result<Option<IdeExecutionModel>, String> {
+    if !bounded_directory(directory) || !valid_ide_conversation_id(conversation_id) {
+        return Ok(None);
+    }
+    read_antigravity_ide_conversation_model_path(&directory.join(format!("{conversation_id}.db")))
+}
+
+fn read_antigravity_ide_current_turn_model(
+    directory: &Path,
+    conversation_id: &str,
+) -> Result<IdeCurrentTurnModel, String> {
+    if !bounded_directory(directory) || !valid_ide_conversation_id(conversation_id) {
+        return Ok(IdeCurrentTurnModel::Missing);
+    }
+    read_antigravity_ide_current_turn_model_path(&directory.join(format!("{conversation_id}.db")))
+}
+
+fn read_antigravity_ide_execution_model(
+    directory: &Path,
+    conversation_id: &str,
+) -> Result<Option<IdeExecutionModel>, String> {
+    if !bounded_directory(directory) || !valid_ide_conversation_id(conversation_id) {
+        return Ok(None);
+    }
+    read_antigravity_ide_execution_model_path(&directory.join(format!("{conversation_id}.db")))
+}
+
+fn read_antigravity_ide_conversation_model_path(
+    database: &Path,
+) -> Result<Option<IdeExecutionModel>, String> {
+    let Some(connection) = open_antigravity_ide_conversation_database(database)? else {
+        return Ok(None);
+    };
+    let revision_context = ide_model_revision_context(database);
+    match read_antigravity_ide_current_turn_model_from_connection(&connection, &revision_context)? {
+        IdeCurrentTurnModel::Available(model) => return Ok(Some(model)),
+        IdeCurrentTurnModel::Unusable => return Ok(None),
+        IdeCurrentTurnModel::Missing => {}
+    }
+    read_antigravity_ide_execution_model_from_connection(&connection, &revision_context)
+}
+
+fn read_antigravity_ide_current_turn_model_path(
+    database: &Path,
+) -> Result<IdeCurrentTurnModel, String> {
+    let Some(connection) = open_antigravity_ide_conversation_database(database)? else {
+        return Ok(IdeCurrentTurnModel::Missing);
+    };
+    read_antigravity_ide_current_turn_model_from_connection(
+        &connection,
+        &ide_model_revision_context(database),
+    )
+}
+
+fn read_antigravity_ide_execution_model_path(
+    database: &Path,
+) -> Result<Option<IdeExecutionModel>, String> {
+    let Some(connection) = open_antigravity_ide_conversation_database(database)? else {
+        return Ok(None);
+    };
+    read_antigravity_ide_execution_model_from_connection(
+        &connection,
+        &ide_model_revision_context(database),
+    )
+}
+
+fn ide_model_revision_context(database: &Path) -> Vec<u8> {
+    database
+        .file_stem()
+        .map(|value| value.to_string_lossy().into_owned().into_bytes())
+        .unwrap_or_default()
+}
+
+fn open_antigravity_ide_conversation_database(
+    database: &Path,
+) -> Result<Option<Connection>, String> {
+    if !bounded_regular_file(database, MAX_IDE_CONVERSATION_DB_BYTES, false, false)? {
+        return Ok(None);
+    }
+    for suffix in ["-wal", "-shm"] {
+        let Some(filename) = database.file_name().and_then(|value| value.to_str()) else {
+            return Ok(None);
+        };
+        let auxiliary = database.with_file_name(format!("{filename}{suffix}"));
+        if !bounded_regular_file(&auxiliary, MAX_IDE_CONVERSATION_AUX_BYTES, true, true)? {
+            return Ok(None);
+        }
+    }
+
+    open_bounded_read_only_database(database).map(Some)
+}
+
+/// Locate the model enum in the newest user-input step. SQLite's incremental
+/// BLOB API reads bounded structural varints, while the streaming scanner seeks
+/// over every unrelated length-delimited body, including user-authored text.
+fn read_antigravity_ide_current_turn_model_from_connection(
+    connection: &Connection,
+    revision_context: &[u8],
+) -> Result<IdeCurrentTurnModel, String> {
+    let has_steps_table: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema \
+             WHERE type = 'table' AND name = 'steps')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("could not inspect the IDE turn-model schema: {error}"))?;
+    if !has_steps_table {
+        return Ok(IdeCurrentTurnModel::Missing);
+    }
+    let (row_id, step_index, payload_type, payload_length) = {
+        let mut statement = connection
+            .prepare(
+                "SELECT rowid, idx, typeof(step_payload), length(step_payload) \
+                 FROM steps WHERE step_type = 14 ORDER BY idx DESC LIMIT 1",
+            )
+            .map_err(|error| format!("could not prepare the IDE turn-model query: {error}"))?;
+        let mut rows = statement
+            .query([])
+            .map_err(|error| format!("could not query the IDE turn model: {error}"))?;
+        let Some(row) = rows
+            .next()
+            .map_err(|error| format!("could not read the IDE turn model: {error}"))?
+        else {
+            return Ok(IdeCurrentTurnModel::Missing);
+        };
+        let row_id: i64 = row
+            .get(0)
+            .map_err(|error| format!("the IDE turn-model row is invalid: {error}"))?;
+        let step_index: i64 = row
+            .get(1)
+            .map_err(|error| format!("the IDE turn-model index is invalid: {error}"))?;
+        let payload_type: String = row
+            .get(2)
+            .map_err(|error| format!("the IDE turn-model type is invalid: {error}"))?;
+        let payload_length: Option<i64> = row
+            .get(3)
+            .map_err(|error| format!("the IDE turn-model length is invalid: {error}"))?;
+        (row_id, step_index, payload_type, payload_length)
+    };
+
+    let Some(payload_length) = payload_length else {
+        return Ok(IdeCurrentTurnModel::Unusable);
+    };
+    if payload_type != "blob"
+        || payload_length <= 0
+        || payload_length as u64 > MAX_IDE_USER_INPUT_BYTES
+    {
+        // The newest row is unusable; never skip backwards to an older input.
+        return Ok(IdeCurrentTurnModel::Unusable);
+    }
+
+    let mut payload = connection
+        .blob_open(MAIN_DB, "steps", "step_payload", row_id, true)
+        .map_err(|error| format!("could not open the IDE turn-model BLOB: {error}"))?;
+    if i64::from(payload.size()) != payload_length {
+        return Ok(IdeCurrentTurnModel::Unusable);
+    }
+    let Some((preference, model_enum)) =
+        decode_ide_user_input_model(&mut payload, payload_length as u64)
+    else {
+        return Ok(IdeCurrentTurnModel::Unusable);
+    };
+
+    let mut revision_source = Vec::with_capacity(64 + revision_context.len());
+    revision_source.extend_from_slice(b"antigravity-ide-user-input-model-v1\0");
+    revision_source.extend_from_slice(revision_context);
+    revision_source.push(0);
+    revision_source.extend_from_slice(&step_index.to_le_bytes());
+    revision_source.extend_from_slice(&model_enum.to_le_bytes());
+    Ok(IdeCurrentTurnModel::Available(IdeExecutionModel {
+        revision: sha256_hex(&revision_source),
+        preference,
+        source: IdeModelSource::CurrentTurn,
+    }))
+}
+
+fn read_antigravity_ide_execution_model_from_connection(
+    connection: &Connection,
+    revision_context: &[u8],
+) -> Result<Option<IdeExecutionModel>, String> {
+    let mut statement = connection
+        .prepare(
+            "SELECT idx, CAST(substr(data, 1, ?1) AS BLOB), length(data) \
+             FROM executor_metadata ORDER BY idx DESC LIMIT 1",
+        )
+        .map_err(|error| format!("could not prepare the IDE execution-model query: {error}"))?;
+    let mut rows = statement
+        .query([MAX_IDE_EXECUTOR_METADATA_BYTES.saturating_add(1) as i64])
+        .map_err(|error| format!("could not query the IDE execution model: {error}"))?;
+    let Some(row) = rows
+        .next()
+        .map_err(|error| format!("could not read the IDE execution model: {error}"))?
+    else {
+        return Ok(None);
+    };
+    let execution_index: i64 = row
+        .get(0)
+        .map_err(|error| format!("the IDE execution-model index is invalid: {error}"))?;
+    let encoded: Vec<u8> = row
+        .get(1)
+        .map_err(|error| format!("the IDE execution model is invalid: {error}"))?;
+    let encoded_length: i64 = row
+        .get(2)
+        .map_err(|error| format!("the IDE execution-model length is invalid: {error}"))?;
+    if encoded_length <= 0
+        || encoded_length > MAX_IDE_EXECUTOR_METADATA_BYTES as i64
+        || encoded.len() != encoded_length as usize
+    {
+        return Ok(None);
+    }
+    Ok(decode_ide_executor_model(&encoded).map(|preference| {
+        let mut revision_source = Vec::with_capacity(64 + revision_context.len());
+        revision_source.extend_from_slice(b"antigravity-ide-execution-model-v1\0");
+        revision_source.extend_from_slice(revision_context);
+        revision_source.push(0);
+        revision_source.extend_from_slice(&execution_index.to_le_bytes());
+        revision_source.extend_from_slice(ide_model_preference_revision_token(preference));
+        IdeExecutionModel {
+            revision: sha256_hex(&revision_source),
+            preference,
+            source: IdeModelSource::Execution,
+        }
+    }))
+}
+
+fn decode_ide_user_input_model<R: Read + Seek>(
+    reader: &mut R,
+    payload_length: u64,
+) -> Option<(IdeSelectedModelPreference, u64)> {
+    if payload_length == 0 || payload_length > MAX_IDE_USER_INPUT_BYTES {
+        return None;
+    }
+    let mut budget = MAX_IDE_PROTOBUF_STRUCTURE_BYTES;
+    let user_input =
+        protobuf_stream_length_delimited_field(reader, (0, payload_length), 19, &mut budget)
+            .ok()
+            .flatten()?;
+    let queued = protobuf_stream_varint_field(reader, user_input, 6, &mut budget).ok()?;
+    if queued.unwrap_or(0) != 0 {
+        // A queued input is not necessarily the invocation currently running.
+        return None;
+    }
+    let user_config = protobuf_stream_length_delimited_field(reader, user_input, 12, &mut budget)
+        .ok()
+        .flatten()?;
+    let planner_config =
+        protobuf_stream_length_delimited_field(reader, user_config, 1, &mut budget)
+            .ok()
+            .flatten()?;
+    let requested_model =
+        protobuf_stream_length_delimited_field(reader, planner_config, 15, &mut budget)
+            .ok()
+            .flatten()?;
+    if requested_model.1.saturating_sub(requested_model.0) > 4 * 1024 {
+        return None;
+    }
+    if protobuf_stream_field(reader, requested_model, 2, &mut budget)
+        .ok()?
+        .is_some()
+    {
+        // ModelOrAlias is a oneof. An alias is not a stable closed model enum,
+        // and competing oneof members make the value ambiguous.
+        return None;
+    }
+    let model_enum = protobuf_stream_varint_field(reader, requested_model, 1, &mut budget)
+        .ok()
+        .flatten()?;
+    Some((ide_model_preference_from_enum(model_enum), model_enum))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProtobufStreamValue {
+    Varint(u64),
+    LengthDelimited((u64, u64)),
+}
+
+fn protobuf_stream_length_delimited_field<R: Read + Seek>(
+    reader: &mut R,
+    window: (u64, u64),
+    wanted: u64,
+    budget: &mut usize,
+) -> Result<Option<(u64, u64)>, ()> {
+    match protobuf_stream_field(reader, window, wanted, budget)? {
+        Some(ProtobufStreamValue::LengthDelimited(value)) => Ok(Some(value)),
+        Some(ProtobufStreamValue::Varint(_)) => Err(()),
+        None => Ok(None),
+    }
+}
+
+fn protobuf_stream_varint_field<R: Read + Seek>(
+    reader: &mut R,
+    window: (u64, u64),
+    wanted: u64,
+    budget: &mut usize,
+) -> Result<Option<u64>, ()> {
+    match protobuf_stream_field(reader, window, wanted, budget)? {
+        Some(ProtobufStreamValue::Varint(value)) => Ok(Some(value)),
+        Some(ProtobufStreamValue::LengthDelimited(_)) => Err(()),
+        None => Ok(None),
+    }
+}
+
+fn protobuf_stream_field<R: Read + Seek>(
+    reader: &mut R,
+    (start, end): (u64, u64),
+    wanted: u64,
+    budget: &mut usize,
+) -> Result<Option<ProtobufStreamValue>, ()> {
+    if start > end || wanted == 0 || reader.seek(SeekFrom::Start(start)).map_err(|_| ())? != start {
+        return Err(());
+    }
+    let mut cursor = start;
+    let mut found = None;
+    while cursor < end {
+        let key = protobuf_stream_varint(reader, &mut cursor, end, budget)?;
+        let field = key >> 3;
+        let wire_type = key & 0x07;
+        if field == 0 || field > 0x1fff_ffff {
+            return Err(());
+        }
+        match wire_type {
+            0 => {
+                let value = protobuf_stream_varint(reader, &mut cursor, end, budget)?;
+                if field == wanted && found.replace(ProtobufStreamValue::Varint(value)).is_some() {
+                    return Err(());
+                }
+            }
+            1 => {
+                if field == wanted {
+                    return Err(());
+                }
+                protobuf_stream_skip(reader, &mut cursor, end, 8)?;
+            }
+            2 => {
+                let length = protobuf_stream_varint(reader, &mut cursor, end, budget)?;
+                let body_end = cursor
+                    .checked_add(length)
+                    .filter(|value| *value <= end)
+                    .ok_or(())?;
+                if field == wanted
+                    && found
+                        .replace(ProtobufStreamValue::LengthDelimited((cursor, body_end)))
+                        .is_some()
+                {
+                    return Err(());
+                }
+                protobuf_stream_seek(reader, &mut cursor, body_end)?;
+            }
+            5 => {
+                if field == wanted {
+                    return Err(());
+                }
+                protobuf_stream_skip(reader, &mut cursor, end, 4)?;
+            }
+            _ => return Err(()),
+        }
+    }
+    Ok(found)
+}
+
+fn protobuf_stream_varint<R: Read>(
+    reader: &mut R,
+    cursor: &mut u64,
+    end: u64,
+    budget: &mut usize,
+) -> Result<u64, ()> {
+    let mut value = 0u64;
+    for shift in (0..=63).step_by(7) {
+        if *cursor >= end {
+            return Err(());
+        }
+        *budget = budget.checked_sub(1).ok_or(())?;
+        let mut byte = [0u8; 1];
+        reader.read_exact(&mut byte).map_err(|_| ())?;
+        *cursor += 1;
+        if shift == 63 && byte[0] & 0xfe != 0 {
+            return Err(());
+        }
+        value |= u64::from(byte[0] & 0x7f) << shift;
+        if byte[0] & 0x80 == 0 {
+            return Ok(value);
+        }
+    }
+    Err(())
+}
+
+fn protobuf_stream_skip<R: Seek>(
+    reader: &mut R,
+    cursor: &mut u64,
+    end: u64,
+    length: u64,
+) -> Result<(), ()> {
+    let target = cursor
+        .checked_add(length)
+        .filter(|value| *value <= end)
+        .ok_or(())?;
+    protobuf_stream_seek(reader, cursor, target)
+}
+
+fn protobuf_stream_seek<R: Seek>(reader: &mut R, cursor: &mut u64, target: u64) -> Result<(), ()> {
+    if reader.seek(SeekFrom::Start(target)).map_err(|_| ())? != target {
+        return Err(());
+    }
+    *cursor = target;
+    Ok(())
+}
+
+fn decode_ide_executor_model(encoded: &[u8]) -> Option<IdeSelectedModelPreference> {
+    if encoded.is_empty() || encoded.len() > MAX_IDE_EXECUTOR_METADATA_BYTES {
+        return None;
+    }
+    let cascade_config = protobuf_length_delimited_field(encoded, 10)?;
+    let planner_config = protobuf_length_delimited_field(cascade_config, 1)?;
+    let model_name = protobuf_length_delimited_field(planner_config, 28)?;
+    let model_name = std::str::from_utf8(model_name).ok()?;
+    Some(match classify_antigravity_model_name(model_name) {
+        Some(kind) => IdeSelectedModelPreference::Recognized(kind),
+        None => IdeSelectedModelPreference::Unrecognized,
+    })
+}
+
+fn valid_ide_conversation_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn bounded_directory(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .is_ok_and(|metadata| !is_link_or_reparse_point(&metadata) && metadata.is_dir())
+}
+
+fn bounded_regular_file(
+    path: &Path,
+    maximum_bytes: u64,
+    missing_is_valid: bool,
+    empty_is_valid: bool,
+) -> Result<bool, String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(missing_is_valid),
+        Err(error) => return Err(format!("could not inspect {}: {error}", path.display())),
+    };
+    Ok(!is_link_or_reparse_point(&metadata)
+        && metadata.is_file()
+        && (empty_is_valid || metadata.len() > 0)
+        && metadata.len() <= maximum_bytes)
+}
+
+fn open_bounded_read_only_database(database: &Path) -> Result<Connection, String> {
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
+        | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        | OpenFlags::SQLITE_OPEN_NOFOLLOW;
+    let connection = Connection::open_with_flags(database, flags)
+        .map_err(|error| format!("could not open {} read-only: {error}", database.display()))?;
+    connection
+        .busy_timeout(IDE_DB_BUSY_TIMEOUT)
+        .map_err(|error| format!("could not bound the IDE database query: {error}"))?;
+    connection
+        .pragma_update(None, "query_only", true)
+        .map_err(|error| format!("could not enforce a read-only IDE query: {error}"))?;
+    Ok(connection)
+}
+
+/// Compatibility model signal for the IDE hook contract, which does not
+/// currently include `modelName`. This query reads one bounded preference value
+/// from Antigravity IDE's editor state and immediately reduces its closed enum;
+/// it does not inspect conversation storage or credential state.
+fn read_antigravity_ide_selected_model(
+    database: &Path,
+) -> Result<Option<IdeSelectedModelPreference>, String> {
+    if !bounded_regular_file(database, MAX_IDE_STATE_DB_BYTES, false, false)? {
+        return Ok(None);
+    }
+
+    let connection = open_bounded_read_only_database(database)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT CAST(value AS BLOB) FROM ItemTable \
+             WHERE key = 'antigravityUnifiedStateSync.modelPreferences' \
+             AND length(value) BETWEEN 1 AND ?1 LIMIT 1",
+        )
+        .map_err(|error| format!("could not prepare the IDE model-preference query: {error}"))?;
+    let mut rows = statement
+        .query([MAX_IDE_MODEL_PREFERENCES_BYTES as i64])
+        .map_err(|error| format!("could not query the IDE model preference: {error}"))?;
+    let Some(row) = rows
+        .next()
+        .map_err(|error| format!("could not read the IDE model preference: {error}"))?
+    else {
+        return Ok(None);
+    };
+    let encoded: Vec<u8> = row
+        .get(0)
+        .map_err(|error| format!("the IDE model preference is invalid: {error}"))?;
+    decode_ide_model_preferences(&encoded)
+        .map(Some)
+        .ok_or_else(|| "the IDE model preference has an invalid bounded encoding".to_string())
+}
+
+#[cfg(test)]
+fn model_kind_from_ide_preferences(encoded: &[u8]) -> Option<AntigravityModelKind> {
+    match decode_ide_model_preferences(encoded)? {
+        IdeSelectedModelPreference::Recognized(kind) => Some(kind),
+        IdeSelectedModelPreference::Unrecognized => None,
+    }
+}
+
+fn decode_ide_model_preferences(encoded: &[u8]) -> Option<IdeSelectedModelPreference> {
+    if encoded.len() > MAX_IDE_MODEL_PREFERENCES_BYTES {
+        return None;
+    }
+    let preferences = decode_base64(encoded)?;
+    let wrapped = protobuf_map_value(&preferences, 1, b"last_selected_agent_model_sentinel_key")?;
+    let encoded_model = protobuf_length_delimited_field(wrapped, 1)?;
+    let model = decode_base64(encoded_model)?;
+    Some(ide_model_preference_from_enum(protobuf_varint_field(
+        &model, 2,
+    )?))
+}
+
+fn ide_model_preference_from_enum(model: u64) -> IdeSelectedModelPreference {
+    let kind = match model {
+        // Observed stable Antigravity IDE 2.x enum values. Unknown future values
+        // deliberately fall back to an unqualified Antigravity label.
+        1071 => AntigravityModelKind::Gemini36FlashHigh,
+        1072 => AntigravityModelKind::Gemini36FlashMedium,
+        1073 => AntigravityModelKind::Gemini,
+        1084 | 1020 | 1187 => AntigravityModelKind::Gemini35Flash,
+        1016 => AntigravityModelKind::Gemini31ProHigh,
+        1036 => AntigravityModelKind::Gemini31ProLow,
+        1035 => AntigravityModelKind::ClaudeSonnet46Thinking,
+        1026 => AntigravityModelKind::ClaudeOpus46Thinking,
+        342 => AntigravityModelKind::GptOss120bMedium,
+        _ => return IdeSelectedModelPreference::Unrecognized,
+    };
+    IdeSelectedModelPreference::Recognized(kind)
+}
+
+fn ide_model_preference_revision_token(preference: IdeSelectedModelPreference) -> &'static [u8] {
+    match preference {
+        IdeSelectedModelPreference::Recognized(kind) => match kind {
+            AntigravityModelKind::Automatic => b"automatic",
+            AntigravityModelKind::Gemini => b"gemini",
+            AntigravityModelKind::Gemini36FlashMedium => b"gemini_3_6_flash_medium",
+            AntigravityModelKind::Gemini36FlashHigh => b"gemini_3_6_flash_high",
+            AntigravityModelKind::Gemini35Flash => b"gemini_3_5_flash",
+            AntigravityModelKind::Gemini31ProHigh => b"gemini_3_1_pro_high",
+            AntigravityModelKind::Gemini31ProLow => b"gemini_3_1_pro_low",
+            AntigravityModelKind::Gemini3Flash => b"gemini_3_flash",
+            AntigravityModelKind::Claude => b"claude",
+            AntigravityModelKind::ClaudeSonnet46Thinking => b"claude_sonnet_4_6_thinking",
+            AntigravityModelKind::ClaudeOpus46Thinking => b"claude_opus_4_6_thinking",
+            AntigravityModelKind::GptOss => b"gpt_oss",
+            AntigravityModelKind::GptOss120b => b"gpt_oss_120b",
+            AntigravityModelKind::GptOss120bMedium => b"gpt_oss_120b_medium",
+            AntigravityModelKind::Unknown => b"unknown",
+        },
+        IdeSelectedModelPreference::Unrecognized => b"unrecognized",
+    }
+}
+
+fn decode_base64(encoded: &[u8]) -> Option<Vec<u8>> {
+    if encoded.is_empty() || !encoded.len().is_multiple_of(4) {
+        return None;
+    }
+    let mut decoded = Vec::with_capacity(encoded.len() / 4 * 3);
+    for (chunk_index, chunk) in encoded.chunks_exact(4).enumerate() {
+        let last = chunk_index + 1 == encoded.len() / 4;
+        let a = base64_value(chunk[0])?;
+        let b = base64_value(chunk[1])?;
+        let c_padding = chunk[2] == b'=';
+        let d_padding = chunk[3] == b'=';
+        if c_padding && !d_padding || (!last && (c_padding || d_padding)) {
+            return None;
+        }
+        let c = if c_padding {
+            0
+        } else {
+            base64_value(chunk[2])?
+        };
+        let d = if d_padding {
+            0
+        } else {
+            base64_value(chunk[3])?
+        };
+        decoded.push((a << 2) | (b >> 4));
+        if !c_padding {
+            decoded.push((b << 4) | (c >> 2));
+        }
+        if !d_padding {
+            decoded.push((c << 6) | d);
+        }
+        if (c_padding && b & 0x0f != 0) || (d_padding && !c_padding && c & 0x03 != 0) {
+            return None;
+        }
+    }
+    Some(decoded)
+}
+
+fn base64_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+fn protobuf_map_value<'a>(bytes: &'a [u8], map_field: u64, wanted_key: &[u8]) -> Option<&'a [u8]> {
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        let key = protobuf_varint(bytes, &mut cursor)?;
+        let field = key >> 3;
+        let wire_type = key & 0x07;
+        if field == 0 {
+            return None;
+        }
+        match wire_type {
+            0 => {
+                protobuf_varint(bytes, &mut cursor)?;
+            }
+            1 => cursor = cursor.checked_add(8).filter(|end| *end <= bytes.len())?,
+            2 => {
+                let length = usize::try_from(protobuf_varint(bytes, &mut cursor)?).ok()?;
+                let end = cursor
+                    .checked_add(length)
+                    .filter(|end| *end <= bytes.len())?;
+                if field == map_field {
+                    let entry = &bytes[cursor..end];
+                    if protobuf_length_delimited_field(entry, 1) == Some(wanted_key) {
+                        return protobuf_length_delimited_field(entry, 2);
+                    }
+                }
+                cursor = end;
+            }
+            5 => cursor = cursor.checked_add(4).filter(|end| *end <= bytes.len())?,
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn protobuf_length_delimited_field(bytes: &[u8], wanted: u64) -> Option<&[u8]> {
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        let key = protobuf_varint(bytes, &mut cursor)?;
+        let field = key >> 3;
+        let wire_type = key & 0x07;
+        if field == 0 {
+            return None;
+        }
+        match wire_type {
+            0 => {
+                protobuf_varint(bytes, &mut cursor)?;
+            }
+            1 => cursor = cursor.checked_add(8).filter(|end| *end <= bytes.len())?,
+            2 => {
+                let length = usize::try_from(protobuf_varint(bytes, &mut cursor)?).ok()?;
+                let end = cursor
+                    .checked_add(length)
+                    .filter(|end| *end <= bytes.len())?;
+                if field == wanted {
+                    return Some(&bytes[cursor..end]);
+                }
+                cursor = end;
+            }
+            5 => cursor = cursor.checked_add(4).filter(|end| *end <= bytes.len())?,
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn protobuf_varint_field(bytes: &[u8], wanted: u64) -> Option<u64> {
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        let key = protobuf_varint(bytes, &mut cursor)?;
+        let field = key >> 3;
+        let wire_type = key & 0x07;
+        if field == 0 {
+            return None;
+        }
+        match wire_type {
+            0 => {
+                let value = protobuf_varint(bytes, &mut cursor)?;
+                if field == wanted {
+                    return Some(value);
+                }
+            }
+            1 => cursor = cursor.checked_add(8).filter(|end| *end <= bytes.len())?,
+            2 => {
+                let length = usize::try_from(protobuf_varint(bytes, &mut cursor)?).ok()?;
+                cursor = cursor
+                    .checked_add(length)
+                    .filter(|end| *end <= bytes.len())?;
+            }
+            5 => cursor = cursor.checked_add(4).filter(|end| *end <= bytes.len())?,
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn protobuf_varint(bytes: &[u8], cursor: &mut usize) -> Option<u64> {
+    let mut value = 0u64;
+    for shift in (0..=63).step_by(7) {
+        let byte = *bytes.get(*cursor)?;
+        *cursor += 1;
+        if shift == 63 && byte & 0xfe != 0 {
+            return None;
+        }
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some(value);
+        }
+    }
+    None
+}
+
 fn classify_antigravity_model_name(value: &str) -> Option<AntigravityModelKind> {
     let value = value.trim();
     if value.is_empty() || value.len() > MAX_MODEL_NAME_BYTES || !value.is_ascii() {
@@ -902,13 +2066,18 @@ fn classify_antigravity_model_name(value: &str) -> Option<AntigravityModelKind> 
     match normalized.as_str() {
         "auto" | "automatic" => Some(AntigravityModelKind::Automatic),
         "gemini-3-6-flash-medium" => Some(AntigravityModelKind::Gemini36FlashMedium),
+        "gemini-3-6-flash-high" => Some(AntigravityModelKind::Gemini36FlashHigh),
         "gemini-3-5-flash" => Some(AntigravityModelKind::Gemini35Flash),
         "gemini-3-1-pro-high" => Some(AntigravityModelKind::Gemini31ProHigh),
         "gemini-3-1-pro-low" => Some(AntigravityModelKind::Gemini31ProLow),
         "gemini-3-flash" => Some(AntigravityModelKind::Gemini3Flash),
-        "claude-sonnet-4-6-thinking" => Some(AntigravityModelKind::ClaudeSonnet46Thinking),
+        "gemini-3-flash-agent" => Some(AntigravityModelKind::Gemini35Flash),
+        "claude-sonnet-4-6" | "claude-sonnet-4-6-thinking" => {
+            Some(AntigravityModelKind::ClaudeSonnet46Thinking)
+        }
         "claude-opus-4-6-thinking" => Some(AntigravityModelKind::ClaudeOpus46Thinking),
         "gpt-oss-120b" => Some(AntigravityModelKind::GptOss120b),
+        "gpt-oss-120b-medium" => Some(AntigravityModelKind::GptOss120bMedium),
         "gemini" => Some(AntigravityModelKind::Gemini),
         "claude" => Some(AntigravityModelKind::Claude),
         "gpt-oss" => Some(AntigravityModelKind::GptOss),
@@ -1815,8 +2984,208 @@ mod tests {
         now: i64,
     ) -> (i32, String) {
         let mut output = Vec::new();
-        let code = run_antigravity_hook_with(event, input.as_bytes(), &mut output, Ok(root), now);
+        let code = run_antigravity_hook_with(
+            event,
+            input.as_bytes(),
+            &mut output,
+            Ok(root),
+            None,
+            None,
+            now,
+        );
         (code, String::from_utf8(output).unwrap())
+    }
+
+    fn hook_with_root_and_ide_state(
+        event: AntigravityHookEvent,
+        input: &str,
+        root: &Path,
+        ide_state_database: &Path,
+        now: i64,
+    ) -> (i32, String) {
+        let mut output = Vec::new();
+        let code = run_antigravity_hook_with(
+            event,
+            input.as_bytes(),
+            &mut output,
+            Ok(root),
+            Some(ide_state_database),
+            None,
+            now,
+        );
+        (code, String::from_utf8(output).unwrap())
+    }
+
+    fn push_test_varint(mut value: u64, output: &mut Vec<u8>) {
+        loop {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            output.push(byte);
+            if value == 0 {
+                break;
+            }
+        }
+    }
+
+    fn test_length_delimited_field(field: u64, value: &[u8]) -> Vec<u8> {
+        let mut output = Vec::new();
+        push_test_varint((field << 3) | 2, &mut output);
+        push_test_varint(value.len() as u64, &mut output);
+        output.extend_from_slice(value);
+        output
+    }
+
+    fn test_varint_field(field: u64, value: u64) -> Vec<u8> {
+        let mut output = Vec::new();
+        push_test_varint(field << 3, &mut output);
+        push_test_varint(value, &mut output);
+        output
+    }
+
+    fn test_base64_encode(bytes: &[u8]) -> String {
+        const ALPHABET: &[u8; 64] =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut encoded = String::new();
+        for chunk in bytes.chunks(3) {
+            let a = chunk[0];
+            let b = chunk.get(1).copied().unwrap_or(0);
+            let c = chunk.get(2).copied().unwrap_or(0);
+            encoded.push(ALPHABET[(a >> 2) as usize] as char);
+            encoded.push(ALPHABET[(((a & 0x03) << 4) | (b >> 4)) as usize] as char);
+            encoded.push(if chunk.len() > 1 {
+                ALPHABET[(((b & 0x0f) << 2) | (c >> 6)) as usize] as char
+            } else {
+                '='
+            });
+            encoded.push(if chunk.len() > 2 {
+                ALPHABET[(c & 0x3f) as usize] as char
+            } else {
+                '='
+            });
+        }
+        encoded
+    }
+
+    fn test_ide_model_preference_entry(key: &[u8], model_enum: u64) -> Vec<u8> {
+        let model = test_base64_encode(&test_varint_field(2, model_enum));
+        let wrapped = test_length_delimited_field(1, model.as_bytes());
+        let mut entry = test_length_delimited_field(1, key);
+        entry.extend(test_length_delimited_field(2, &wrapped));
+        entry
+    }
+
+    fn test_ide_model_preferences(model_enum: u64) -> String {
+        let entry =
+            test_ide_model_preference_entry(b"last_selected_agent_model_sentinel_key", model_enum);
+        test_base64_encode(&test_length_delimited_field(1, &entry))
+    }
+
+    fn write_ide_state_database(database: &Path, model_enum: u64) {
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        let connection = Connection::open(database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS ItemTable \
+                 (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB);",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO ItemTable (key, value) VALUES (?1, ?2)",
+                rusqlite::params![
+                    "antigravityUnifiedStateSync.modelPreferences",
+                    test_ide_model_preferences(model_enum)
+                ],
+            )
+            .unwrap();
+    }
+
+    fn test_ide_executor_metadata(model_name: &str) -> Vec<u8> {
+        let planner = test_length_delimited_field(28, model_name.as_bytes());
+        let cascade = test_length_delimited_field(1, &planner);
+        test_length_delimited_field(10, &cascade)
+    }
+
+    fn write_ide_conversation_model(database: &Path, index: i64, model_name: &str) {
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        let connection = Connection::open(database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS executor_metadata \
+                 (idx INTEGER PRIMARY KEY, data BLOB);",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO executor_metadata (idx, data) VALUES (?1, ?2)",
+                rusqlite::params![index, test_ide_executor_metadata(model_name)],
+            )
+            .unwrap();
+    }
+
+    fn test_ide_user_input_step(model_enum: u64, queued: bool, private_padding: &[u8]) -> Vec<u8> {
+        let requested_model = test_varint_field(1, model_enum);
+        let planner_config = test_length_delimited_field(15, &requested_model);
+        let user_config = test_length_delimited_field(1, &planner_config);
+
+        let mut user_input = test_length_delimited_field(1, private_padding);
+        if queued {
+            user_input.extend(test_varint_field(6, 1));
+        }
+        user_input.extend(test_length_delimited_field(12, &user_config));
+        // Field 13 is the previous user config and must never override the
+        // current config in field 12.
+        let previous_model = test_varint_field(1, 1072);
+        let previous_planner = test_length_delimited_field(15, &previous_model);
+        let previous_config = test_length_delimited_field(1, &previous_planner);
+        user_input.extend(test_length_delimited_field(13, &previous_config));
+
+        let mut step = test_length_delimited_field(2, private_padding);
+        step.extend(test_length_delimited_field(19, &user_input));
+        step
+    }
+
+    fn write_ide_conversation_turn_model(database: &Path, index: i64, model_enum: u64) {
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        let connection = Connection::open(database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS steps \
+                 (idx INTEGER PRIMARY KEY, step_type INTEGER, step_payload BLOB);",
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT OR REPLACE INTO steps (idx, step_type, step_payload) \
+                 VALUES (?1, 14, ?2)",
+                rusqlite::params![
+                    index,
+                    test_ide_user_input_step(model_enum, false, b"private user input")
+                ],
+            )
+            .unwrap();
+    }
+
+    struct CountingCursor {
+        inner: io::Cursor<Vec<u8>>,
+        bytes_read: usize,
+    }
+
+    impl Read for CountingCursor {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let count = self.inner.read(buffer)?;
+            self.bytes_read += count;
+            Ok(count)
+        }
+    }
+
+    impl Seek for CountingCursor {
+        fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+            self.inner.seek(position)
+        }
     }
 
     fn state_records(root: &Path) -> Vec<Value> {
@@ -1856,20 +3225,70 @@ mod tests {
                 "gemini_3_1_pro_high",
             ),
             (
+                "gemini-3.6-flash-high",
+                AntigravityModelKind::Gemini36FlashHigh,
+                "gemini_3_6_flash_high",
+            ),
+            (
+                "gemini-3.5-flash",
+                AntigravityModelKind::Gemini35Flash,
+                "gemini_3_5_flash",
+            ),
+            (
+                "gemini-3.1-pro-low",
+                AntigravityModelKind::Gemini31ProLow,
+                "gemini_3_1_pro_low",
+            ),
+            (
+                "gemini-3-flash",
+                AntigravityModelKind::Gemini3Flash,
+                "gemini_3_flash",
+            ),
+            (
+                "gemini-3-flash-agent",
+                AntigravityModelKind::Gemini35Flash,
+                "gemini_3_5_flash",
+            ),
+            (
+                "claude-sonnet-4.6",
+                AntigravityModelKind::ClaudeSonnet46Thinking,
+                "claude_sonnet_4_6_thinking",
+            ),
+            (
                 "claude-sonnet-4.6-thinking",
                 AntigravityModelKind::ClaudeSonnet46Thinking,
                 "claude_sonnet_4_6_thinking",
+            ),
+            (
+                "Claude Opus 4.6 (Thinking)",
+                AntigravityModelKind::ClaudeOpus46Thinking,
+                "claude_opus_4_6_thinking",
             ),
             (
                 "gpt-oss-120b",
                 AntigravityModelKind::GptOss120b,
                 "gpt_oss_120b",
             ),
+            (
+                "gpt-oss-120b-medium",
+                AntigravityModelKind::GptOss120bMedium,
+                "gpt_oss_120b_medium",
+            ),
             ("auto", AntigravityModelKind::Automatic, "automatic"),
             (
                 "gemini-future-preview",
                 AntigravityModelKind::Gemini,
                 "gemini",
+            ),
+            (
+                "claude-future-preview",
+                AntigravityModelKind::Claude,
+                "claude",
+            ),
+            (
+                "gpt-oss-future-preview",
+                AntigravityModelKind::GptOss,
+                "gpt_oss",
             ),
         ];
 
@@ -2054,6 +3473,958 @@ mod tests {
     }
 
     #[test]
+    fn ide_hook_execution_has_a_separate_readable_health_receipt() {
+        let temp = TempDir::new().unwrap();
+        let workspace = temp.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let payload = json!({
+            "conversationId": "ide-conversation",
+            "workspacePaths": [workspace],
+            "transcriptPath": "/home/test/.gemini/antigravity-ide/brain/ide-conversation/.system_generated/logs/transcript.jsonl",
+            "artifactDirectoryPath": "/home/test/.gemini/antigravity-ide/brain/ide-conversation"
+        });
+
+        let (code, output) = hook_with_root(
+            AntigravityHookEvent::PreInvocation,
+            &payload.to_string(),
+            temp.path(),
+            10,
+        );
+
+        assert_eq!(code, 0);
+        assert_eq!(output, "{}\n");
+        assert!(antigravity_two_hook_observation(temp.path(), 10)
+            .unwrap()
+            .is_none());
+        let observation = antigravity_ide_hook_observation(temp.path(), 10)
+            .unwrap()
+            .unwrap();
+        assert_eq!(observation.surface, "antigravity_ide");
+        assert_eq!(observation.outcome, AntigravityHookOutcome::Recorded);
+        assert_eq!(observation.workspace_count, 1);
+        let record: Value = serde_json::from_slice(
+            &fs::read(
+                fs::read_dir(temp.path().join("antigravity-ide"))
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(record.get("modelKind").is_none());
+    }
+
+    #[test]
+    fn ide_hook_tracks_the_latest_model_and_late_tool_events_cannot_reopen_a_turn() {
+        let temp = TempDir::new().unwrap();
+        let state_root = temp.path().join("state");
+        let ide_state_database = temp.path().join("globalStorage/state.vscdb");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let conversation_id = "9710f92a-3aac-40d8-9b34-1a19de34735b";
+        write_ide_state_database(&ide_state_database, 1072);
+        let payload = json!({
+            "conversationId": conversation_id,
+            "workspacePaths": [workspace],
+            "invocationNum": 0,
+            "transcriptPath": format!(
+                "/home/test/.gemini/antigravity-ide/brain/{conversation_id}/.system_generated/logs/transcript.jsonl"
+            )
+        });
+
+        let (code, output) = hook_with_root_and_ide_state(
+            AntigravityHookEvent::PreInvocation,
+            &payload.to_string(),
+            &state_root,
+            &ide_state_database,
+            10,
+        );
+
+        assert_eq!(code, 0);
+        assert_eq!(output, "{}\n");
+        let record: Value = serde_json::from_slice(
+            &fs::read(
+                fs::read_dir(state_root.join("antigravity-ide"))
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["state"], "activity_detected");
+        assert_eq!(record["modelKind"], "gemini_3_6_flash_medium");
+        let saved = record.to_string();
+        assert!(!saved.contains(conversation_id));
+        assert!(!saved.contains("gemini-3-6"));
+
+        // invocationNum does not define a reliable user-turn boundary. Every
+        // PreInvocation must pick up a later model selection.
+        write_ide_state_database(&ide_state_database, 1035);
+        let later_invocation = json!({
+            "conversationId": conversation_id,
+            "workspacePaths": [workspace],
+            "invocationNum": 7,
+            "transcriptPath": format!(
+                "/home/test/.gemini/antigravity-ide/brain/{conversation_id}/.system_generated/logs/transcript.jsonl"
+            )
+        });
+        hook_with_root_and_ide_state(
+            AntigravityHookEvent::PreInvocation,
+            &later_invocation.to_string(),
+            &state_root,
+            &ide_state_database,
+            15,
+        );
+        let record: Value = serde_json::from_slice(
+            &fs::read(
+                fs::read_dir(state_root.join("antigravity-ide"))
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["modelKind"], "claude_sonnet_4_6_thinking");
+        assert_eq!(record["changedAtMs"], 15);
+
+        // Successful tool completion is state-neutral. It must not manufacture
+        // a later activity marker or replace the latest trusted model.
+        let (code, output) = hook_with_root(
+            AntigravityHookEvent::PostToolUse,
+            &later_invocation.to_string(),
+            &state_root,
+            20,
+        );
+        assert_eq!(code, 0);
+        assert_eq!(output, "{}\n");
+        let record: Value = serde_json::from_slice(
+            &fs::read(
+                fs::read_dir(state_root.join("antigravity-ide"))
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["modelKind"], "claude_sonnet_4_6_thinking");
+        assert_eq!(record["state"], "activity_detected");
+        assert_eq!(record["changedAtMs"], 15);
+
+        // The IDE preference write is asynchronous. A Stop refresh corrects a
+        // single-invocation turn whose PreInvocation observed the older value.
+        write_ide_state_database(&ide_state_database, 342);
+        let stop = json!({
+            "conversationId": conversation_id,
+            "workspacePaths": [workspace],
+            "executionNum": 1,
+            "fullyIdle": true,
+            "terminationReason": "model_stop",
+            "transcriptPath": format!(
+                "/home/test/.gemini/antigravity-ide/brain/{conversation_id}/.system_generated/logs/transcript.jsonl"
+            )
+        });
+        hook_with_root_and_ide_state(
+            AntigravityHookEvent::Stop,
+            &stop.to_string(),
+            &state_root,
+            &ide_state_database,
+            30,
+        );
+        let record: Value = serde_json::from_slice(
+            &fs::read(
+                fs::read_dir(state_root.join("antigravity-ide"))
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["modelKind"], "gpt_oss_120b_medium");
+        assert_eq!(record["state"], "turn_finished");
+        assert_eq!(record["changedAtMs"], 30);
+
+        // Antigravity regularly emits PostToolUse after Stop. The terminal
+        // status and its timestamp must remain intact.
+        hook_with_root(
+            AntigravityHookEvent::PostToolUse,
+            &later_invocation.to_string(),
+            &state_root,
+            40,
+        );
+        let record: Value = serde_json::from_slice(
+            &fs::read(
+                fs::read_dir(state_root.join("antigravity-ide"))
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["modelKind"], "gpt_oss_120b_medium");
+        assert_eq!(record["state"], "turn_finished");
+        assert_eq!(record["changedAtMs"], 30);
+
+        // A transient lookup failure on the next model call preserves the
+        // latest trusted model but legitimately reopens lifecycle activity.
+        hook_with_root(
+            AntigravityHookEvent::PreInvocation,
+            &later_invocation.to_string(),
+            &state_root,
+            50,
+        );
+        let record: Value = serde_json::from_slice(
+            &fs::read(
+                fs::read_dir(state_root.join("antigravity-ide"))
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["modelKind"], "gpt_oss_120b_medium");
+        assert_eq!(record["state"], "activity_detected");
+        assert_eq!(record["changedAtMs"], 50);
+
+        // A delayed event with an older timestamp cannot replace newer state.
+        hook_with_root_and_ide_state(
+            AntigravityHookEvent::Stop,
+            &stop.to_string(),
+            &state_root,
+            &ide_state_database,
+            45,
+        );
+        let record: Value = serde_json::from_slice(
+            &fs::read(
+                fs::read_dir(state_root.join("antigravity-ide"))
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["state"], "activity_detected");
+        assert_eq!(record["changedAtMs"], 50);
+
+        let unknown_payload = json!({
+            "conversationId": conversation_id,
+            "workspacePaths": [workspace],
+            "invocationNum": 0,
+            "transcriptPath": format!(
+                "/home/test/.gemini/antigravity-ide/brain/{conversation_id}/transcript.jsonl"
+            ),
+            "modelName": "private-deployment-model"
+        });
+        hook_with_root_and_ide_state(
+            AntigravityHookEvent::PreInvocation,
+            &unknown_payload.to_string(),
+            &state_root,
+            &ide_state_database,
+            60,
+        );
+        let record: Value = serde_json::from_slice(
+            &fs::read(
+                fs::read_dir(state_root.join("antigravity-ide"))
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(record.get("modelKind").is_none());
+        assert!(!record.to_string().contains("private-deployment-model"));
+
+        // A successfully decoded but unknown IDE enum also clears a stale
+        // qualifier rather than misreporting the previously selected model.
+        write_ide_state_database(&ide_state_database, 342);
+        hook_with_root_and_ide_state(
+            AntigravityHookEvent::PreInvocation,
+            &later_invocation.to_string(),
+            &state_root,
+            &ide_state_database,
+            65,
+        );
+        let record: Value = serde_json::from_slice(
+            &fs::read(
+                fs::read_dir(state_root.join("antigravity-ide"))
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["modelKind"], "gpt_oss_120b_medium");
+        write_ide_state_database(&ide_state_database, 999_999);
+        let compatibility_payload = json!({
+            "conversationId": conversation_id,
+            "workspacePaths": [workspace],
+            "transcriptPath": format!(
+                "/home/test/.gemini/antigravity-ide/brain/{conversation_id}/transcript.jsonl"
+            )
+        });
+        hook_with_root_and_ide_state(
+            AntigravityHookEvent::PreInvocation,
+            &compatibility_payload.to_string(),
+            &state_root,
+            &ide_state_database,
+            70,
+        );
+        let record: Value = serde_json::from_slice(
+            &fs::read(
+                fs::read_dir(state_root.join("antigravity-ide"))
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(record.get("modelKind").is_none());
+    }
+
+    #[test]
+    fn ide_hook_prefers_the_latest_per_conversation_execution_model() {
+        let temp = TempDir::new().unwrap();
+        let state_root = temp.path().join("state");
+        let ide_state_database = temp.path().join("globalStorage/state.vscdb");
+        let conversations = temp.path().join("conversations");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let conversation_id = "403467f7-041a-420e-84cb-87da2ba51959";
+        let conversation_database = conversations.join(format!("{conversation_id}.db"));
+        let payload = json!({
+            "conversationId": conversation_id,
+            "workspacePaths": [workspace],
+            "invocationNum": 0,
+            "transcriptPath": format!(
+                "/home/test/.gemini/antigravity-ide/brain/{conversation_id}/transcript.jsonl"
+            )
+        });
+
+        // The turn starts from the current selection before any executor row
+        // exists.
+        write_ide_state_database(&ide_state_database, 1072);
+        let mut output = Vec::new();
+        assert_eq!(
+            run_antigravity_hook_with(
+                AntigravityHookEvent::PreInvocation,
+                payload.to_string().as_bytes(),
+                &mut output,
+                Ok(&state_root),
+                Some(&ide_state_database),
+                Some(&conversations),
+                99,
+            ),
+            0
+        );
+        let initial: Value = serde_json::from_slice(
+            &fs::read(
+                fs::read_dir(state_root.join("antigravity-ide"))
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(initial["modelKind"], "gemini_3_6_flash_medium");
+
+        // Once each new execution row appears, it is authoritative even while
+        // the global preference remains pinned to the initial Gemini value.
+        for (index, model_name, expected) in [
+            (0, "gemini-3-flash-agent", "gemini_3_5_flash"),
+            (1, "claude-sonnet-4-6", "claude_sonnet_4_6_thinking"),
+            (2, "gpt-oss-120b-medium", "gpt_oss_120b_medium"),
+        ] {
+            write_ide_conversation_model(&conversation_database, index, model_name);
+            let mut output = Vec::new();
+            assert_eq!(
+                run_antigravity_hook_with(
+                    AntigravityHookEvent::PreInvocation,
+                    payload.to_string().as_bytes(),
+                    &mut output,
+                    Ok(&state_root),
+                    Some(&ide_state_database),
+                    Some(&conversations),
+                    100 + index,
+                ),
+                0
+            );
+            assert_eq!(output, b"{}\n");
+            let record: Value = serde_json::from_slice(
+                &fs::read(
+                    fs::read_dir(state_root.join("antigravity-ide"))
+                        .unwrap()
+                        .next()
+                        .unwrap()
+                        .unwrap()
+                        .path(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(record["modelKind"], expected);
+        }
+
+        let wanted = BTreeSet::from([sha256_hex(conversation_id.as_bytes())]);
+        assert_eq!(
+            antigravity_ide_execution_models(&conversations, &wanted)
+                .get(&sha256_hex(conversation_id.as_bytes()))
+                .map(|model| model.preference),
+            Some(IdeSelectedModelPreference::Recognized(
+                AntigravityModelKind::GptOss120bMedium
+            ))
+        );
+    }
+
+    #[test]
+    fn ide_execution_model_reader_never_falls_back_to_an_older_row() {
+        let temp = TempDir::new().unwrap();
+        let database = temp
+            .path()
+            .join("conversations/403467f7-041a-420e-84cb-87da2ba51959.db");
+        write_ide_conversation_model(&database, 0, "gemini-3.6-flash-high");
+        write_ide_conversation_model(&database, 1, "private-deployment-model");
+        assert_eq!(
+            read_antigravity_ide_conversation_model_path(&database)
+                .unwrap()
+                .map(|model| model.preference),
+            Some(IdeSelectedModelPreference::Unrecognized)
+        );
+
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute(
+                "INSERT INTO executor_metadata (idx, data) VALUES (?1, ?2)",
+                rusqlite::params![2, vec![0_u8; MAX_IDE_EXECUTOR_METADATA_BYTES + 1]],
+            )
+            .unwrap();
+        assert_eq!(
+            read_antigravity_ide_conversation_model_path(&database).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn ide_first_observed_turn_prefers_the_current_selection_over_an_older_execution() {
+        let temp = TempDir::new().unwrap();
+        let state_root = temp.path().join("state");
+        let ide_state_database = temp.path().join("globalStorage/state.vscdb");
+        let conversations = temp.path().join("conversations");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let conversation_id = "403467f7-041a-420e-84cb-87da2ba51959";
+        let conversation_database = conversations.join(format!("{conversation_id}.db"));
+        write_ide_state_database(&ide_state_database, 1035);
+        write_ide_conversation_model(&conversation_database, 0, "gemini-3.6-flash-medium");
+        let payload = json!({
+            "conversationId": conversation_id,
+            "workspacePaths": [workspace],
+            "invocationNum": 0,
+            "transcriptPath": format!(
+                "/home/test/.gemini/antigravity-ide/brain/{conversation_id}/transcript.jsonl"
+            )
+        });
+
+        let mut output = Vec::new();
+        run_antigravity_hook_with(
+            AntigravityHookEvent::PreInvocation,
+            payload.to_string().as_bytes(),
+            &mut output,
+            Ok(&state_root),
+            Some(&ide_state_database),
+            Some(&conversations),
+            10,
+        );
+
+        let record: Value = serde_json::from_slice(
+            &fs::read(
+                fs::read_dir(state_root.join("antigravity-ide"))
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["state"], "activity_detected");
+        assert_eq!(record["modelKind"], "claude_sonnet_4_6_thinking");
+        assert!(record["ideModelRevision"].as_str().is_some());
+    }
+
+    #[test]
+    fn ide_new_turn_uses_selection_immediately_then_confirms_each_execution_revision() {
+        let temp = TempDir::new().unwrap();
+        let state_root = temp.path().join("state");
+        let ide_state_database = temp.path().join("globalStorage/state.vscdb");
+        let conversations = temp.path().join("conversations");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let conversation_id = "403467f7-041a-420e-84cb-87da2ba51959";
+        let conversation_database = conversations.join(format!("{conversation_id}.db"));
+        let payload = json!({
+            "conversationId": conversation_id,
+            "workspacePaths": [workspace],
+            "invocationNum": 0,
+            "transcriptPath": format!(
+                "/home/test/.gemini/antigravity-ide/brain/{conversation_id}/transcript.jsonl"
+            )
+        });
+        let stop = json!({
+            "conversationId": conversation_id,
+            "workspacePaths": [workspace],
+            "fullyIdle": true,
+            "terminationReason": "model_stop",
+            "transcriptPath": format!(
+                "/home/test/.gemini/antigravity-ide/brain/{conversation_id}/transcript.jsonl"
+            )
+        });
+        let read_record = || -> Value {
+            serde_json::from_slice(
+                &fs::read(
+                    fs::read_dir(state_root.join("antigravity-ide"))
+                        .unwrap()
+                        .next()
+                        .unwrap()
+                        .unwrap()
+                        .path(),
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+        let run = |event, body: &Value, now| {
+            let mut output = Vec::new();
+            run_antigravity_hook_with(
+                event,
+                body.to_string().as_bytes(),
+                &mut output,
+                Ok(&state_root),
+                Some(&ide_state_database),
+                Some(&conversations),
+                now,
+            )
+        };
+
+        write_ide_state_database(&ide_state_database, 1072);
+        write_ide_conversation_model(&conversation_database, 0, "gemini-3.6-flash-medium");
+        run(AntigravityHookEvent::PreInvocation, &payload, 10);
+        run(AntigravityHookEvent::Stop, &stop, 20);
+        assert_eq!(read_record()["modelKind"], "gemini_3_6_flash_medium");
+
+        // The prior Gemini executor row still exists, but the new turn must use
+        // Claude's freshly selected model as soon as Activity detected begins.
+        write_ide_state_database(&ide_state_database, 1035);
+        run(AntigravityHookEvent::PreInvocation, &payload, 30);
+        assert_eq!(read_record()["state"], "activity_detected");
+        assert_eq!(read_record()["modelKind"], "claude_sonnet_4_6_thinking");
+        let gemini_revision = read_antigravity_ide_conversation_model_path(&conversation_database)
+            .unwrap()
+            .unwrap()
+            .revision;
+        assert_eq!(read_record()["ideModelRevision"], gemini_revision);
+
+        // The desktop refresh will reconcile this row while the turn is
+        // active; a subsequent lifecycle hook observes the same revision too.
+        write_ide_conversation_model(&conversation_database, 1, "claude-sonnet-4-6");
+        run(AntigravityHookEvent::Stop, &stop, 40);
+        assert_eq!(read_record()["state"], "turn_finished");
+        assert_eq!(read_record()["modelKind"], "claude_sonnet_4_6_thinking");
+
+        // A third turn starts before any desktop snapshot. It must display the
+        // GPT-OSS selection immediately while anchoring Claude's finished row
+        // so a refresh cannot revert the active label.
+        write_ide_state_database(&ide_state_database, 342);
+        run(AntigravityHookEvent::PreInvocation, &payload, 50);
+        assert_eq!(read_record()["state"], "activity_detected");
+        assert_eq!(read_record()["modelKind"], "gpt_oss_120b_medium");
+        let claude_revision = read_antigravity_ide_conversation_model_path(&conversation_database)
+            .unwrap()
+            .unwrap()
+            .revision;
+        assert_eq!(read_record()["ideModelRevision"], claude_revision);
+
+        write_ide_conversation_model(&conversation_database, 2, "gpt-oss-120b-medium");
+        run(AntigravityHookEvent::Stop, &stop, 60);
+        assert_eq!(read_record()["state"], "turn_finished");
+        assert_eq!(read_record()["modelKind"], "gpt_oss_120b_medium");
+    }
+
+    #[test]
+    fn ide_activity_uses_the_current_user_input_model_before_execution_finishes() {
+        let temp = TempDir::new().unwrap();
+        let state_root = temp.path().join("state");
+        let ide_state_database = temp.path().join("globalStorage/state.vscdb");
+        let conversations = temp.path().join("conversations");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let conversation_id = "403467f7-041a-420e-84cb-87da2ba51959";
+        let conversation_database = conversations.join(format!("{conversation_id}.db"));
+        let payload = json!({
+            "conversationId": conversation_id,
+            "workspacePaths": [workspace],
+            "invocationNum": 0,
+            "transcriptPath": format!(
+                "/home/test/.gemini/antigravity-ide/brain/{conversation_id}/transcript.jsonl"
+            )
+        });
+        let stop = json!({
+            "conversationId": conversation_id,
+            "workspacePaths": [workspace],
+            "fullyIdle": true,
+            "terminationReason": "model_stop",
+            "transcriptPath": format!(
+                "/home/test/.gemini/antigravity-ide/brain/{conversation_id}/transcript.jsonl"
+            )
+        });
+        let run = |event, body: &Value, now| {
+            let mut output = Vec::new();
+            assert_eq!(
+                run_antigravity_hook_with(
+                    event,
+                    body.to_string().as_bytes(),
+                    &mut output,
+                    Ok(&state_root),
+                    Some(&ide_state_database),
+                    Some(&conversations),
+                    now,
+                ),
+                0
+            );
+            assert_eq!(
+                output,
+                event.fail_open_output(),
+                "hook output must remain fail-open"
+            );
+        };
+        let read_record = || -> Value {
+            serde_json::from_slice(
+                &fs::read(
+                    fs::read_dir(state_root.join("antigravity-ide"))
+                        .unwrap()
+                        .next()
+                        .unwrap()
+                        .unwrap()
+                        .path(),
+                )
+                .unwrap(),
+            )
+            .unwrap()
+        };
+
+        // Keep both fallback signals pinned to the first model. Only the
+        // newest user-input step reflects switches made for later turns.
+        write_ide_state_database(&ide_state_database, 1072);
+        write_ide_conversation_model(&conversation_database, 0, "gemini-3.6-flash-medium");
+        write_ide_conversation_turn_model(&conversation_database, 10, 1072);
+        run(AntigravityHookEvent::PreInvocation, &payload, 10);
+        assert_eq!(read_record()["state"], "activity_detected");
+        assert_eq!(read_record()["modelKind"], "gemini_3_6_flash_medium");
+        run(AntigravityHookEvent::Stop, &stop, 20);
+        assert_eq!(read_record()["state"], "turn_finished");
+
+        write_ide_conversation_turn_model(&conversation_database, 20, 1035);
+        run(AntigravityHookEvent::PreInvocation, &payload, 30);
+        let claude_activity = read_record();
+        assert_eq!(claude_activity["state"], "activity_detected");
+        assert_eq!(claude_activity["modelKind"], "claude_sonnet_4_6_thinking");
+        let current_model = read_antigravity_ide_conversation_model_path(&conversation_database)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            current_model.preference,
+            IdeSelectedModelPreference::Recognized(AntigravityModelKind::ClaudeSonnet46Thinking)
+        );
+        assert_eq!(claude_activity["ideModelRevision"], current_model.revision);
+        run(AntigravityHookEvent::Stop, &stop, 40);
+        assert_eq!(read_record()["state"], "turn_finished");
+        assert_eq!(read_record()["modelKind"], "claude_sonnet_4_6_thinking");
+
+        write_ide_conversation_turn_model(&conversation_database, 30, 342);
+        run(AntigravityHookEvent::PreInvocation, &payload, 50);
+        assert_eq!(read_record()["state"], "activity_detected");
+        assert_eq!(read_record()["modelKind"], "gpt_oss_120b_medium");
+
+        // A queued future input must not make this active turn fall back to
+        // either of the deliberately stale Gemini signals.
+        let connection = Connection::open(&conversation_database).unwrap();
+        connection
+            .execute(
+                "INSERT INTO steps (idx, step_type, step_payload) VALUES (?1, 14, ?2)",
+                rusqlite::params![
+                    40,
+                    test_ide_user_input_step(1035, true, b"queued private input")
+                ],
+            )
+            .unwrap();
+        drop(connection);
+        run(AntigravityHookEvent::PreInvocation, &payload, 60);
+        assert_eq!(read_record()["state"], "activity_detected");
+        assert_eq!(read_record()["modelKind"], "gpt_oss_120b_medium");
+        assert_eq!(
+            read_antigravity_ide_conversation_model_path(&conversation_database).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn ide_user_input_model_scanner_seeks_over_private_bodies() {
+        let private_padding = vec![b'x'; 256 * 1024];
+        let encoded = test_ide_user_input_step(1035, false, &private_padding);
+        let mut reader = CountingCursor {
+            inner: io::Cursor::new(encoded.clone()),
+            bytes_read: 0,
+        };
+
+        assert_eq!(
+            decode_ide_user_input_model(&mut reader, encoded.len() as u64),
+            Some((
+                IdeSelectedModelPreference::Recognized(
+                    AntigravityModelKind::ClaudeSonnet46Thinking
+                ),
+                1035
+            ))
+        );
+        assert!(
+            reader.bytes_read < 128,
+            "streaming model decode unexpectedly read {} bytes",
+            reader.bytes_read
+        );
+
+        let queued = test_ide_user_input_step(342, true, b"queued private input");
+        assert_eq!(
+            decode_ide_user_input_model(&mut io::Cursor::new(&queued), queued.len() as u64),
+            None
+        );
+
+        let mut structurally_expensive = Vec::new();
+        for _ in 0..MAX_IDE_PROTOBUF_STRUCTURE_BYTES {
+            structurally_expensive.extend(test_varint_field(1, 0));
+        }
+        structurally_expensive.extend(test_ide_user_input_step(342, false, b"private"));
+        let mut reader = CountingCursor {
+            inner: io::Cursor::new(structurally_expensive.clone()),
+            bytes_read: 0,
+        };
+        assert_eq!(
+            decode_ide_user_input_model(&mut reader, structurally_expensive.len() as u64),
+            None
+        );
+        assert!(reader.bytes_read <= MAX_IDE_PROTOBUF_STRUCTURE_BYTES);
+
+        let mut duplicate = test_ide_user_input_step(1035, false, b"first");
+        duplicate.extend(test_ide_user_input_step(342, false, b"second"));
+        assert_eq!(
+            decode_ide_user_input_model(&mut io::Cursor::new(&duplicate), duplicate.len() as u64),
+            None
+        );
+    }
+
+    #[test]
+    fn ide_turn_model_reader_never_falls_back_to_an_older_user_input() {
+        let temp = TempDir::new().unwrap();
+        let database = temp
+            .path()
+            .join("conversations/403467f7-041a-420e-84cb-87da2ba51959.db");
+        write_ide_conversation_turn_model(&database, 1, 1072);
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute(
+                "INSERT INTO steps (idx, step_type, step_payload) VALUES (?1, 14, ?2)",
+                rusqlite::params![
+                    2,
+                    test_ide_user_input_step(1035, true, b"queued private input")
+                ],
+            )
+            .unwrap();
+        drop(connection);
+
+        assert_eq!(
+            read_antigravity_ide_current_turn_model_path(&database).unwrap(),
+            IdeCurrentTurnModel::Unusable
+        );
+    }
+
+    #[test]
+    fn ide_payload_model_takes_precedence_over_the_selected_model_preference() {
+        let temp = TempDir::new().unwrap();
+        let state_root = temp.path().join("state");
+        let ide_state_database = temp.path().join("globalStorage/state.vscdb");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let conversation_id = "9710f92a-3aac-40d8-9b34-1a19de34735b";
+        write_ide_state_database(&ide_state_database, 1035);
+        let payload = json!({
+            "conversationId": conversation_id,
+            "workspacePaths": [workspace],
+            "invocationNum": 0,
+            "transcriptPath": format!(
+                "/home/test/.gemini/antigravity-ide/brain/{conversation_id}/transcript.jsonl"
+            ),
+            "modelName": "gpt-oss-120b-medium"
+        });
+
+        hook_with_root_and_ide_state(
+            AntigravityHookEvent::PreInvocation,
+            &payload.to_string(),
+            &state_root,
+            &ide_state_database,
+            10,
+        );
+
+        let record: Value = serde_json::from_slice(
+            &fs::read(
+                fs::read_dir(state_root.join("antigravity-ide"))
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["modelKind"], "gpt_oss_120b_medium");
+    }
+
+    #[test]
+    fn empty_ide_payload_model_uses_the_current_turn_signal() {
+        let temp = TempDir::new().unwrap();
+        let state_root = temp.path().join("state");
+        let conversations = temp.path().join("conversations");
+        let workspace = temp.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let conversation_id = "9710f92a-3aac-40d8-9b34-1a19de34735b";
+        write_ide_conversation_turn_model(
+            &conversations.join(format!("{conversation_id}.db")),
+            1,
+            1035,
+        );
+        let payload = json!({
+            "conversationId": conversation_id,
+            "workspacePaths": [workspace],
+            "invocationNum": 0,
+            "transcriptPath": format!(
+                "/home/test/.gemini/antigravity-ide/brain/{conversation_id}/transcript.jsonl"
+            ),
+            "modelName": null
+        });
+
+        let mut output = Vec::new();
+        run_antigravity_hook_with(
+            AntigravityHookEvent::PreInvocation,
+            payload.to_string().as_bytes(),
+            &mut output,
+            Ok(&state_root),
+            None,
+            Some(&conversations),
+            10,
+        );
+
+        let record: Value = serde_json::from_slice(
+            &fs::read(
+                fs::read_dir(state_root.join("antigravity-ide"))
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap()
+                    .path(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(record["state"], "activity_detected");
+        assert_eq!(record["modelKind"], "claude_sonnet_4_6_thinking");
+    }
+
+    #[test]
+    fn ide_selected_model_preference_accepts_only_known_closed_enum_values() {
+        // Real Antigravity IDE 2.1.1 preference shape for Claude Sonnet 4.6.
+        assert_eq!(
+            model_kind_from_ide_preferences(
+                b"CjAKJmxhc3Rfc2VsZWN0ZWRfYWdlbnRfbW9kZWxfc2VudGluZWxfa2V5EgYKBEVJc0k="
+            ),
+            Some(AntigravityModelKind::ClaudeSonnet46Thinking)
+        );
+        let cases = [
+            (1071, AntigravityModelKind::Gemini36FlashHigh),
+            (1072, AntigravityModelKind::Gemini36FlashMedium),
+            (1073, AntigravityModelKind::Gemini),
+            (1084, AntigravityModelKind::Gemini35Flash),
+            (1020, AntigravityModelKind::Gemini35Flash),
+            (1187, AntigravityModelKind::Gemini35Flash),
+            (1016, AntigravityModelKind::Gemini31ProHigh),
+            (1036, AntigravityModelKind::Gemini31ProLow),
+            (1035, AntigravityModelKind::ClaudeSonnet46Thinking),
+            (1026, AntigravityModelKind::ClaudeOpus46Thinking),
+            (342, AntigravityModelKind::GptOss120bMedium),
+        ];
+        for (model_enum, expected) in cases {
+            assert_eq!(
+                model_kind_from_ide_preferences(test_ide_model_preferences(model_enum).as_bytes()),
+                Some(expected)
+            );
+        }
+        assert_eq!(
+            model_kind_from_ide_preferences(test_ide_model_preferences(999_999).as_bytes()),
+            None
+        );
+        assert_eq!(
+            decode_ide_model_preferences(test_ide_model_preferences(999_999).as_bytes()),
+            Some(IdeSelectedModelPreference::Unrecognized)
+        );
+        let mut multiple_entries = test_length_delimited_field(
+            1,
+            &test_ide_model_preference_entry(b"unrelated_preference", 342),
+        );
+        multiple_entries.extend(test_length_delimited_field(
+            1,
+            &test_ide_model_preference_entry(b"last_selected_agent_model_sentinel_key", 1026),
+        ));
+        assert_eq!(
+            model_kind_from_ide_preferences(test_base64_encode(&multiple_entries).as_bytes()),
+            Some(AntigravityModelKind::ClaudeOpus46Thinking)
+        );
+        assert_eq!(model_kind_from_ide_preferences(b"not base64"), None);
+        assert_eq!(decode_ide_model_preferences(b"not base64"), None);
+    }
+
+    #[test]
     fn conflicting_product_paths_are_not_mislabeled() {
         let temp = TempDir::new().unwrap();
         let workspace = temp.path().join("workspace");
@@ -2086,12 +4457,6 @@ mod tests {
     #[test]
     fn lifecycle_fields_map_to_coarse_states_without_being_persisted() {
         let cases = [
-            (
-                AntigravityHookEvent::PostToolUse,
-                json!({"error":"tool failed"}),
-                "failed",
-                "{}\n",
-            ),
             (
                 AntigravityHookEvent::Stop,
                 json!({"fullyIdle":false,"terminationReason":"model_stop"}),
@@ -2150,6 +4515,67 @@ mod tests {
     }
 
     #[test]
+    fn post_tool_use_never_writes_or_reopens_activity_state() {
+        let temp = TempDir::new().unwrap();
+        let workspace = temp.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let payload = json!({
+            "conversationId": "conversation",
+            "workspacePaths": [workspace],
+            "transcriptPath": "/home/test/.gemini/antigravity-ide/brain/conversation/transcript.jsonl"
+        });
+
+        hook_with_root(
+            AntigravityHookEvent::PostToolUse,
+            &payload.to_string(),
+            temp.path(),
+            10,
+        );
+        assert!(!temp.path().join("antigravity-ide").exists());
+        let mut failed_tool = payload.clone();
+        failed_tool["error"] = json!("tool failed");
+        hook_with_root(
+            AntigravityHookEvent::PostToolUse,
+            &failed_tool.to_string(),
+            temp.path(),
+            15,
+        );
+        assert!(!temp.path().join("antigravity-ide").exists());
+
+        hook_with_root(
+            AntigravityHookEvent::PreInvocation,
+            &payload.to_string(),
+            temp.path(),
+            20,
+        );
+        let before = fs::read(
+            fs::read_dir(temp.path().join("antigravity-ide"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path(),
+        )
+        .unwrap();
+        hook_with_root(
+            AntigravityHookEvent::PostToolUse,
+            &payload.to_string(),
+            temp.path(),
+            30,
+        );
+        let after = fs::read(
+            fs::read_dir(temp.path().join("antigravity-ide"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path(),
+        )
+        .unwrap();
+        assert_eq!(after, before);
+    }
+
+    #[test]
     fn malformed_and_oversized_payloads_are_bounded_and_fail_open() {
         let temp = TempDir::new().unwrap();
         for event in EVENTS {
@@ -2176,6 +4602,8 @@ mod tests {
             reader,
             &mut output,
             Ok(temp.path()),
+            None,
+            None,
             20,
         );
         assert_eq!(code, 0);

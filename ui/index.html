@@ -278,8 +278,9 @@
             <h3>No workspaces detected</h3>
             <p>
               Open a folder in VS Code or Antigravity IDE with its VSParallel companion enabled.
-              For Antigravity 2.0, install activity hooks and start an agent turn inside a saved
-              Project; opening the Project alone does not fire a hook.
+              For built-in model activity, install Antigravity hooks and start an agent turn in a
+              saved Antigravity 2.0 Project or Antigravity IDE workspace; opening it alone does
+              not fire a hook.
             </p>
             <button class="quiet-button" id="emptyRefreshButton" type="button">
               <svg class="button-icon" viewBox="0 0 16 16" aria-hidden="true">
@@ -527,10 +528,11 @@
                   <p class="integration-meta" id="antigravityMeta" hidden></p>
                   <p class="integration-activity-limitation" role="note">
                     <strong>Recent activity only.</strong>
-                    Start an agent turn after installation. Opening a Project alone does not fire
-                    these hooks, and a Project-level <code>.agents/hooks.json</code> can override
-                    the global hook. Events identify the 2.0 or IDE surface and report project
-                    paths, but not an exact live window, focus, or project-opening controls.
+                    Start an agent turn after installation. Opening a Project or workspace alone
+                    does not fire these hooks, and a workspace-level
+                    <code>.agents/hooks.json</code> can override the global hook. Events identify
+                    the 2.0 or IDE surface and report workspace paths, but not an exact live
+                    window, focus, or open controls.
                   </p>
                   <div class="integration-actions">
                     <button
@@ -664,7 +666,8 @@
                 </svg>
                 <span>
                   Reload affected editor windows and restart provider sessions to apply changes.
-                  Antigravity 2.0 reports only after a new agent turn.
+                  Antigravity 2.0 and Antigravity IDE report hook activity only after a new agent
+                  turn.
                 </span>
               </div>
 
