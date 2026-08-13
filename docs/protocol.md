@@ -22,7 +22,7 @@ Stored as `instances/<safe-instance-id>.json`:
 {
   "schemaVersion": 1,
   "instanceId": "51adf7cb-d0ee-42a2-8d5d-dc8ef93d74f8",
-  "editor": "antigravity_ide",
+  "editor": "cursor",
   "workspaceName": "example-workspace",
   "workspaceFolders": [
     {
@@ -56,11 +56,14 @@ Stored as `instances/<safe-instance-id>.json`:
 }
 ```
 
-`editor`, added in companion version 0.4.0, is the closed value `vscode` or
-`antigravity_ide`. It selects a locally configured launcher but never contains
-an executable or command path. Older heartbeats without `editor` remain valid
-and use the historical VS Code behavior. `antigravity_2` is not accepted from
-a companion heartbeat.
+`editor`, added in companion version 0.4.0 and extended in companion version
+0.4.1, is the closed value `vscode`, `cursor`, or `antigravity_ide`. It selects
+a locally configured launcher but never contains an executable or command
+path. Older heartbeats without `editor` remain valid and use the historical VS
+Code behavior. `antigravity_2` and a separate Cursor Agents Window value are
+not accepted from a companion heartbeat. Cursor's separate Agents Window does
+not activate the third-party companion and remains represented only through
+the hook-record protocol below.
 
 `active` is the VS Code-compatible host's recent-interaction hint; it is not
 used as liveness. VSParallel derives liveness only from `lastSeenAtMs`.
@@ -94,14 +97,15 @@ this release has no bridge for reading provider state from a remote host.
 
 Opening resolves both the target and editor from the validated heartbeat, not
 from UI-supplied path or command data. `vscode` selects
-`VSPARALLEL_CODE_COMMAND`; `antigravity_ide` selects
+`VSPARALLEL_CODE_COMMAND`; `cursor` selects `VSPARALLEL_CURSOR_COMMAND`;
+`antigravity_ide` selects
 `VSPARALLEL_ANTIGRAVITY_IDE_COMMAND`. An active heartbeat asks that editor to
 prefer an existing exact-target window. A retained but inactive heartbeat uses
 `--new-window` for the exact target. The target must still be an existing local
-absolute path. Hook-only Antigravity 2.0 and Antigravity IDE rows never produce
-an open target.
+absolute path. Hook-only Cursor workspace, Cursor Agent, Antigravity 2.0, and
+Antigravity IDE rows never produce an open target.
 
-## Lifecycle records (schema version 1)
+## Hook observations and lifecycle records (schema version 1)
 
 Codex records are stored as `codex/<sha256-of-session-id>.json`; Claude records
 use the same five-core-field structure at
@@ -118,6 +122,26 @@ use the same five-core-field structure at
   "changedAtMs": 1785800000000
 }
 ```
+
+Cursor native hook records use the same five core fields under `cursor/`.
+Only events containing a valid local path in Cursor's `workspace_roots` can
+produce a record; pathless events are omitted rather than creating an
+unassociated row. For `workspaceOpen`, `sessionKey` and the filename are the
+same deterministic, domain-separated SHA-256 key derived from the normalized
+workspace path. This key carries no session or conversation identity. Each
+valid root produces an independent `workspace_opened` record. Such records
+contain no `modelName` or `agentKind`.
+
+Cursor records may add optional camel-case `modelName` and `agentKind` string
+fields selected from the native hook payload. `modelName` is trimmed, must be
+nonempty and at most 128 bytes, must be ASCII, and may
+contain only alphanumerics, spaces, and `- _ . / : + ( ) ,`; `agentKind` must
+be exactly `Background agent`, `Agent`, `Ask`, or `Edit` and is otherwise
+omitted. These labels are
+bounded metadata supplied by Cursor, not a claim that a particular model is
+currently inferring. Prompt and response bodies, email fields, transcript
+material, token data, and every other unselected payload field are discarded
+before the record is written.
 
 Antigravity records may add an optional `modelKind` field when a hook supplies
 `modelName` or Antigravity IDE exposes a recognized current-model enum in its
@@ -142,22 +166,35 @@ model** rather than guessing the routed model. Unrecognized, invalid, and
 oversized model names are omitted. The raw `modelName` is never stored.
 
 These optional fields are additive, backward-compatible parts of schema version
-1. Codex and Claude records, older Antigravity records, and Antigravity events
-without IDE model metadata continue to contain only the five core fields.
+1. Codex and Claude records, Cursor records without bounded metadata, older
+Antigravity records, and Antigravity events without IDE model metadata continue
+to contain only the five core fields.
 
-Allowed on-disk states across the three adapters are `activity_detected`,
-`turn_finished`, `session_ended`, `failed_or_interrupted`, `failed`, and
-`interrupted`. Each adapter writes only its subset shown below. The snapshot
-normalizes the last three failure states to **Failed/interrupted** and derives
+Allowed on-disk states across the four adapters are `workspace_opened`,
+`session_started`, `activity_detected`, `turn_finished`, `session_ended`,
+`failed_or_interrupted`, `failed`, and `interrupted`. Each adapter writes only
+its subset shown below. The snapshot ignores both Cursor-only non-activity
+states when deriving an activity card: `workspace_opened` may create recent
+workspace evidence, while `session_started` remains metadata-only. It
+normalizes the last three failure states to **Failed/interrupted**, and derives
 `unknown` when no usable recent record can be associated with a workspace;
 `unknown` is not written. The main UI labels an initial absence **No activity
 yet** and reserves **Unknown** for a previous lifecycle signal that has become
 stale.
 
-The adapters map only documented lifecycle events:
+The adapters map only documented hook events:
 
 | Provider | Event | Recorded state |
 | --- | --- | --- |
+| Cursor | `workspaceOpen` | `workspace_opened` (recent workspace evidence only; not displayed as activity) |
+| Cursor | `sessionStart` | `session_started` (metadata only; not displayed as activity) |
+| Cursor | `beforeSubmitPrompt` | `activity_detected` |
+| Cursor | `stop` with completed status | `turn_finished` |
+| Cursor | `stop` with aborted status | `interrupted` |
+| Cursor | `stop` with error status | `failed` |
+| Cursor | `sessionEnd` with `completed`, `window_close`, or `user_close` outcome | `session_ended` |
+| Cursor | `sessionEnd` with aborted outcome | `interrupted` |
+| Cursor | `sessionEnd` with error outcome | `failed` |
 | Codex | `UserPromptSubmit` | `activity_detected` |
 | Codex | `Stop` | `turn_finished` |
 | Codex | `SessionEnd` | `session_ended` |
@@ -171,6 +208,103 @@ The adapters map only documented lifecycle events:
 | Antigravity | Otherwise `Stop`, interrupted/cancelled | `interrupted` |
 | Antigravity | Otherwise `Stop`, `fullyIdle: false` | `activity_detected` |
 | Antigravity | Otherwise `Stop` | `turn_finished` |
+
+The Cursor adapter admits only `conversation_id`, `session_id`,
+`workspace_roots`, `model_id`, `model`, bounded `model_params`, `status`,
+`reason`, `composer_mode`, and `is_background_agent`. Hook input is capped at
+1 MiB and all other fields are streamed past without representation.
+`workspaceOpen` admits only `workspace_roots`; it ignores every other field and
+requires no session or conversation identity. For the four lifecycle events,
+raw conversation/session identity is required, capped at 16 KiB, hashed to the
+stored `sessionKey`, and then discarded. Prompt and stop events prefer
+`conversation_id`; `sessionStart` and `sessionEnd` prefer `session_id`; each
+can fall back to the other identifier. Their filename hashes the raw identity
+together with the normalized workspace path so one multi-root event produces
+independent records without exposing the identity.
+
+At most 64 unique `workspace_roots` are considered. Each must be a local
+absolute path no longer than 32 KiB; URI-like, UNC-style non-local, and
+lexically escaping paths are rejected. Existing paths are canonicalized and
+other absolute paths are lexically normalized. An event with no valid path is
+omitted. The hook always fails open and emits no record for malformed,
+oversized, pathless, or unsupported/missing terminal-status events. Lifecycle
+events with missing or oversized identity are also omitted; `workspaceOpen`
+does not require one. When the hook subprocess receives the exact,
+case-sensitive environment value `CURSOR_CODE_REMOTE=true`, the adapter
+suppresses all Cursor hook-record persistence because this release has no
+remote-host bridge. It still writes `{}` to standard output and exits
+successfully, preserving fail-open behavior.
+
+For `modelName`, the adapter selects `model_id` with `model` as a fallback,
+omits the non-specific `default` and `unknown` sentinels, admits only a trimmed
+ASCII-safe token up to 128 bytes, and may append only
+closed thinking/context/effort parameters while keeping the entire result
+within 128 bytes. `agentKind` is one of **Background agent**, **Agent**,
+**Ask**, or **Edit**, derived from the bounded background and composer-mode
+fields supplied by the session lifecycle hooks. Invalid metadata is omitted;
+the session-scoped agent kind survives later events for the same hashed session,
+and terminal events preserve the current turn's earlier valid model label when
+their payload omits it. A new prompt without a concrete model clears the prior
+turn's model label.
+
+Cursor's user-level hooks run across local Cursor agent surfaces, including its
+VS Code-based IDE and separate Agents Window. The payload does not provide a
+trustworthy source-surface or native-window identity, liveness, focus, or exact
+open target, so an unmatched local event cannot be attributed specifically to
+the IDE, Agents Window, or Cursor CLI. A hook path covered by exactly one
+retained Cursor companion heartbeat is associated with that IDE workspace and
+the generic duplicate is suppressed. A fresh (at most 24 hours old) unmatched
+`workspace_opened` record is synthesized in **Recent** as one generic
+**Cursor** workspace row. It is non-live, non-focused, non-openable, has
+`recentlyActive: false`, and has no Cursor activity view or agent/model
+information. A fresh unmatched displayable lifecycle record is instead
+synthesized as a generic recent **Cursor Agent** row that is also non-live,
+non-focused, and non-openable; `session_started` by itself remains completely
+hidden. Zero or multiple matching heartbeats retain the appropriate generic
+row rather than guessing ownership.
+Lifecycle records are first reduced to the newest marker per hashed session;
+any remaining fresh active session takes priority over another session's
+terminal marker.
+Stale and pathless hook records do not produce hook-only rows. No Cursor process
+or native-window scraping is performed; live state comes only from companion
+heartbeats. User-level hooks do not cover cloud agents, and remote hook
+executions are suppressed as described above.
+
+### Cursor hook installation
+
+The primary **Set up Cursor monitoring** action installs or repairs the Cursor
+companion and these native hooks together. A separate hooks-only action manages
+the same hook configuration without installing the companion and therefore
+provides only recent, non-live fallback observations.
+
+VSParallel manages one fail-open command handler in each native flat hook array
+`workspaceOpen`, `sessionStart`, `beforeSubmitPrompt`, `stop`, and `sessionEnd`
+in `~/.cursor/hooks.json`. The `workspaceOpen` handler invokes the absolute
+VSParallel executable as `cursor-hook workspace-open`; `sessionStart` uses
+`cursor-hook session-start`, and the other handlers use the corresponding
+kebab-case event. Cursor's hook timeout is set to two seconds.
+Existing unrelated top-level configuration and handlers are preserved.
+The managed file must parse as strict UTF-8 JSON; if it contains comments,
+trailing commas, or otherwise invalid JSON, VSParallel leaves it unchanged and
+reports that the integration is unavailable. As with Cursor itself, avoid
+editing `hooks.json` concurrently with an install, repair, or uninstall action.
+
+Before the first change, VSParallel makes the one-time exact-byte backup
+`~/.cursor/hooks.json.vsparallel.bak`. Installation and removal recognize only
+an exact current handler or a strict historical VSParallel handler with no
+unexpected keys and a safely parsed absolute executable/event command.
+Modified lookalikes remain user-owned. Malformed managed hook arrays, an
+unsupported top-level version, oversized configuration, or link/reparse-point
+configuration aborts without writing. Updates are atomic; uninstall removes
+only recognized VSParallel-owned handlers and retains the backup. Existing
+records under `cursor/` are not deleted automatically. Status and repair
+require all five current handlers, so an older four-handler installation is
+reported as update- or repair-needed. Reinstall adds the managed
+`workspaceOpen` handler while preserving unrelated hooks. Uninstall recognizes
+and removes both the current set and strictly recognized legacy VSParallel
+handlers.
+
+### Codex, Claude, and Antigravity lifecycle reduction
 
 Codex and Claude hash the provider session ID and do not retain the raw session
 or turn ID. The Antigravity adapter selects documented `conversationId`,
@@ -365,7 +499,7 @@ active query is what makes usage available for those sessions.
 `VSPARALLEL_CLAUDE_COMMAND` can
 select a different executable; otherwise VSParallel can use either `claude`
 from `PATH` or the executable bundled with the installed Claude extension in VS
-Code or Antigravity IDE, trying the other source if the first query fails. It
+Code, Cursor, or Antigravity IDE, trying the other source if the first query fails. It
 locates the bundled source through either configured editor launcher or, when
 the launchers are unavailable, a bounded read of the local extension registries
 described below.
@@ -400,18 +534,20 @@ as unavailable. The UI may retain a recent, unexpired last-known value in memory
 for up to 15 minutes and marks it as stale; it is never written to disk.
 `VSPARALLEL_CODEX_COMMAND` can select a different executable; otherwise
 VSParallel tries `codex` from `PATH` and the executable bundled with a locally
-installed Codex extension in VS Code or Antigravity IDE. An explicit
+installed Codex extension in VS Code, Cursor, or Antigravity IDE. An explicit
 `VSPARALLEL_CODEX_COMMAND` is used literally and does not enable
 bundled-extension fallback.
 
 For bundled-provider discovery, VSParallel first invokes the configured
-`VSPARALLEL_CODE_COMMAND` and `VSPARALLEL_ANTIGRAVITY_IDE_COMMAND` launchers
-with the supported extension-location argument. If that fails, it reads only
+`VSPARALLEL_CODE_COMMAND`, `VSPARALLEL_CURSOR_COMMAND`, and
+`VSPARALLEL_ANTIGRAVITY_IDE_COMMAND` launchers with the supported
+extension-location argument. If that fails, it reads only
 the exact provider entries in these local registry files:
 
 - `~/.vscode/extensions/extensions.json`
 - `~/.vscode-insiders/extensions/extensions.json`
 - `~/.vscode-oss/extensions/extensions.json`
+- `~/.cursor/extensions/extensions.json`
 - `~/.antigravity-ide/extensions/extensions.json`
 
 The resulting extension path may be cached in process memory but is not
@@ -423,7 +559,7 @@ No record may contain prompt text, assistant output, source text, terminal
 content, Git diffs, tool inputs/output, transcript paths/content, credentials,
 or machine identifiers. The companion records only the public extension status
 and placement fields shown above; it never reads extension exports or private
-state. The lifecycle adapters receive richer documented hook payloads but
+state. The hook adapters receive richer documented payloads but
 create new objects with the five core fields and discard the input before
 writing. Antigravity may add only the optional closed `modelKind` described
 above; its IDE reconciliation incrementally reads only the structural bytes and
@@ -432,6 +568,13 @@ prompt and context bodies, with the bounded executor field as a fallback. It
 never writes the raw conversation filename, model identifier, or step payload.
 Only the closed `modelKind` and an opaque SHA-256 model-signal revision may
 survive that reduction. The
+Cursor adapter may add only the optional bounded `modelName` and `agentKind`
+strings described above for lifecycle records. A `workspaceOpen` record admits
+only normalized local workspace roots and a timestamp, uses a path-derived
+one-way key, and contains no agent/model metadata. The adapter discards prompts,
+responses, email fields, transcripts, token data, and other unselected
+native-hook fields, and does not write a record when Cursor supplies no usable
+local workspace root. The
 Claude status-line adapter
 likewise creates the minimal usage record shown above and does not represent or
 persist the accompanying session ID, working directory, model, cost,

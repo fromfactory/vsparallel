@@ -1,10 +1,12 @@
 # VSParallel
 
 VSParallel is a local-first desktop companion for developers working across
-multiple VS Code and Antigravity IDE windows. It brings every workspace into
-one clear overview, showing workspace activity, focus, and coarse Antigravity,
-Codex, and Claude Code lifecycle status at a glance. Antigravity 2.0 activity
-can also appear as a recent workspace, with the limitations described below.
+multiple VS Code, Cursor, and Antigravity IDE windows. It brings every
+workspace into one clear overview, showing workspace activity, focus, and
+coarse Cursor Agent, Antigravity, Codex, and Claude Code lifecycle status at a
+glance. Cursor IDE is fully supported. Cursor's separate Agents Window and
+Antigravity 2.0 can add recent hook-only activity with the limitations
+described below.
 
 Switch between projects instantly, return to the workspace that needs your
 attention, and access active workspaces directly from the native system tray—all
@@ -20,10 +22,14 @@ and any network connection. VSParallel does not read or store either
 credential, and it does not persist the live usage responses.
 
 VSParallel does not extract, log, retain, or transmit prompts, responses,
-source code, terminal contents, transcripts, or Git data. Optional lifecycle
-hooks receive documented provider event payloads and construct new,
-privacy-minimal records containing only a hashed session/conversation key,
-local workspace path, coarse state, and timestamp. Antigravity activity records
+source code, terminal contents, transcripts, or Git data. Optional hook
+integrations receive documented provider event payloads and construct new,
+privacy-minimal records containing only a one-way key, local workspace path,
+coarse state, and timestamp. Cursor `workspaceOpen` records use a deterministic
+path-derived key and contain no session identity or agent/model metadata;
+Cursor lifecycle records may also contain bounded model and agent labels
+supplied by Cursor's native hooks.
+Antigravity activity records
 may also include an optional closed model classification from hook `modelName`
 or, for IDE hooks that omit it, the bounded current-model enum embedded in that
 conversation's latest user-input step. Bounded execution metadata and the
@@ -40,7 +46,7 @@ distinguish configured from observed execution. See
 
 ## Requirements and platform support
 
-- VS Code 1.85 or newer, Antigravity IDE, or both
+- VS Code 1.85 or newer, Cursor, Antigravity IDE, or any combination of them
 - The command-line launcher for each editor you want VSParallel to open
 - The platform WebView and runtime libraries required by Tauri 2
 
@@ -73,17 +79,26 @@ Translocation path, relaunch the installed app and choose **Repair** for each
 affected integration.
 
 1. Select the settings gear beside **Refresh**.
-2. Install the companion for **VS Code**, **Antigravity IDE**, or both.
-3. Optionally install **Antigravity activity hooks**, **Codex lifecycle
-   hooks**, **Claude Code lifecycle hooks**, or any combination of them.
+2. Install the companion for **VS Code** or **Antigravity IDE** as needed. For
+   Cursor, choose **Set up Cursor monitoring**; this installs or repairs the
+   companion and Cursor activity hooks together.
+3. Optionally install **Antigravity activity hooks**, **Codex lifecycle hooks**,
+   **Claude Code lifecycle hooks**, or any combination of them. A separate
+   **Cursor hooks only** control is available when non-live fallback monitoring
+   is preferred without the companion.
 4. Reload editor windows that were already open and restart affected provider
    sessions.
-5. For an Antigravity built-in model, open a saved **Project** in Antigravity
+5. Cursor IDE windows report live heartbeats after reload. The separate Agents
+   Window remains hook-only: opening a local workspace can create a recent
+   `workspaceOpen` observation, and starting a new turn can add Cursor Agent
+   status. Hook records do not prove that a window is live, focused, or
+   openable.
+6. For an Antigravity built-in model, open a saved **Project** in Antigravity
    2.0 or a workspace in Antigravity IDE and start a new agent turn. Merely
    opening or selecting it does not fire a lifecycle hook. If that workspace
    has `.agents/hooks.json`, its hooks take precedence over the global hook, so
    add the VSParallel handlers there as well or remove the override.
-6. After installing Codex hooks, run `/hooks` in Codex, review the three
+7. After installing Codex hooks, run `/hooks` in Codex, review the three
    VSParallel handlers, and trust them.
 
 The final Codex review is an intentional security boundary. VSParallel reads
@@ -92,14 +107,61 @@ hooks on your behalf. Workspace settings can still disable hooks. Opening Codex
 or `/hooks` does not create an activity marker; after trusting the handlers,
 submit a prompt from the monitored workspace.
 
+If a Cursor IDE window is open but no live workspace appears, open **Setup & diagnostics**,
+set up or repair **Cursor monitoring**, and reload every affected Cursor
+window. Cursor IDE monitoring is fully supported; the separate Agents Window
+remains limited to recent, non-live native-hook observations. Setup installs or
+repairs the companion and all five managed Cursor handlers,
+including `workspaceOpen`, together. Named-profile users must launch VSParallel
+with the matching `VSPARALLEL_CURSOR_PROFILE` value.
+
 The bundled companion extension reports workspace, focus, heartbeat,
-provider-extension presence, and a closed editor identifier through documented
-VS Code-compatible APIs. Installed in either VS Code or Antigravity IDE, it
-provides the same exact-window tracking and trusted open target. Optional
-lifecycle hooks add coarse **Activity detected**, **Turn finished**, and
+provider-extension presence, and a closed editor identifier through compatible
+VS Code APIs. Installed in VS Code, Cursor IDE, or Antigravity IDE, it provides
+live window tracking and a trusted open target when the host exposes a local
+workspace path. Cursor's separate Agents Window does not activate the
+third-party companion and remains hook-only. Optional lifecycle hooks add
+coarse **Activity detected**, **Turn finished**, and
 **Failed/interrupted** states. Before the first matching hook event, the UI says
 **No activity yet**; lifecycle information older than 24 hours becomes
 **Unknown**. Extension activation alone is never presented as active work.
+
+Cursor activity monitoring merges VSParallel-owned handlers into Cursor's
+native user hook file at `~/.cursor/hooks.json`. The `workspaceOpen` event
+records recent workspace evidence only. It creates no agent status or
+agent/model label and never proves that a window is live, focused, or openable.
+The `sessionStart`, `beforeSubmitPrompt`, `stop`, and `sessionEnd` events provide
+coarse Cursor Agent **Activity detected**, **Turn finished**, and
+failure/interruption status, plus bounded agent or model labels when Cursor
+supplies them. In particular, `sessionStart` captures the agent kind from
+Cursor's bounded composer-mode/background fields, but remains metadata-only
+until a prompt is submitted. These hooks can run for local Cursor agent
+surfaces, including the VS Code-based IDE and separate Agents Window. They do
+not expose a native window identity, liveness, focus, exact open target, or
+source-surface identifier, and VSParallel does not inspect Cursor processes or
+native-window internals; live state comes only from companion heartbeats. Only
+local paths in the `workspace_roots` values supplied by Cursor can be
+associated; pathless events are omitted. An unmatched `workspaceOpen`
+path appears in **Recent** as a generic **Cursor** workspace row with no
+activity card. An unmatched lifecycle path appears as a generic recent
+**Cursor Agent** row rather than being attributed to the IDE, Agents Window, or
+Cursor CLI. Neither kind of hook-only row is live, focused, or openable. When
+exactly one Cursor IDE heartbeat covers the path, that companion-backed window
+owns the observation and the generic duplicate is suppressed; when multiple
+windows cover it, the generic row avoids guessing. Parallel sessions are
+reduced independently, so one session finishing does not conceal another
+session's newer unresolved activity marker.
+Prompts, responses, email fields, transcripts, token data, and all other
+unselected hook payload fields are discarded. When Cursor launches a hook with
+the exact, case-sensitive environment value `CURSOR_CODE_REMOTE=true`, the
+handler persists no Cursor activity record; it still returns `{}` and exits
+successfully so monitoring remains fail-open. User-level hooks do not cover
+cloud agents. Cursor's managed `hooks.json` must be strict JSON; VSParallel
+leaves JSON-with-comments or otherwise invalid configuration unchanged and
+reports it in Setup. Setup requires all five current handlers; a four-handler
+installation from an earlier VSParallel build is shown as needing an update or
+repair. Reinstalling preserves unrelated hooks, and uninstall recognizes both
+the current and legacy VSParallel-owned handler sets.
 
 Antigravity activity monitoring installs a named `vsparallel` entry in
 Antigravity's documented global `~/.gemini/config/hooks.json`. Its
@@ -167,8 +229,9 @@ while Claude keeps control of its existing secure authentication. The parser
 keeps only rate-limit windows and discards account, session, attribution, and
 other response fields.
 
-Use a companion-backed workspace card to ask its reporting editor—VS Code or
-Antigravity IDE—to open or activate the exact target.
+Use a companion-backed workspace card with a verified local target to ask its
+reporting editor—VS Code, Cursor, or Antigravity IDE—to open or activate that
+target. Hook-only rows are not openable.
 VSParallel then stays available as a compact always-on-top panel: choose another
 workspace, restore the full window, or temporarily hide the panel. The panel
 uses native vibrancy on macOS and acrylic blur on supported Windows versions;
@@ -192,17 +255,23 @@ temporary updater failures do not interrupt the local monitor.
 ### Installed components
 
 The companion is embedded in the desktop application and can be installed
-independently through VS Code's or Antigravity IDE's supported extension
-command. Temporary installation files are removed after the installed version
-is verified. Both installations use the extension ID
+independently through VS Code's, Cursor's, or Antigravity IDE's supported
+extension command. Temporary installation files are removed after the
+installed version is verified. All installations use the extension ID
 `vsparallel.vsparallel-companion`.
 
-The Antigravity, Codex, and Claude Code integrations merge VSParallel-owned
+The primary **Set up Cursor monitoring** action installs or repairs the Cursor
+companion first and then all five native activity hooks. A hooks-only action is
+also available for users who want the recent, non-live fallback without the
+companion.
+
+The Cursor, Antigravity, Codex, and Claude Code integrations merge VSParallel-owned
 handlers into their user configuration. Existing unrelated settings and hooks
 are preserved, writes are atomic, and a one-time backup is created before the
-first change. Removing the Antigravity integration removes only the owned
-`vsparallel` entry and preserves
-`~/.gemini/config/hooks.json.vsparallel.bak` for manual cleanup.
+first change. Removing an integration removes only its recognized
+VSParallel-owned handlers. Cursor preserves
+`~/.cursor/hooks.json.vsparallel.bak`, and Antigravity preserves
+`~/.gemini/config/hooks.json.vsparallel.bak`, for manual cleanup.
 
 When no `statusLine` is configured, the Claude Code integration also installs a
 privacy-minimal fallback usage capture command with a 60-second refresh
@@ -215,23 +284,30 @@ To use VS Code Insiders or another installation, set
 `VSPARALLEL_CODE_COMMAND` to its absolute executable path before launching
 VSParallel.
 
+To select a different Cursor installation, set `VSPARALLEL_CURSOR_COMMAND` to
+its absolute executable path before launching VSParallel.
+
 To select a different Antigravity IDE installation, set
 `VSPARALLEL_ANTIGRAVITY_IDE_COMMAND` to its absolute executable path before
-launching VSParallel. Companion heartbeats contain only the trusted
-`vscode`/`antigravity_ide` identifier, never this executable path.
+launching VSParallel. Companion heartbeats contain only the trusted `vscode`,
+`cursor`, or `antigravity_ide` identifier, never an executable path.
 
-For bundled Codex and Claude executable discovery, VSParallel tries both
+Named companion profiles can be selected with `VSPARALLEL_VSCODE_PROFILE`,
+`VSPARALLEL_CURSOR_PROFILE`, and `VSPARALLEL_ANTIGRAVITY_IDE_PROFILE`.
+
+For bundled Codex and Claude executable discovery, VSParallel tries the
 configured editor launchers, then reads only the provider entries in the local
 registries at `~/.vscode/extensions`, `~/.vscode-insiders/extensions`,
-`~/.vscode-oss/extensions`, and `~/.antigravity-ide/extensions`.
+`~/.vscode-oss/extensions`, `~/.cursor/extensions`, and
+`~/.antigravity-ide/extensions`.
 
 Codex usage tries `codex` on `PATH` and the executable bundled with the locally
-installed Codex extension in VS Code or Antigravity IDE. To select another
+installed Codex extension in VS Code, Cursor, or Antigravity IDE. To select another
 signed-in executable, set
 `VSPARALLEL_CODEX_COMMAND` to its absolute path before launching VSParallel.
 
 Claude Code usage can use either `claude` on `PATH` or the executable bundled
-with the installed Claude extension in VS Code or Antigravity IDE, trying the
+with the installed Claude extension in VS Code, Cursor, or Antigravity IDE, trying the
 other source if the first query fails. To select another signed-in executable,
 set
 `VSPARALLEL_CLAUDE_COMMAND` to its absolute path before launching VSParallel.
@@ -239,13 +315,14 @@ set
 ## How it works
 
 ```text
-VS Code / Antigravity IDE companion ─ exact workspace/editor heartbeat ─┐
-Antigravity agent hooks ── recent product/path lifecycle marker ────────┤
-Codex hooks ──────────────── coarse lifecycle marker ───────────────────┤─ local state ─┐
-Claude Code hooks ────────── coarse lifecycle marker ───────────────────┤               │
-Claude Code statusLine ───── fallback usage cache ──────────────────────┘               │
-Claude CLI control ───────── live usage percentages/reset times ────────────────────────┤─ Rust core ─ Tauri UI
-Codex app-server ─────────── hook trust + live usage percentages/reset times ───────────┘             └─ native tray
+VS Code / Cursor IDE / Antigravity IDE companion ─ live workspace heartbeat ──────┐
+Cursor native user hooks ───── recent workspace-open/lifecycle metadata ──────────┤
+Antigravity agent hooks ────── recent product/path lifecycle marker ──────────────┤
+Codex hooks ─────────────────── coarse lifecycle marker ──────────────────────────┤─ local state ─┐
+Claude Code hooks ───────────── coarse lifecycle marker ──────────────────────────┤               │
+Claude Code statusLine ───────── fallback usage cache ────────────────────────────┘               │
+Claude CLI control ───────────── live usage percentages/reset times ──────────────────────────────┤─ Rust core ─ Tauri UI
+Codex app-server ─────────────── hook trust + live usage percentages/reset times ─────────────────┘             └─ native tray
 ```
 
 The desktop application uses Tauri 2, a Rust backend, and a framework-free
@@ -262,10 +339,17 @@ native tray menu.
 Lifecycle state is hook-derived rather than an internal provider progress feed.
 Records are associated with workspaces by local path, and exact native-window
 foregrounding remains subject to the companion-backed editor and
-operating-system focus behavior. Antigravity hooks identify their product
+operating-system focus behavior. Cursor IDE heartbeats are fully supported;
+Cursor's separate Agents Window remains hook-only. Cursor hooks identify only
+the local `workspace_roots` Cursor supplies; they cover local agent surfaces
+including the IDE and Agents Window but distinguish neither the source surface
+nor a native window. A `workspaceOpen` observation can add a generic recent
+workspace but cannot establish liveness, focus, an open target, or agent
+activity.
+Antigravity hooks identify their product
 surface only after an agent turn and do not expose exact live-window state, so
-only a VS Code or Antigravity IDE heartbeat can establish liveness, focus, and
-an open target. Antigravity 2.0's saved-project registry does not identify the
+only a companion heartbeat can establish liveness and focus, and only one with
+a verified local target can be opened. Antigravity 2.0's saved-project registry does not identify the
 currently open Project and is not used as a presence signal.
 Remote, virtual, and untitled workspaces can be listed but do not expose a
 verified local open target. VSParallel shows whether a companion-backed editor
@@ -284,7 +368,7 @@ VSParallel stores only the metadata required for the workspace overview:
 - local workspace paths, display names, editor identity, focus state, and
   heartbeat timestamps;
 - whether the configured Codex and Claude Code extensions are installed and
-  active in a VS Code or Antigravity IDE window/profile and, when known,
+  active in a VS Code, Cursor, or Antigravity IDE window/profile and, when known,
   whether they run in the local or remote extension host;
 - coarse lifecycle state, a one-way hash of the provider session or
   conversation identifier, working directory, and timestamp when optional
@@ -293,6 +377,12 @@ VSParallel stores only the metadata required for the workspace overview:
   model enum in the latest per-conversation user-input step, with bounded
   executor metadata and the last-selected-model preference as compatibility
   fallbacks; IDE records may contain an opaque SHA-256 model-signal revision;
+- Cursor workspace-open observations containing a deterministic, path-derived
+  one-way key, the local workspace path, `workspace_opened`, and a timestamp,
+  but no session identity or agent/model label;
+- Cursor Agent lifecycle records containing the same privacy-minimal core,
+  plus optional bounded `modelName` and `agentKind` labels selected from the
+  native hook payload;
 - Antigravity hook execution health containing fixed event, surface, and
   outcome values plus timestamp and validated workspace count, but no model; and
 - Claude Code five-hour and weekly usage percentages, their optional reset
@@ -313,7 +403,7 @@ if a refresh temporarily fails.
 | Windows | `%LOCALAPPDATA%\VSParallel` |
 
 Set `VSPARALLEL_STATE_DIR` to the same absolute path for VSParallel, the
-supported editors, Codex, Claude Code, and Antigravity only when overriding
+supported editors, Cursor hooks, Codex, Claude Code, and Antigravity only when overriding
 these defaults.
 
 Stale heartbeats are hidden after 60 seconds, and lifecycle state older than 24
@@ -367,6 +457,12 @@ To use a different VS Code executable:
 VSPARALLEL_CODE_COMMAND=/absolute/path/to/code-insiders ./scripts/run-dev.sh
 ```
 
+To use a different Cursor executable:
+
+```bash
+VSPARALLEL_CURSOR_COMMAND=/absolute/path/to/cursor ./scripts/run-dev.sh
+```
+
 To use a different Antigravity IDE executable:
 
 ```bash
@@ -377,6 +473,7 @@ If you use a named editor profile, select the same profile for companion setup:
 
 ```bash
 VSPARALLEL_VSCODE_PROFILE=Work ./scripts/run-dev.sh
+VSPARALLEL_CURSOR_PROFILE=Agents ./scripts/run-dev.sh
 VSPARALLEL_ANTIGRAVITY_IDE_PROFILE=Agents ./scripts/run-dev.sh
 ```
 
@@ -387,7 +484,7 @@ VSPARALLEL_CODEX_COMMAND=/absolute/path/to/codex ./scripts/run-dev.sh
 ```
 
 To force a Claude executable instead of the `claude` found on `PATH` or the
-binary bundled with the Claude extension in VS Code or Antigravity IDE:
+binary bundled with the Claude extension in VS Code, Cursor, or Antigravity IDE:
 
 ```bash
 VSPARALLEL_CLAUDE_COMMAND=/absolute/path/to/claude ./scripts/run-dev.sh
@@ -464,7 +561,7 @@ For a local Linux developer installation:
 
 ### Companion development
 
-Open `companion/` in VS Code or Antigravity IDE and start an Extension
+Open `companion/` in VS Code, Cursor, or Antigravity IDE and start an Extension
 Development Host. There is no dependency installation step. The optional
 standalone packager is:
 
@@ -478,8 +575,8 @@ the Rust backend.
 ## Uninstall and remove local data
 
 1. Open **Setup & diagnostics** in VSParallel.
-2. Uninstall each enabled lifecycle or Antigravity activity integration.
-3. Uninstall each installed VS Code or Antigravity IDE companion.
+2. Uninstall each enabled lifecycle, Cursor activity, or Antigravity activity integration.
+3. Uninstall each installed VS Code, Cursor, or Antigravity IDE companion.
 4. Reload open editor windows and provider sessions.
 5. Uninstall the desktop package with the operating system's package manager.
 

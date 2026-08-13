@@ -2,7 +2,7 @@
 
 Pushing a version tag builds the Tauri application on native GitHub hosted
 runners and publishes the packages, signed updater artifacts, updater manifest,
-and VS Code companion VSIX in one GitHub Release. The Release is created only
+and VS Code-compatible editor companion VSIX in one GitHub Release. The Release is created only
 after the repository checks and all platform builds succeed.
 
 ## One-time updater signing setup
@@ -70,7 +70,7 @@ needed.
 | Ubuntu Linux | Ubuntu 22.04, x86-64 | Use `VSParallel_<version>_amd64.deb` on Debian or Ubuntu. Use `VSParallel_<version>_amd64.AppImage` on other compatible x86-64 distributions. |
 | macOS 12.3+ | Universal (Apple silicon and Intel) | Use `VSParallel_<version>_universal.dmg`. |
 | Windows | x86-64 | Use the `VSParallel_<version>_x64-setup.exe` NSIS installer. |
-| VS Code 1.85+ | Platform independent | `vsparallel-companion-<companion-version>.vsix` is the optional standalone companion package. Most users should install the embedded companion from VSParallel instead. |
+| VS Code-compatible editors 1.85+ | Platform independent | `vsparallel-companion-<companion-version>.vsix` is the optional standalone companion for VS Code, Cursor, and Antigravity IDE. Most users should install it from VSParallel instead. |
 
 An AppImage downloaded through a browser may need to be made executable with
 `chmod +x VSParallel_*.AppImage` before it can be launched.

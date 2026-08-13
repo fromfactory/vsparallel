@@ -311,7 +311,7 @@ fn read_codex_rate_limits(
 
 /// Send a Codex app-server request using either a selected non-default
 /// executable or, for the `codex` command, the binary bundled with the installed
-/// Codex extension in VS Code or Antigravity IDE as a fallback.
+/// Codex extension in VS Code, Cursor, or Antigravity IDE as a fallback.
 pub(crate) fn codex_app_server_request_resolved(
     executable: &OsStr,
     method: &str,
@@ -462,6 +462,7 @@ fn locate_extension_with_cli(
 ) -> Option<PathBuf> {
     let commands = [
         OsString::from(crate::opener::code_command()),
+        OsString::from(crate::opener::cursor_command()),
         OsString::from(crate::opener::antigravity_ide_command()),
     ];
     locate_extension_with_commands(&ProcessCodeCliRunner, commands, extension_id, binary)
@@ -517,7 +518,7 @@ struct EditorExtensionMetadata {
 
 /// An editor launcher can be missing from PATH or unusable in a confined
 /// package even while its extensions are available. The bounded local VS Code
-/// and Antigravity IDE registries are a second source for the exact installed
+/// Antigravity IDE, and Cursor registries are a second source for the exact installed
 /// extension path.
 fn locate_codex_extension_from_registry() -> Option<PathBuf> {
     locate_extension_from_registry(CODEX_EXTENSION_ID, codex_extension_binary)
@@ -559,11 +560,12 @@ fn platform_home_directory() -> Option<PathBuf> {
     home.filter(|value| !value.is_empty()).map(PathBuf::from)
 }
 
-fn vs_compatible_extension_directories(home: &Path) -> [PathBuf; 4] {
+fn vs_compatible_extension_directories(home: &Path) -> [PathBuf; 5] {
     [
         home.join(".vscode").join("extensions"),
         home.join(".vscode-insiders").join("extensions"),
         home.join(".vscode-oss").join("extensions"),
+        home.join(".cursor").join("extensions"),
         home.join(".antigravity-ide").join("extensions"),
     ]
 }
@@ -1339,7 +1341,7 @@ fn provider_failure_detail(
     let normalized = error.to_ascii_lowercase();
     let subject = match source {
         "automatic" => format!(
-            "{provider} from the app PATH or a local VS Code-compatible editor extension (VS Code or Antigravity IDE)"
+            "{provider} from the app PATH or a local VS Code-compatible editor extension (VS Code, Cursor, or Antigravity IDE)"
         ),
         "configured" => {
             format!("The {provider} executable selected by {override_variable}")
@@ -1361,7 +1363,7 @@ fn provider_failure_detail(
     }
     if normalized.contains("rejected") || normalized.contains("no result") {
         return format!(
-            "{subject} rejected the usage request. Sign in to the same local account used by VS Code or Antigravity IDE, or update it, then refresh usage."
+            "{subject} rejected the usage request. Sign in to the same local account used by VS Code, Cursor, or Antigravity IDE, or update it, then refresh usage."
         );
     }
     if normalized.contains("malformed")
@@ -2002,7 +2004,7 @@ mod tests {
         let detail =
             provider_failure_detail("Codex", "VSPARALLEL_CODEX_COMMAND", &automatic, "fallback");
         assert!(detail.contains("app PATH or a local VS Code-compatible editor extension"));
-        assert!(detail.contains("VS Code or Antigravity IDE"));
+        assert!(detail.contains("VS Code, Cursor, or Antigravity IDE"));
 
         let configured = tag_provider_failure("could not start Claude Code".to_string(), false);
         let detail = provider_failure_detail(
@@ -2024,7 +2026,7 @@ mod tests {
             let detail = provider_failure_detail("Provider", "OVERRIDE", error, "fallback");
             assert!(detail.contains(expected));
             if error.contains("rejected") {
-                assert!(detail.contains("VS Code or Antigravity IDE"));
+                assert!(detail.contains("VS Code, Cursor, or Antigravity IDE"));
             }
         }
 
@@ -2449,6 +2451,7 @@ mod tests {
                 temp.path().join(".vscode").join("extensions"),
                 temp.path().join(".vscode-insiders").join("extensions"),
                 temp.path().join(".vscode-oss").join("extensions"),
+                temp.path().join(".cursor").join("extensions"),
                 temp.path().join(".antigravity-ide").join("extensions"),
             ]
         );

@@ -6,11 +6,16 @@
   type ColorTheme = Exclude<ThemePreference, "system">;
   type IntegrationKind =
     | "companion"
+    | "cursorCompanion"
     | "antigravityIde"
+    | "cursor"
     | "antigravity"
     | "codex"
     | "claude";
-  type EditorIntegrationKind = Extract<IntegrationKind, "companion" | "antigravityIde">;
+  type EditorIntegrationKind = Extract<
+    IntegrationKind,
+    "companion" | "cursorCompanion" | "antigravityIde"
+  >;
   type IntegrationActionKind = IntegrationKind | "all";
   type IntegrationOperation = "install" | "uninstall";
   type IntegrationVisualState = "missing" | "ready" | "warning" | "error";
@@ -54,6 +59,9 @@
     | "install_claude_hooks"
     | "install_codex_hooks"
     | "install_companion"
+    | "install_cursor_companion"
+    | "install_cursor_hooks"
+    | "install_cursor_monitoring"
     | "install_antigravity_hooks"
     | "install_antigravity_ide_companion"
     | "is_release_build"
@@ -64,6 +72,8 @@
     | "uninstall_claude_hooks"
     | "uninstall_codex_hooks"
     | "uninstall_companion"
+    | "uninstall_cursor_companion"
+    | "uninstall_cursor_hooks"
     | "uninstall_antigravity_hooks"
     | "uninstall_antigravity_ide_companion";
 
@@ -73,6 +83,8 @@
     changedAtMs: number | null;
     detail: string;
     modelKind: AntigravityModelKind | null;
+    modelName: string;
+    agentKind: string;
     extensionDetectionAvailable: boolean | null;
     extensionInstalled: boolean | null;
     extensionActive: boolean | null;
@@ -81,7 +93,7 @@
 
   interface Workspace {
     instanceId: string;
-    editor: "vscode" | "antigravity_ide" | "antigravity_2";
+    editor: "vscode" | "cursor" | "antigravity_ide" | "antigravity_2";
     editorName: string;
     name: string;
     path: string;
@@ -94,6 +106,7 @@
     codex: ActivityView;
     claude: ActivityView;
     antigravity: ActivityView | null;
+    cursor: ActivityView | null;
   }
 
   interface WorkspaceGroup {
@@ -153,7 +166,9 @@
   interface IntegrationStatus {
     schemaVersion: number;
     companion: IntegrationComponent;
+    cursorCompanion: IntegrationComponent;
     antigravityIde: IntegrationComponent;
+    cursor: IntegrationComponent;
     antigravity: IntegrationComponent;
     codex: IntegrationComponent;
     claude: IntegrationComponent;
@@ -281,7 +296,9 @@
   const THEME_PREFERENCES: ReadonlySet<string> = new Set(["system", "light", "dark"]);
   const INTEGRATION_KINDS = [
     "companion",
+    "cursorCompanion",
     "antigravityIde",
+    "cursor",
     "antigravity",
     "codex",
     "claude",
@@ -329,6 +346,7 @@
     updateNowButton: requiredElement<HTMLButtonElement>("#updateNowButton"),
     updateLaterButton: requiredElement<HTMLButtonElement>("#updateLaterButton"),
     emptyState: requiredElement<HTMLDivElement>("#emptyState"),
+    emptySetupButton: requiredElement<HTMLButtonElement>("#emptySetupButton"),
     emptyRefreshButton: requiredElement<HTMLButtonElement>("#emptyRefreshButton"),
     launchOverlay: requiredElement<HTMLDivElement>("#launchOverlay"),
     launchStatus: requiredElement<HTMLSpanElement>("#launchStatus"),
@@ -350,6 +368,16 @@
     companionMeta: requiredElement<HTMLParagraphElement>("#companionMeta"),
     companionInstallButton: requiredElement<HTMLButtonElement>("#companionInstallButton"),
     companionUninstallButton: requiredElement<HTMLButtonElement>("#companionUninstallButton"),
+    cursorCompanionCard: requiredElement<HTMLElement>("#cursorCompanionCard"),
+    cursorCompanionStatus: requiredElement<HTMLSpanElement>("#cursorCompanionStatus"),
+    cursorCompanionDetail: requiredElement<HTMLParagraphElement>("#cursorCompanionDetail"),
+    cursorCompanionMeta: requiredElement<HTMLParagraphElement>("#cursorCompanionMeta"),
+    cursorCompanionInstallButton: requiredElement<HTMLButtonElement>(
+      "#cursorCompanionInstallButton",
+    ),
+    cursorCompanionUninstallButton: requiredElement<HTMLButtonElement>(
+      "#cursorCompanionUninstallButton",
+    ),
     antigravityIdeCard: requiredElement<HTMLElement>("#antigravityIdeCard"),
     antigravityIdeStatus: requiredElement<HTMLSpanElement>("#antigravityIdeStatus"),
     antigravityIdeDetail: requiredElement<HTMLParagraphElement>("#antigravityIdeDetail"),
@@ -360,6 +388,12 @@
     antigravityIdeUninstallButton: requiredElement<HTMLButtonElement>(
       "#antigravityIdeUninstallButton",
     ),
+    cursorCard: requiredElement<HTMLElement>("#cursorCard"),
+    cursorStatus: requiredElement<HTMLSpanElement>("#cursorStatus"),
+    cursorDetail: requiredElement<HTMLParagraphElement>("#cursorDetail"),
+    cursorMeta: requiredElement<HTMLParagraphElement>("#cursorMeta"),
+    cursorInstallButton: requiredElement<HTMLButtonElement>("#cursorInstallButton"),
+    cursorUninstallButton: requiredElement<HTMLButtonElement>("#cursorUninstallButton"),
     antigravityCard: requiredElement<HTMLElement>("#antigravityCard"),
     antigravityStatus: requiredElement<HTMLSpanElement>("#antigravityStatus"),
     antigravityDetail: requiredElement<HTMLParagraphElement>("#antigravityDetail"),
@@ -561,7 +595,7 @@
 
     return {
       kind,
-      optional: kind !== "companion" && kind !== "antigravityIde",
+      optional: !["companion", "cursorCompanion", "antigravityIde"].includes(kind),
       token,
       visualState,
       installed,
@@ -571,13 +605,17 @@
         raw.detail,
         kind === "companion"
           ? "VS Code companion status details are unavailable."
-          : kind === "antigravityIde"
-            ? "Antigravity IDE companion status details are unavailable."
-            : kind === "antigravity"
-              ? "Antigravity activity hook status details are unavailable."
-          : kind === "codex"
-            ? "Codex lifecycle hook status details are unavailable."
-            : "Claude Code lifecycle hook status details are unavailable.",
+          : kind === "cursorCompanion"
+            ? "Cursor companion status details are unavailable."
+            : kind === "antigravityIde"
+              ? "Antigravity IDE companion status details are unavailable."
+              : kind === "cursor"
+                ? "Cursor hooks-only status details are unavailable."
+              : kind === "antigravity"
+                  ? "Antigravity activity hook status details are unavailable."
+                  : kind === "codex"
+                    ? "Codex lifecycle hook status details are unavailable."
+                    : "Claude Code lifecycle hook status details are unavailable.",
       ),
       installedVersion,
       targetVersion: asString(raw.targetVersion),
@@ -598,7 +636,9 @@
     return {
       schemaVersion: raw.schemaVersion,
       companion: normalizeIntegrationComponent(raw.companion, "companion"),
+      cursorCompanion: normalizeIntegrationComponent(raw.cursorCompanion, "cursorCompanion"),
       antigravityIde: normalizeIntegrationComponent(raw.antigravityIde, "antigravityIde"),
+      cursor: normalizeIntegrationComponent(raw.cursor, "cursor"),
       antigravity: normalizeIntegrationComponent(raw.antigravity, "antigravity"),
       codex: normalizeIntegrationComponent(raw.codex, "codex"),
       claude: normalizeIntegrationComponent(raw.claude, "claude"),
@@ -726,6 +766,8 @@
       changedAtMs: asTimestamp(raw.changedAtMs),
       detail: asString(raw.detail),
       modelKind: normalizeAntigravityModelKind(raw.modelKind),
+      modelName: asString(raw.modelName),
+      agentKind: asString(raw.agentKind),
       extensionDetectionAvailable: asNullableBoolean(raw.extensionDetectionAvailable),
       extensionInstalled: asNullableBoolean(raw.extensionInstalled),
       extensionActive: asNullableBoolean(raw.extensionActive),
@@ -742,14 +784,20 @@
     const path = asString(raw.path);
     const name = asString(raw.name, deriveName(path) || "Unnamed workspace");
     const editorToken = normalizeStateToken(raw.editor);
-    const editor = editorToken === "antigravity_ide" || editorToken === "antigravity_2"
-      ? editorToken
-      : "vscode";
-    const defaultEditorName = editor === "antigravity_ide"
-      ? "Antigravity IDE"
-      : editor === "antigravity_2"
-        ? "Antigravity 2.0"
-        : "VS Code";
+    const editor: Workspace["editor"] = editorToken === "cursor"
+      ? "cursor"
+      : editorToken === "antigravity_ide"
+        ? "antigravity_ide"
+        : editorToken === "antigravity_2"
+          ? "antigravity_2"
+          : "vscode";
+    const defaultEditorName = editor === "cursor"
+      ? "Cursor"
+      : editor === "antigravity_ide"
+        ? "Antigravity IDE"
+        : editor === "antigravity_2"
+          ? "Antigravity 2.0"
+          : "VS Code";
 
     return {
       instanceId,
@@ -767,6 +815,9 @@
       claude: normalizeActivityView(raw.claude),
       antigravity: isObject(raw.antigravity)
         ? normalizeActivityView(raw.antigravity)
+        : null,
+      cursor: isObject(raw.cursor)
+        ? normalizeActivityView(raw.cursor)
         : null,
     };
   }
@@ -1076,7 +1127,7 @@
       finished: 2,
       unknown: 1,
     };
-    return [workspace.codex, workspace.claude, workspace.antigravity]
+    return [workspace.codex, workspace.claude, workspace.antigravity, workspace.cursor]
       .filter((activity): activity is ActivityView => activity !== null)
       .reduce((current, candidate) =>
         priority[candidate.kind] > priority[current.kind] ? candidate : current,
@@ -1214,7 +1265,9 @@
     } else if (lifecycleSource) {
       const source = createElement("span", "provider-extension", lifecycleSource);
       source.dataset.state = "present";
-      source.title = "Lifecycle activity reported by Antigravity's built-in model hook.";
+      source.title = lifecycleSource === "Cursor hooks"
+        ? "Lifecycle activity reported by Cursor's documented agent hooks."
+        : "Lifecycle activity reported by Antigravity's built-in model hook.";
       body.append(source);
       presenceLabel = lifecycleSource;
     }
@@ -1288,6 +1341,26 @@
           "Antigravity built-in model",
           modelFamily,
           modelLabel,
+        ),
+      );
+    }
+    if (workspace.cursor) {
+      const cursorDetails = [workspace.cursor.agentKind, workspace.cursor.modelName]
+        .filter(Boolean)
+        .join(" · ");
+      providers.append(
+        createProviderState(
+          "Cursor Agent",
+          workspace.cursor,
+          cursorDetails
+            ? `Cursor Agent (${cursorDetails}), latest agent and model reported by Cursor`
+            : "Cursor Agent",
+          workspace.editorName,
+          false,
+          false,
+          "Cursor hooks",
+          cursorDetails,
+          cursorDetails ? `Latest Cursor agent and model: ${cursorDetails}` : "",
         ),
       );
     }
@@ -2168,6 +2241,17 @@
       };
     }
 
+    if (kind === "cursorCompanion") {
+      return {
+        card: elements.cursorCompanionCard,
+        status: elements.cursorCompanionStatus,
+        detail: elements.cursorCompanionDetail,
+        meta: elements.cursorCompanionMeta,
+        installButton: elements.cursorCompanionInstallButton,
+        uninstallButton: elements.cursorCompanionUninstallButton,
+      };
+    }
+
     if (kind === "antigravityIde") {
       return {
         card: elements.antigravityIdeCard,
@@ -2187,6 +2271,17 @@
         meta: elements.antigravityMeta,
         installButton: elements.antigravityInstallButton,
         uninstallButton: elements.antigravityUninstallButton,
+      };
+    }
+
+    if (kind === "cursor") {
+      return {
+        card: elements.cursorCard,
+        status: elements.cursorStatus,
+        detail: elements.cursorDetail,
+        meta: elements.cursorMeta,
+        installButton: elements.cursorInstallButton,
+        uninstallButton: elements.cursorUninstallButton,
       };
     }
 
@@ -2217,24 +2312,31 @@
     componentElements.status.dataset.state = component.visualState;
     componentElements.status.textContent = component.label;
     componentElements.detail.textContent = component.detail;
-    componentElements.installButton.textContent = component.actionLabel;
+    const installButtonLabel = integrationInstallButtonLabel(component);
+    componentElements.installButton.textContent = installButtonLabel;
     const componentName = component.kind === "companion"
       ? "VS Code companion"
-      : component.kind === "antigravityIde"
-        ? "Antigravity IDE companion"
-        : component.kind === "antigravity"
-          ? "Antigravity activity hooks"
-      : component.kind === "codex"
-        ? "Codex activity hooks"
-        : "Claude Code activity hooks";
+      : component.kind === "cursorCompanion"
+        ? "Cursor companion"
+        : component.kind === "antigravityIde"
+          ? "Antigravity IDE companion"
+          : component.kind === "cursor"
+            ? "Cursor hooks only"
+            : component.kind === "antigravity"
+              ? "Antigravity activity hooks"
+              : component.kind === "codex"
+                ? "Codex activity hooks"
+                : "Claude Code activity hooks";
     componentElements.installButton.setAttribute(
       "aria-label",
-      `${component.actionLabel} ${componentName}`,
+      installButtonLabel === component.actionLabel
+        ? `${component.actionLabel} ${componentName}`
+        : installButtonLabel,
     );
     componentElements.uninstallButton.hidden = !component.installed;
 
     let meta = "";
-    if (component.kind === "companion" || component.kind === "antigravityIde") {
+    if (["companion", "cursorCompanion", "antigravityIde"].includes(component.kind)) {
       if (component.installedVersion && component.targetVersion) {
         meta = `Installed ${component.installedVersion} · Bundled ${component.targetVersion}`;
       } else if (component.installedVersion) {
@@ -2247,6 +2349,20 @@
     }
     componentElements.meta.textContent = meta;
     componentElements.meta.hidden = !meta;
+  }
+
+  function integrationInstallButtonLabel(component: IntegrationComponent): string {
+    if (component.kind === "cursorCompanion") {
+      return component.actionLabel === "Install"
+        ? "Set up Cursor monitoring"
+        : "Repair Cursor monitoring";
+    }
+    if (component.kind === "cursor") {
+      return component.actionLabel === "Install"
+        ? "Install hooks only"
+        : "Repair hooks only";
+    }
+    return component.actionLabel;
   }
 
   function integrationProgressLabel(
@@ -2288,11 +2404,16 @@
         componentElements.installButton.textContent =
           isCurrentAction && action?.operation === "install"
             ? integrationProgressLabel(component, "install")
-            : component.actionLabel;
+            : integrationInstallButtonLabel(component);
+        const uninstallLabel = kind === "cursorCompanion"
+          ? "Uninstall companion"
+          : "Uninstall";
         componentElements.uninstallButton.textContent =
           isCurrentAction && action?.operation === "uninstall"
-            ? "Uninstalling…"
-            : "Uninstall";
+            ? kind === "cursorCompanion"
+              ? "Uninstalling companion…"
+              : "Uninstalling…"
+            : uninstallLabel;
       }
     });
   }
@@ -2301,7 +2422,7 @@
     installed: boolean;
     warningCount: number;
   } {
-    const companions = [status.companion, status.antigravityIde];
+    const companions = [status.companion, status.cursorCompanion, status.antigravityIde];
     return {
       installed: companions.some((component) => component.installed),
       warningCount: companions.filter((component) =>
@@ -2329,7 +2450,7 @@
     }
 
     const editorSummary = summarizeEditorCompanions(status);
-    const optionalComponents = [status.antigravity, status.codex, status.claude];
+    const optionalComponents = [status.cursor, status.antigravity, status.codex, status.claude];
     const optionalMissing = optionalComponents.some(
       (component) => component.visualState === "missing",
     );
@@ -2379,7 +2500,9 @@
     state.integrationStatus = status;
     state.integrationLoaded = true;
     renderIntegrationComponent(status.companion);
+    renderIntegrationComponent(status.cursorCompanion);
     renderIntegrationComponent(status.antigravityIde);
+    renderIntegrationComponent(status.cursor);
     renderIntegrationComponent(status.antigravity);
     renderIntegrationComponent(status.codex);
     renderIntegrationComponent(status.claude);
@@ -2421,7 +2544,9 @@
         normalizeIntegrationStatus({
           schemaVersion: SCHEMA_VERSION,
           companion: { state: "error", label: "Check failed", detail: message },
+          cursorCompanion: { state: "error", label: "Check failed", detail: message },
           antigravityIde: { state: "error", label: "Check failed", detail: message },
+          cursor: { state: "error", label: "Check failed", detail: message },
           antigravity: { state: "error", label: "Check failed", detail: message },
           codex: { state: "error", label: "Check failed", detail: message },
           claude: { state: "error", label: "Check failed", detail: message },
@@ -2445,24 +2570,35 @@
       if (kind === "companion") {
         return "VS Code companion uninstalled. Existing stale heartbeats will age out automatically.";
       }
+      if (kind === "cursorCompanion") {
+        return "Cursor companion uninstalled. Existing stale heartbeats will age out automatically.";
+      }
       if (kind === "antigravityIde") {
         return "Antigravity IDE companion uninstalled. Existing stale heartbeats will age out automatically.";
       }
-      const provider = kind === "antigravity"
-        ? "Antigravity"
-        : kind === "codex"
-          ? "Codex"
-          : "Claude Code";
+      const provider = kind === "cursor"
+        ? "Cursor"
+        : kind === "antigravity"
+          ? "Antigravity"
+          : kind === "codex"
+            ? "Codex"
+            : "Claude Code";
       return `${provider} activity hooks uninstalled. Existing stale activity markers will age out automatically.`;
     }
     if (kind === "companion") {
       return "VS Code companion installed. Reload open VS Code windows to start reporting heartbeats.";
+    }
+    if (kind === "cursorCompanion") {
+      return "Cursor monitoring installed. Reload open Cursor IDE windows; live IDE heartbeats begin after reload. The Agents Window remains hook-only and reports recent activity, not a live or openable window.";
     }
     if (kind === "antigravityIde") {
       return "Antigravity IDE companion installed. Reload open Antigravity IDE windows to start reporting heartbeats.";
     }
     if (kind === "antigravity") {
       return "Antigravity activity hooks installed. Start a new agent turn in an Antigravity 2.0 Project or Antigravity IDE workspace; opening it alone does not fire a hook.";
+    }
+    if (kind === "cursor") {
+      return "Cursor hooks only installed. Opening a local workspace can create recent workspace evidence; start a new turn in the Cursor IDE or Agents Window for lifecycle status. Hooks do not establish a live or openable window.";
     }
     return kind === "codex"
       ? "Codex activity hooks installed. Usage remaining is separate; see the requirement above. In Codex, run /hooks and complete the required security review."
@@ -2486,6 +2622,11 @@
         uninstall: "uninstall_companion",
         name: "VS Code companion",
       },
+      cursorCompanion: {
+        install: "install_cursor_monitoring",
+        uninstall: "uninstall_cursor_companion",
+        name: "Cursor monitoring",
+      },
       antigravityIde: {
         install: "install_antigravity_ide_companion",
         uninstall: "uninstall_antigravity_ide_companion",
@@ -2495,6 +2636,11 @@
         install: "install_antigravity_hooks",
         uninstall: "uninstall_antigravity_hooks",
         name: "Antigravity activity hooks",
+      },
+      cursor: {
+        install: "install_cursor_hooks",
+        uninstall: "uninstall_cursor_hooks",
+        name: "Cursor hooks only",
       },
       codex: {
         install: "install_codex_hooks",
@@ -2521,8 +2667,16 @@
       renderIntegrationStatus(normalizeIntegrationStatus(raw));
       setIntegrationMessage(integrationActionSuccess(kind, operation), "success");
     } catch (error) {
+      const message = readableError(error, `Could not ${operation} ${componentName}.`);
+      try {
+        const raw = await invoke("get_integration_status", {});
+        renderIntegrationStatus(normalizeIntegrationStatus(raw));
+      } catch (_statusError) {
+        // Preserve the operation's actionable error if the follow-up status
+        // query is also unavailable.
+      }
       setIntegrationMessage(
-        readableError(error, `Could not ${operation} ${componentName}.`),
+        message,
         "error",
       );
     } finally {
@@ -2550,6 +2704,9 @@
     if (status.companion.token !== "unavailable") {
       kinds.push("companion");
     }
+    if (status.cursorCompanion.token !== "unavailable") {
+      kinds.push("cursorCompanion");
+    }
     if (status.antigravityIde.token !== "unavailable") {
       kinds.push("antigravityIde");
     }
@@ -2563,25 +2720,48 @@
     }
 
     const editorKinds = availableEditorSetupKinds(integrationStatus);
-    const editorSteps = editorKinds.map((kind) => kind === "companion"
-      ? {
+    const editorSteps = editorKinds.map((kind) => {
+      if (kind === "companion") {
+        return {
           kind,
           name: "VS Code companion",
           editorName: "VS Code",
           command: "install_companion" as const,
-        }
-      : {
+        };
+      }
+      if (kind === "cursorCompanion") {
+        return {
           kind,
-          name: "Antigravity IDE companion",
-          editorName: "Antigravity IDE",
-          command: "install_antigravity_ide_companion" as const,
-        });
+          name: "Cursor monitoring",
+          editorName: "Cursor IDE",
+          command: "install_cursor_monitoring" as const,
+        };
+      }
+      return {
+        kind,
+        name: "Antigravity IDE companion",
+        editorName: "Antigravity IDE",
+        command: "install_antigravity_ide_companion" as const,
+      };
+    });
+    const cursorHookFallbackSteps: Array<{
+      kind: IntegrationKind;
+      name: string;
+      command: TauriCommand;
+    }> = editorKinds.includes("cursorCompanion")
+      ? []
+      : [{
+          kind: "cursor",
+          name: "Cursor hooks only",
+          command: "install_cursor_hooks",
+        }];
     const steps: Array<{
       kind: IntegrationKind;
       name: string;
       command: TauriCommand;
     }> = [
       ...editorSteps,
+      ...cursorHookFallbackSteps,
       {
         kind: "antigravity",
         name: "Antigravity activity hooks",
@@ -2624,8 +2804,11 @@
 
     if (unconfirmed.length === 0) {
       const editorNames = editorSteps.map((step) => step.editorName);
+      const cursorReloadNote = editorKinds.includes("cursorCompanion")
+        ? " Live Cursor IDE heartbeats begin after reload; the Agents Window remains hook-only."
+        : "";
       const successMessage = editorNames.length
-        ? `${formatNaturalList(editorNames)} companion${editorNames.length === 1 ? "" : "s"} and activity hooks are installed. Reload ${formatNaturalList(editorNames)}, restart affected provider sessions, then run /hooks in Codex and complete its required security review.`
+        ? `${formatNaturalList(editorNames)} companion${editorNames.length === 1 ? "" : "s"} and activity hooks are installed. Reload ${formatNaturalList(editorNames)}.${cursorReloadNote} Restart affected provider sessions, then run /hooks in Codex and complete its required security review.`
         : "Activity hooks are installed. No available editor companion CLI was detected, so editor setup was skipped. Restart affected provider sessions, then run /hooks in Codex and complete its required security review.";
       setIntegrationMessage(
         successMessage,
@@ -2671,19 +2854,27 @@
 
     const componentNames: Record<IntegrationKind, string> = {
       companion: "VS Code companion",
+      cursorCompanion: "Cursor companion",
       antigravityIde: "Antigravity IDE companion",
+      cursor: "Cursor hooks only",
       antigravity: "Antigravity activity hooks",
       codex: "Codex activity hooks",
       claude: "Claude Code activity hooks",
     };
     state.pendingUninstall = kind;
     elements.uninstallTitle.textContent = `Uninstall ${componentNames[kind]}?`;
-    if (kind === "companion" || kind === "antigravityIde") {
-      const editorName = kind === "companion" ? "VS Code" : "Antigravity IDE";
+    if (["companion", "cursorCompanion", "antigravityIde"].includes(kind)) {
+      const editorName = kind === "companion"
+        ? "VS Code"
+        : kind === "cursorCompanion"
+          ? "Cursor"
+          : "Antigravity IDE";
       elements.uninstallDescription.textContent = `VSParallel will stop receiving workspace heartbeats after existing ${editorName} windows are reloaded. No project files are removed.`;
     } else {
-      const provider = kind === "antigravity"
-        ? "Antigravity"
+      const provider = kind === "cursor"
+        ? "Cursor"
+        : kind === "antigravity"
+          ? "Antigravity"
         : kind === "codex"
           ? "Codex"
           : "Claude Code";
@@ -2728,6 +2919,24 @@
     const term = createElement("dt", "", label);
     const description = createElement("dd", warning ? "has-warning" : "", value);
     elements.diagnosticsList.append(term, description);
+  }
+
+  function describeCursorHeartbeatDiagnostic(
+    activeRecords: number,
+    retainedRecords: number,
+    latestDescription: string,
+    recentWorkspaceOpens: number,
+  ): string {
+    if (activeRecords > 0) {
+      return `${activeRecords} active · ${retainedRecords} retained · latest ${latestDescription}`;
+    }
+    if (retainedRecords > 0) {
+      return `No active Cursor IDE heartbeat · ${retainedRecords} retained · latest ${latestDescription} · Agents Window is hook-only`;
+    }
+    if (recentWorkspaceOpens > 0) {
+      return "No live Cursor IDE heartbeat · the hook source may be the hook-only Agents Window; reload Cursor IDE for OPEN";
+    }
+    return "Not observed · set up Cursor monitoring and reload Cursor IDE";
   }
 
   function describeAntigravityHookExecution(
@@ -2784,14 +2993,24 @@
     const malformedCodex = asNonNegativeInteger(raw.malformedCodexRecords);
     const malformedClaude = asNonNegativeInteger(raw.malformedClaudeRecords);
     const malformedAntigravity = asNonNegativeInteger(raw.malformedAntigravityRecords);
+    const malformedCursor = asNonNegativeInteger(raw.malformedCursorRecords);
     const omittedInstances = asNonNegativeInteger(raw.omittedInstanceRecords);
     const omittedCodex = asNonNegativeInteger(raw.omittedCodexRecords);
     const omittedClaude = asNonNegativeInteger(raw.omittedClaudeRecords);
     const omittedAntigravity = asNonNegativeInteger(raw.omittedAntigravityRecords);
+    const omittedCursor = asNonNegativeInteger(raw.omittedCursorRecords);
     const validInstances = asNonNegativeInteger(raw.validInstanceRecords);
     const validCodex = asNonNegativeInteger(raw.validCodexRecords);
     const validClaude = asNonNegativeInteger(raw.validClaudeRecords);
     const validAntigravity = asNonNegativeInteger(raw.validAntigravityRecords);
+    const validCursor = asNonNegativeInteger(raw.validCursorRecords);
+    const activeCursorInstances = asNonNegativeInteger(raw.activeCursorInstanceRecords);
+    const retainedCursorInstances = asNonNegativeInteger(raw.retainedCursorInstanceRecords);
+    const latestCursorInstance = asTimestamp(raw.latestCursorInstanceAtMs);
+    const recentCursorWorkspaceOpens = asNonNegativeInteger(
+      raw.recentCursorWorkspaceOpenRecords,
+    );
+    const latestCursorWorkspaceOpen = asTimestamp(raw.latestCursorWorkspaceOpenedAtMs);
     const antigravityTwoHook = describeAntigravityHookExecution(
       raw,
       "antigravityTwoHook",
@@ -2810,12 +3029,18 @@
     const totalMalformed = malformedInstances
       + malformedCodex
       + malformedClaude
-      + malformedAntigravity;
-    const totalOmitted = omittedInstances + omittedCodex + omittedClaude + omittedAntigravity;
+      + malformedAntigravity
+      + malformedCursor;
+    const totalOmitted = omittedInstances
+      + omittedCodex
+      + omittedClaude
+      + omittedAntigravity
+      + omittedCursor;
 
     elements.diagnosticsList.replaceChildren();
     appendDiagnostic("State directory", asString(raw.stateDirectory, "Unavailable"));
     appendDiagnostic("VS Code command", asString(raw.codeCommand, "code"));
+    appendDiagnostic("Cursor command", asString(raw.cursorCommand, "cursor"));
     appendDiagnostic(
       "Antigravity IDE command",
       asString(raw.antigravityIdeCommand, "antigravity-ide"),
@@ -2841,6 +3066,26 @@
       malformedAntigravity > 0 || omittedAntigravity > 0,
     );
     appendDiagnostic(
+      "Cursor hook records",
+      `${validCursor} valid · ${malformedCursor} malformed · ${omittedCursor} omitted`,
+      malformedCursor > 0 || omittedCursor > 0,
+    );
+    appendDiagnostic(
+      "Cursor live heartbeat",
+      describeCursorHeartbeatDiagnostic(
+        activeCursorInstances,
+        retainedCursorInstances,
+        formatRelativeTime(latestCursorInstance).toLowerCase(),
+        recentCursorWorkspaceOpens,
+      ),
+    );
+    appendDiagnostic(
+      "Cursor workspace hook",
+      recentCursorWorkspaceOpens
+        ? `${recentCursorWorkspaceOpens} recent workspace${recentCursorWorkspaceOpens === 1 ? "" : "s"} · latest ${formatRelativeTime(latestCursorWorkspaceOpen).toLowerCase()}`
+        : "Not observed · open a local Cursor workspace after installing hooks",
+    );
+    appendDiagnostic(
       "Antigravity 2.0 hook execution",
       antigravityTwoHook.detail,
       antigravityTwoHook.warning,
@@ -2864,15 +3109,15 @@
     state.diagnosticsUnavailable = false;
     updateSetupSummary();
     elements.diagnosticsStatus.classList.remove("has-error");
-    elements.diagnosticsStatus.textContent = validInstances || validAntigravity
-      ? "One or more editor heartbeats or Antigravity activity records are available."
+    elements.diagnosticsStatus.textContent = validInstances || validAntigravity || validCursor
+      ? "One or more editor heartbeats, Cursor hook records, or Antigravity activity records are available."
       : antigravityHookHealthUnreadable
         ? "VSParallel could not read one or more Antigravity hook execution-health records."
         : !antigravityHookObserved
           ? "No workspace source is present yet. Opening an Antigravity 2.0 Project or Antigravity IDE workspace does not fire hooks; start an agent turn to create recent activity."
           : antigravityHookWarning
             ? "Antigravity invoked VSParallel, but a latest surface event did not create a workspace record."
-            : "No valid workspace source is present yet. Check an editor companion or Antigravity activity hooks.";
+            : "No valid workspace source is present yet. Check an editor companion, Cursor activity hooks, or Antigravity activity hooks.";
   }
 
   async function refreshDiagnostics(): Promise<void> {
@@ -3079,6 +3324,7 @@
   }
 
   elements.refreshButton.addEventListener("click", refreshAll);
+  elements.emptySetupButton.addEventListener("click", openSettingsDialog);
   elements.emptyRefreshButton.addEventListener("click", refreshSnapshot);
   elements.restoreFullButton.addEventListener("click", restoreFullWindow);
   elements.hidePanelButton.addEventListener("click", hideFloatingPanel);
@@ -3102,8 +3348,14 @@
   elements.companionInstallButton.addEventListener("click", () =>
     runIntegrationAction("companion", "install"),
   );
+  elements.cursorCompanionInstallButton.addEventListener("click", () =>
+    runIntegrationAction("cursorCompanion", "install"),
+  );
   elements.antigravityIdeInstallButton.addEventListener("click", () =>
     runIntegrationAction("antigravityIde", "install"),
+  );
+  elements.cursorInstallButton.addEventListener("click", () =>
+    runIntegrationAction("cursor", "install"),
   );
   elements.antigravityInstallButton.addEventListener("click", () =>
     runIntegrationAction("antigravity", "install"),
@@ -3117,9 +3369,13 @@
   elements.companionUninstallButton.addEventListener("click", () =>
     requestUninstall("companion"),
   );
+  elements.cursorCompanionUninstallButton.addEventListener("click", () =>
+    requestUninstall("cursorCompanion"),
+  );
   elements.antigravityIdeUninstallButton.addEventListener("click", () =>
     requestUninstall("antigravityIde"),
   );
+  elements.cursorUninstallButton.addEventListener("click", () => requestUninstall("cursor"));
   elements.antigravityUninstallButton.addEventListener("click", () =>
     requestUninstall("antigravity"),
   );

@@ -24,6 +24,7 @@ use std::os::unix::fs::OpenOptionsExt;
 pub const EXTENSION_ID: &str = "vsparallel.vsparallel-companion";
 pub const VSCODE_PROFILE_ENV: &str = "VSPARALLEL_VSCODE_PROFILE";
 pub const ANTIGRAVITY_IDE_PROFILE_ENV: &str = "VSPARALLEL_ANTIGRAVITY_IDE_PROFILE";
+pub const CURSOR_PROFILE_ENV: &str = "VSPARALLEL_CURSOR_PROFILE";
 
 const CONTENT_TYPES: &[u8] = include_bytes!("../../companion/[Content_Types].xml");
 const VSIX_MANIFEST: &[u8] = include_bytes!("../../companion/extension.vsixmanifest");
@@ -1059,7 +1060,7 @@ mod tests {
 
     #[test]
     fn embedded_identity_and_version_come_from_package_json() {
-        assert_eq!(bundled_companion_version().unwrap(), "0.4.0");
+        assert_eq!(bundled_companion_version().unwrap(), "0.4.1");
         let value: serde_json::Value = serde_json::from_slice(PACKAGE_JSON).unwrap();
         assert_eq!(
             format!(
@@ -1069,7 +1070,7 @@ mod tests {
             ),
             EXTENSION_ID
         );
-        assert!(validate_vsix_manifest_identity(VSIX_MANIFEST, "0.4.0").is_ok());
+        assert!(validate_vsix_manifest_identity(VSIX_MANIFEST, "0.4.1").is_ok());
         assert!(validate_vsix_manifest_identity(VSIX_MANIFEST, "9.9.9").is_err());
     }
 
@@ -1107,12 +1108,12 @@ mod tests {
     #[test]
     fn status_reports_current_version_and_uses_exact_cli_arguments() {
         let runner = ScriptedRunner::new(vec![successful(
-            b"unrelated.extension@9.0.0\nvsparallel.vsparallel-companion@0.4.0\n".to_vec(),
+            b"unrelated.extension@9.0.0\nvsparallel.vsparallel-companion@0.4.1\n".to_vec(),
         )]);
         let status = companion_status_with(&runner, OsStr::new("/opt/code with spaces"), None);
 
         assert_eq!(status.state, CompanionStatusState::Current);
-        assert_eq!(status.installed_version.as_deref(), Some("0.4.0"));
+        assert_eq!(status.installed_version.as_deref(), Some("0.4.1"));
         assert_eq!(
             runner.calls(),
             vec![RecordedCall {
@@ -1129,7 +1130,7 @@ mod tests {
     fn named_profile_is_applied_to_status_install_and_verification() {
         let runner = ScriptedRunner::new(vec![
             successful(b"installed\n".to_vec()),
-            successful(b"vsparallel.vsparallel-companion@0.4.0\n".to_vec()),
+            successful(b"vsparallel.vsparallel-companion@0.4.1\n".to_vec()),
         ]);
         let temporary_directory = TempDir::new().unwrap();
         let result = install_companion_with(
@@ -1157,7 +1158,7 @@ mod tests {
     #[test]
     fn named_profile_is_applied_to_uninstall_and_verification() {
         let runner = ScriptedRunner::new(vec![
-            successful(b"vsparallel.vsparallel-companion@0.4.0\n".to_vec()),
+            successful(b"vsparallel.vsparallel-companion@0.4.1\n".to_vec()),
             successful(b"uninstalled\n".to_vec()),
             successful(b"other.extension@1.0.0\n".to_vec()),
         ]);
@@ -1224,7 +1225,7 @@ mod tests {
         let status = CompanionStatus {
             state: CompanionStatusState::Unavailable,
             extension_id: EXTENSION_ID.to_string(),
-            bundled_version: Some("0.4.0".to_string()),
+            bundled_version: Some("0.4.1".to_string()),
             installed_version: None,
             detail: Some("could not run the VS Code command".to_string()),
         };
@@ -1251,7 +1252,7 @@ mod tests {
     fn install_passes_a_real_embedded_vsix_as_one_argument_and_removes_it() {
         let runner = ScriptedRunner::new(vec![
             successful(b"installed\n".to_vec()),
-            successful(b"vsparallel.vsparallel-companion@0.4.0\n".to_vec()),
+            successful(b"vsparallel.vsparallel-companion@0.4.1\n".to_vec()),
         ]);
         let root = TempDir::new().unwrap();
         let temporary_directory = root.path().join("temporary packages with spaces");
@@ -1332,7 +1333,7 @@ mod tests {
     #[test]
     fn uninstall_uses_the_exact_extension_id_and_verifies_removal() {
         let runner = ScriptedRunner::new(vec![
-            successful(b"vsparallel.vsparallel-companion@0.4.0\n".to_vec()),
+            successful(b"vsparallel.vsparallel-companion@0.4.1\n".to_vec()),
             successful(b"uninstalled\n".to_vec()),
             successful(b"other.extension@1.0.0\n".to_vec()),
         ]);

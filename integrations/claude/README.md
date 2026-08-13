@@ -24,11 +24,12 @@ parser discards account, session, attribution, and every field except the rate
 limits, and the temporary directory is removed after the query.
 
 The active usage query is independent of lifecycle hooks and `statusLine`.
-This matters for native graphical Claude sessions in VS Code, which do not run
-the terminal status line. VSParallel can use either `claude` from `PATH` or the
-executable bundled with the installed Claude VS Code extension, trying the
-other source if the first query fails. `VSPARALLEL_CLAUDE_COMMAND` can select a
-different signed-in executable.
+This matters for native graphical Claude sessions in VS Code-compatible
+editors, which do not run the terminal status line. VSParallel can use either
+`claude` from `PATH` or the executable bundled with the installed Claude
+extension in VS Code, Cursor, or Antigravity IDE, trying the other source if
+the first query fails. `VSPARALLEL_CLAUDE_COMMAND` can select a different
+signed-in executable.
 
 The app merges its owned handlers into the `hooks` object in the user's Claude
 `settings.json` and preserves unrelated settings and handlers. It maps only

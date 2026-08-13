@@ -452,6 +452,7 @@ fn tray_workspace_entries(snapshot: &Snapshot) -> Vec<TrayWorkspaceEntry> {
                 &workspace.codex,
                 &workspace.claude,
                 workspace.antigravity.as_ref(),
+                workspace.cursor.as_ref(),
             ),
             openable: workspace.openable,
         })
@@ -480,8 +481,9 @@ fn aggregate_status(
     codex: &ActivityView,
     claude: &ActivityView,
     antigravity: Option<&ActivityView>,
+    cursor: Option<&ActivityView>,
 ) -> TrayActivityStatus {
-    [Some(codex), Some(claude), antigravity]
+    [Some(codex), Some(claude), antigravity, cursor]
         .into_iter()
         .flatten()
         .map(activity_status)
@@ -549,6 +551,8 @@ mod tests {
             changed_at_ms: None,
             detail: detail.to_string(),
             model_kind: None,
+            model_name: None,
+            agent_kind: None,
             extension_detection_available: None,
             extension_installed: None,
             extension_active: None,
@@ -579,6 +583,7 @@ mod tests {
             last_seen_at_ms: 1,
             started_at_ms: 0,
             antigravity: None,
+            cursor: None,
             codex: activity(codex, "PRIVATE CODEX DETAIL"),
             claude: activity(claude, "PRIVATE CLAUDE DETAIL"),
         }
@@ -741,10 +746,20 @@ mod tests {
         ];
         for (codex, claude, expected) in cases {
             assert_eq!(
-                aggregate_status(&activity(codex, ""), &activity(claude, ""), None),
+                aggregate_status(&activity(codex, ""), &activity(claude, ""), None, None,),
                 expected
             );
         }
+
+        assert_eq!(
+            aggregate_status(
+                &activity("turn_finished", ""),
+                &activity("unknown", ""),
+                None,
+                Some(&activity("activity_detected", "")),
+            ),
+            TrayActivityStatus::Activity,
+        );
     }
 
     #[test]

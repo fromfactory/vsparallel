@@ -2,6 +2,7 @@ mod antigravity_integration;
 mod claude_integration;
 mod codex_integration;
 mod companion_integration;
+mod cursor_integration;
 mod opener;
 mod state;
 mod tray;
@@ -10,12 +11,13 @@ mod usage;
 pub use antigravity_integration::{run_antigravity_hook_stdio, AntigravityHookEvent};
 pub use claude_integration::run_claude_hook_stdio;
 pub use codex_integration::run_codex_hook_stdio;
+pub use cursor_integration::{run_cursor_hook_stdio, CursorHookEvent};
 pub use usage::{run_claude_statusline_stdio, CLAUDE_STATUSLINE_ARGUMENT};
 
 use companion_integration::{CompanionOperationResult, CompanionStatus, CompanionStatusState};
 use opener::{
-    antigravity_ide_command, code_command, open_editor_with, ProcessWorkspaceLauncher,
-    WorkspaceLaunchMode,
+    antigravity_ide_command, code_command, cursor_command, open_editor_with,
+    ProcessWorkspaceLauncher, WorkspaceLaunchMode,
 };
 use serde::Serialize;
 use state::{now_ms, Diagnostics, Snapshot, StateStore};
@@ -155,7 +157,9 @@ struct LifecycleIntegrationView {
 struct IntegrationStatusView {
     schema_version: u32,
     companion: CompanionIntegrationView,
+    cursor_companion: CompanionIntegrationView,
     antigravity_ide: CompanionIntegrationView,
+    cursor: LifecycleIntegrationView,
     antigravity: LifecycleIntegrationView,
     codex: LifecycleIntegrationView,
     claude: LifecycleIntegrationView,
@@ -186,7 +190,13 @@ async fn get_diagnostics() -> Result<Diagnostics, String> {
     run_background(|| {
         let command = code_command();
         let antigravity_command = antigravity_ide_command();
-        Ok(StateStore::from_environment()?.diagnostics(now_ms(), command, antigravity_command))
+        let cursor_command = cursor_command();
+        Ok(StateStore::from_environment()?.diagnostics(
+            now_ms(),
+            command,
+            antigravity_command,
+            cursor_command,
+        ))
     })
     .await
 }
@@ -214,6 +224,92 @@ async fn uninstall_companion() -> Result<IntegrationStatusView, String> {
         let result = companion_integration::uninstall_companion(OsStr::new(&command))?;
         let status = verified_companion_status(result)?;
         Ok(build_integration_status_with_companion(status, true))
+    })
+    .await
+}
+
+#[tauri::command]
+async fn install_cursor_companion() -> Result<IntegrationStatusView, String> {
+    run_background(|| {
+        let command = cursor_command();
+        let result = companion_integration::install_companion_for_editor(
+            OsStr::new(&command),
+            "Cursor",
+            companion_integration::CURSOR_PROFILE_ENV,
+        )?;
+        let status = verified_companion_status(result)?;
+        Ok(build_integration_status_with_cursor_companion(status, true))
+    })
+    .await
+}
+
+/// Installs both pieces needed for complete local Cursor monitoring.
+///
+/// The VS Code-compatible companion is installed first because it is the only
+/// source of live IDE-window heartbeats. Native hooks are then installed to
+/// enrich those workspaces (and the separate Agents Window) with coarse
+/// workspace and agent lifecycle observations.
+#[tauri::command]
+async fn install_cursor_monitoring() -> Result<IntegrationStatusView, String> {
+    run_background(|| {
+        // Resolve the hook destinations before changing the editor extension so
+        // obvious configuration failures cannot leave a partial installation.
+        let config_dir = cursor_integration::cursor_config_dir_from_environment()?;
+        let executable = integration_executable()?;
+        let command = cursor_command();
+        let companion_status = install_cursor_monitoring_components(
+            || {
+                let result = companion_integration::install_companion_for_editor(
+                    OsStr::new(&command),
+                    "Cursor",
+                    companion_integration::CURSOR_PROFILE_ENV,
+                )?;
+                verified_companion_status(result)
+            },
+            || cursor_integration::install_cursor_integration(&config_dir, &executable),
+        )?;
+
+        Ok(build_integration_status_with_cursor_companion(
+            companion_status,
+            true,
+        ))
+    })
+    .await
+}
+
+fn install_cursor_monitoring_components<C, H>(
+    install_companion: C,
+    install_hooks: H,
+) -> Result<CompanionStatus, String>
+where
+    C: FnOnce() -> Result<CompanionStatus, String>,
+    H: FnOnce() -> Result<cursor_integration::CursorIntegrationChange, String>,
+{
+    let companion_status = install_companion()?;
+    let change = install_hooks().map_err(|error| {
+        format!(
+            "The Cursor companion was installed, but Cursor activity hooks could not be configured: {error}"
+        )
+    })?;
+    verify_cursor_change(&change, true).map_err(|error| {
+        format!(
+            "The Cursor companion was installed, but Cursor activity hooks could not be verified: {error}"
+        )
+    })?;
+    Ok(companion_status)
+}
+
+#[tauri::command]
+async fn uninstall_cursor_companion() -> Result<IntegrationStatusView, String> {
+    run_background(|| {
+        let command = cursor_command();
+        let result = companion_integration::uninstall_companion_for_editor(
+            OsStr::new(&command),
+            "Cursor",
+            companion_integration::CURSOR_PROFILE_ENV,
+        )?;
+        let status = verified_companion_status(result)?;
+        Ok(build_integration_status_with_cursor_companion(status, true))
     })
     .await
 }
@@ -297,6 +393,30 @@ async fn uninstall_claude_hooks() -> Result<IntegrationStatusView, String> {
 }
 
 #[tauri::command]
+async fn install_cursor_hooks() -> Result<IntegrationStatusView, String> {
+    run_background(|| {
+        let config_dir = cursor_integration::cursor_config_dir_from_environment()?;
+        let executable = integration_executable()?;
+        let change = cursor_integration::install_cursor_integration(&config_dir, &executable)?;
+        verify_cursor_change(&change, true)?;
+        Ok(build_integration_status(false))
+    })
+    .await
+}
+
+#[tauri::command]
+async fn uninstall_cursor_hooks() -> Result<IntegrationStatusView, String> {
+    run_background(|| {
+        let config_dir = cursor_integration::cursor_config_dir_from_environment()?;
+        let executable = integration_executable()?;
+        let change = cursor_integration::uninstall_cursor_integration(&config_dir, &executable)?;
+        verify_cursor_change(&change, false)?;
+        Ok(build_integration_status(false))
+    })
+    .await
+}
+
+#[tauri::command]
 async fn install_antigravity_hooks() -> Result<IntegrationStatusView, String> {
     run_background(|| {
         let config_dir = antigravity_integration::antigravity_config_dir_from_environment()?;
@@ -335,6 +455,19 @@ fn verify_antigravity_change(
     }
 }
 
+fn verify_cursor_change(
+    change: &cursor_integration::CursorIntegrationChange,
+    expected_installed: bool,
+) -> Result<(), String> {
+    if change.status.installed == expected_installed
+        && (expected_installed || change.status.state == "not_installed")
+    {
+        Ok(())
+    } else {
+        Err(change.status.message.clone())
+    }
+}
+
 async fn run_background<T, F>(operation: F) -> Result<T, String>
 where
     T: Send + 'static,
@@ -346,30 +479,45 @@ where
 }
 
 fn build_integration_status(requires_restart: bool) -> IntegrationStatusView {
-    build_integration_status_with_companions(None, None, requires_restart)
+    build_integration_status_with_companions(None, None, None, requires_restart)
 }
 
 fn build_integration_status_with_companion(
     companion_status: CompanionStatus,
     requires_restart: bool,
 ) -> IntegrationStatusView {
-    build_integration_status_with_companions(Some(companion_status), None, requires_restart)
+    build_integration_status_with_companions(Some(companion_status), None, None, requires_restart)
+}
+
+fn build_integration_status_with_cursor_companion(
+    companion_status: CompanionStatus,
+    requires_restart: bool,
+) -> IntegrationStatusView {
+    build_integration_status_with_companions(None, Some(companion_status), None, requires_restart)
 }
 
 fn build_integration_status_with_antigravity_ide_companion(
     companion_status: CompanionStatus,
     requires_restart: bool,
 ) -> IntegrationStatusView {
-    build_integration_status_with_companions(None, Some(companion_status), requires_restart)
+    build_integration_status_with_companions(None, None, Some(companion_status), requires_restart)
 }
 
 fn build_integration_status_with_companions(
     companion_status: Option<CompanionStatus>,
+    cursor_status: Option<CompanionStatus>,
     antigravity_ide_status: Option<CompanionStatus>,
     requires_restart: bool,
 ) -> IntegrationStatusView {
     let companion_status = companion_status
         .unwrap_or_else(|| companion_integration::companion_status(OsStr::new(&code_command())));
+    let cursor_status = cursor_status.unwrap_or_else(|| {
+        companion_integration::companion_status_for_editor(
+            OsStr::new(&cursor_command()),
+            "Cursor",
+            companion_integration::CURSOR_PROFILE_ENV,
+        )
+    });
     let antigravity_ide_status = antigravity_ide_status.unwrap_or_else(|| {
         companion_integration::companion_status_for_editor(
             OsStr::new(&antigravity_ide_command()),
@@ -378,14 +526,18 @@ fn build_integration_status_with_companions(
         )
     });
     let companion = companion_view(companion_status);
+    let cursor_companion = companion_view_for(cursor_status, "Cursor");
     let antigravity_ide = companion_view_for(antigravity_ide_status, "Antigravity IDE");
+    let cursor = cursor_view();
     let antigravity = antigravity_view();
     let codex = codex_view();
     let claude = claude_view();
     IntegrationStatusView {
         schema_version: INTEGRATION_SCHEMA_VERSION,
         companion,
+        cursor_companion,
         antigravity_ide,
+        cursor,
         antigravity,
         codex,
         claude,
@@ -596,6 +748,50 @@ fn unavailable_claude_view(error: String, config_path: Option<String>) -> Lifecy
     }
 }
 
+fn cursor_view() -> LifecycleIntegrationView {
+    let config_dir = match cursor_integration::cursor_config_dir_from_environment() {
+        Ok(path) => path,
+        Err(error) => return unavailable_cursor_view(error, None),
+    };
+    let config_path = Some(config_dir.join("hooks.json").to_string_lossy().into_owned());
+    let executable = match integration_executable() {
+        Ok(path) => path,
+        Err(error) => return unavailable_cursor_view(error, config_path),
+    };
+    match cursor_integration::cursor_integration_status(&config_dir, &executable) {
+        Ok(status) => {
+            let (state, label) = match status.state.as_str() {
+                "installed" => ("installed", "Installed"),
+                "not_installed" => ("not_installed", "Not installed"),
+                "stale" => ("repair_needed", "Update available"),
+                "partial" => ("repair_needed", "Repair needed"),
+                _ => ("unavailable", "Status unavailable"),
+            };
+            LifecycleIntegrationView {
+                state: state.to_string(),
+                label: label.to_string(),
+                detail: status.message,
+                config_path: Some(status.config_path),
+                review_required: None,
+            }
+        }
+        Err(error) => unavailable_cursor_view(
+            format!("VSParallel could not safely read the Cursor hook configuration: {error}"),
+            config_path,
+        ),
+    }
+}
+
+fn unavailable_cursor_view(error: String, config_path: Option<String>) -> LifecycleIntegrationView {
+    LifecycleIntegrationView {
+        state: "unavailable".to_string(),
+        label: "Status unavailable".to_string(),
+        detail: error,
+        config_path,
+        review_required: None,
+    }
+}
+
 fn antigravity_view() -> LifecycleIntegrationView {
     let config_dir = match antigravity_integration::antigravity_config_dir_from_environment() {
         Ok(path) => path,
@@ -783,7 +979,7 @@ fn validate_macos_integration_location(path: &Path) -> Result<(), String> {
     );
     if mounted_volume || app_translocation {
         return Err(
-            "VSParallel is running from a temporary macOS location. Copy VSParallel.app to /Applications, relaunch it there, then use Repair for the Antigravity, Codex, and Claude Code lifecycle integrations."
+            "VSParallel is running from a temporary macOS location. Copy VSParallel.app to /Applications, relaunch it there, then use Repair for the affected editor companions and Cursor, Antigravity, Codex, or Claude Code lifecycle integrations."
                 .to_string(),
         );
     }
@@ -2289,8 +2485,13 @@ pub fn run() {
             get_integration_status,
             install_companion,
             uninstall_companion,
+            install_cursor_companion,
+            install_cursor_monitoring,
+            uninstall_cursor_companion,
             install_antigravity_ide_companion,
             uninstall_antigravity_ide_companion,
+            install_cursor_hooks,
+            uninstall_cursor_hooks,
             install_codex_hooks,
             uninstall_codex_hooks,
             install_claude_hooks,
@@ -2331,7 +2532,7 @@ mod tests {
         CompanionStatus {
             state,
             extension_id: companion_integration::EXTENSION_ID.to_string(),
-            bundled_version: Some("0.4.0".to_string()),
+            bundled_version: Some("0.4.1".to_string()),
             installed_version: None,
             detail: None,
         }
@@ -2630,6 +2831,10 @@ mod tests {
             "code-insiders.cmd"
         ));
         assert!(windows_editor_process_matches("VSCodium.exe", "codium"));
+        assert!(windows_editor_process_matches(
+            r#"C:\Users\dev\AppData\Local\Programs\cursor\Cursor.exe"#,
+            "cursor.exe"
+        ));
         assert!(!windows_editor_process_matches("Codex.exe", "code"));
         assert!(!windows_editor_process_matches("", "code"));
     }
@@ -2643,11 +2848,11 @@ mod tests {
     #[test]
     fn maps_companion_states_to_the_versioned_setup_contract() {
         let current = companion_view(CompanionStatus {
-            installed_version: Some("0.4.0".to_string()),
+            installed_version: Some("0.4.1".to_string()),
             ..companion_status(CompanionStatusState::Current)
         });
         assert_eq!(current.state, "installed");
-        assert_eq!(current.target_version.as_deref(), Some("0.4.0"));
+        assert_eq!(current.target_version.as_deref(), Some("0.4.1"));
 
         assert_eq!(
             companion_view(companion_status(CompanionStatusState::DifferentVersion)).state,
@@ -2712,6 +2917,63 @@ mod tests {
         };
         let error = verified_companion_status(result).unwrap_err();
         assert!(error.contains("verification failed"));
+    }
+
+    #[test]
+    fn cursor_monitoring_installs_companion_before_hooks_and_reports_partial_failures() {
+        use std::cell::Cell;
+
+        let cursor_change = |state: &str, installed: bool, message: &str| {
+            cursor_integration::CursorIntegrationChange {
+                changed: false,
+                migrated: false,
+                status: cursor_integration::CursorIntegrationStatus {
+                    state: state.to_string(),
+                    installed,
+                    config_path: "/config/hooks.json".to_string(),
+                    backup_path: "/config/hooks.json.vsparallel.bak".to_string(),
+                    event_states: std::collections::BTreeMap::new(),
+                    message: message.to_string(),
+                },
+            }
+        };
+
+        let hooks_called = Cell::new(false);
+        let error = install_cursor_monitoring_components(
+            || Err("Cursor companion installation failed".to_string()),
+            || {
+                hooks_called.set(true);
+                Ok(cursor_change("installed", true, "installed"))
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("companion installation failed"));
+        assert!(!hooks_called.get());
+
+        let error = install_cursor_monitoring_components(
+            || Ok(companion_status(CompanionStatusState::Current)),
+            || Err("hooks.json is read-only".to_string()),
+        )
+        .unwrap_err();
+        assert!(error.contains("companion was installed"));
+        assert!(error.contains("could not be configured"));
+        assert!(error.contains("read-only"));
+
+        let error = install_cursor_monitoring_components(
+            || Ok(companion_status(CompanionStatusState::Current)),
+            || Ok(cursor_change("partial", false, "one handler is missing")),
+        )
+        .unwrap_err();
+        assert!(error.contains("companion was installed"));
+        assert!(error.contains("could not be verified"));
+        assert!(error.contains("one handler is missing"));
+
+        let status = install_cursor_monitoring_components(
+            || Ok(companion_status(CompanionStatusState::Current)),
+            || Ok(cursor_change("installed", true, "installed")),
+        )
+        .unwrap();
+        assert_eq!(status.state, CompanionStatusState::Current);
     }
 
     #[test]
@@ -2791,7 +3053,7 @@ mod tests {
     }
 
     #[test]
-    fn setup_contract_serializes_both_optional_lifecycle_integrations() {
+    fn setup_contract_serializes_all_editor_and_lifecycle_integrations() {
         let lifecycle = LifecycleIntegrationView {
             state: "not_installed".to_string(),
             label: "Not installed".to_string(),
@@ -2804,10 +3066,15 @@ mod tests {
         let status = IntegrationStatusView {
             schema_version: INTEGRATION_SCHEMA_VERSION,
             companion: companion_view(companion_status(CompanionStatusState::NotInstalled)),
+            cursor_companion: companion_view_for(
+                companion_status(CompanionStatusState::NotInstalled),
+                "Cursor",
+            ),
             antigravity_ide: companion_view_for(
                 companion_status(CompanionStatusState::NotInstalled),
                 "Antigravity IDE",
             ),
+            cursor: lifecycle.clone(),
             antigravity: lifecycle.clone(),
             codex,
             claude: lifecycle,
@@ -2821,7 +3088,9 @@ mod tests {
         assert!(serialized["claude"]["reviewRequired"].is_null());
         assert_eq!(serialized["claude"]["state"], "not_installed");
         assert!(serialized["companion"].is_object());
+        assert!(serialized["cursorCompanion"].is_object());
         assert!(serialized["antigravityIde"].is_object());
+        assert_eq!(serialized["cursor"]["state"], "not_installed");
         assert_eq!(serialized["antigravity"]["state"], "not_installed");
     }
 }

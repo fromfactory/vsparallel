@@ -6,7 +6,7 @@
     <meta name="color-scheme" content="dark light" />
     <meta
       name="description"
-      content="A compact local overview of VS Code and Antigravity workspaces with coarse agent activity."
+      content="A compact local overview of VS Code, Cursor, and Antigravity workspaces with coarse agent activity."
     />
     <title>VSParallel</title>
     <link rel="icon" type="image/png" href="vsparallel-icon.png" />
@@ -277,18 +277,27 @@
             <span class="empty-state__mark" aria-hidden="true">◇</span>
             <h3>No workspaces detected</h3>
             <p>
-              Open a folder in VS Code or Antigravity IDE with its VSParallel companion enabled.
-              For built-in model activity, install Antigravity hooks and start an agent turn in a
-              saved Antigravity 2.0 Project or Antigravity IDE workspace; opening it alone does
-              not fire a hook.
+              Open a folder in VS Code, Cursor, or Antigravity IDE with its VSParallel companion
+              enabled. Cursor hooks can also record a recent workspace open, but only the companion
+              reports a live, focused, or openable window. Start a turn in Cursor's Agents Window or
+              an Antigravity workspace to see agent activity.
             </p>
-            <button class="quiet-button" id="emptyRefreshButton" type="button">
-              <svg class="button-icon" viewBox="0 0 16 16" aria-hidden="true">
-                <path d="M13.1 5.15A5.5 5.5 0 1 0 13.38 10" />
-                <path d="M13.1 2.8v2.7h-2.7" />
-              </svg>
-              Check again
-            </button>
+            <div class="empty-state__actions">
+              <button
+                class="setup-button setup-button--primary"
+                id="emptySetupButton"
+                type="button"
+              >
+                Open setup
+              </button>
+              <button class="quiet-button" id="emptyRefreshButton" type="button">
+                <svg class="button-icon" viewBox="0 0 16 16" aria-hidden="true">
+                  <path d="M13.1 5.15A5.5 5.5 0 1 0 13.38 10" />
+                  <path d="M13.1 2.8v2.7h-2.7" />
+                </svg>
+                Check again
+              </button>
+            </div>
           </div>
         </section>
       </main>
@@ -400,9 +409,9 @@
                 <div>
                   <h3 id="integrationHeading">Integrations</h3>
                   <p id="integrationDescription">
-                    Install at least one editor companion—VS Code or Antigravity IDE—to track
-                    live workspaces. Activity hooks and usage are separate. Hooks report lifecycle
-                    status; usage comes from the provider sources described below.
+                    Install at least one editor companion—VS Code, Cursor, or Antigravity IDE—to
+                    track live workspaces. Activity hooks and usage are separate. Hooks report
+                    lifecycle status; usage comes from the provider sources described below.
                   </p>
                 </div>
                 <button
@@ -456,6 +465,58 @@
                   </div>
                 </article>
 
+                <article class="integration-card" id="cursorCompanionCard">
+                  <div class="integration-card__header">
+                    <div class="integration-card__identity">
+                      <svg class="integration-card__icon" viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M5 4.5 19 12 5 19.5V4.5Z" />
+                        <path d="m8.5 9 5 3-5 3V9Z" />
+                      </svg>
+                      <div>
+                        <h4>Cursor companion</h4>
+                        <p class="integration-detail" id="cursorCompanionDetail">
+                          Checking the Cursor companion…
+                        </p>
+                      </div>
+                    </div>
+                    <span
+                      class="integration-status"
+                      id="cursorCompanionStatus"
+                      data-state="checking"
+                    >
+                      Checking…
+                    </span>
+                  </div>
+                  <p class="integration-meta" id="cursorCompanionMeta" hidden></p>
+                  <p class="integration-activity-limitation" role="note">
+                    <strong>Live Cursor IDE and recent agent activity.</strong>
+                    Setup installs or repairs the Cursor companion and activity hooks together.
+                    Reload Cursor IDE windows before live heartbeats begin. The Agents Window remains
+                    hook-only and can report recent activity, not a live or openable window.
+                    Uninstalling the companion removes live IDE support only; hooks are managed
+                    separately below.
+                  </p>
+                  <div class="integration-actions">
+                    <button
+                      class="setup-button setup-button--primary"
+                      id="cursorCompanionInstallButton"
+                      type="button"
+                      disabled
+                    >
+                      Set up Cursor monitoring
+                    </button>
+                    <button
+                      class="setup-button setup-button--danger"
+                      id="cursorCompanionUninstallButton"
+                      type="button"
+                      disabled
+                      hidden
+                    >
+                      Uninstall companion
+                    </button>
+                  </div>
+                </article>
+
                 <article class="integration-card" id="antigravityIdeCard">
                   <div class="integration-card__header">
                     <div class="integration-card__identity">
@@ -491,6 +552,61 @@
                     <button
                       class="setup-button setup-button--danger"
                       id="antigravityIdeUninstallButton"
+                      type="button"
+                      disabled
+                      hidden
+                    >
+                      Uninstall
+                    </button>
+                  </div>
+                </article>
+
+                <article class="integration-card" id="cursorCard">
+                  <div class="integration-card__header">
+                    <div class="integration-card__identity">
+                      <svg class="integration-card__icon" viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M5 4.5 19 12 5 19.5V4.5Z" />
+                        <circle cx="10" cy="12" r="2.5" />
+                      </svg>
+                      <div>
+                        <h4>
+                          Cursor hooks only
+                          <span class="optional-label">Optional</span>
+                        </h4>
+                        <p class="integration-detail" id="cursorDetail">
+                          Checking documented Cursor hooks…
+                        </p>
+                      </div>
+                    </div>
+                    <span class="integration-status" id="cursorStatus" data-state="checking">
+                      Checking…
+                    </span>
+                  </div>
+                  <p class="integration-meta" id="cursorMeta" hidden></p>
+                  <p class="integration-activity-limitation" role="note">
+                    <strong>Recent activity only.</strong>
+                    These hooks cover local workspace opens and agent turns in the Cursor IDE and
+                    Agents Window. A workspaceOpen observation creates recent workspace evidence,
+                    not a live, focused, or openable window or an agent-activity card. Start a turn
+                    to see Activity detected or Turn finished. An unmatched lifecycle hook cannot
+                    identify its Cursor surface and is labeled Cursor Agent. If setup offers Update
+                    or Repair, reinstall so all five managed handlers—including workspaceOpen—are
+                    current. VSParallel records workspace roots and bounded agent/model identifiers
+                    when Cursor reports them, but never prompt or response content. Cloud agents are
+                    not covered; remote events are omitted because this release has no remote bridge.
+                  </p>
+                  <div class="integration-actions">
+                    <button
+                      class="setup-button setup-button--primary"
+                      id="cursorInstallButton"
+                      type="button"
+                      disabled
+                    >
+                      Install hooks only
+                    </button>
+                    <button
+                      class="setup-button setup-button--danger"
+                      id="cursorUninstallButton"
                       type="button"
                       disabled
                       hidden
@@ -581,7 +697,7 @@
                     <strong>Usage remaining is separate.</strong>
                     For live usage, VSParallel needs a compatible, signed-in Codex CLI available
                     to this app, either from a standalone installation or the locally installed
-                    Codex extension in VS Code or Antigravity IDE.
+                    Codex extension in VS Code, Cursor, or Antigravity IDE.
                   </p>
                   <div class="trust-guidance" id="codexTrustGuidance" role="note" hidden>
                     <strong>Review required</strong>
@@ -634,8 +750,8 @@
                     <strong>Usage remaining is separate.</strong>
                     For live usage, VSParallel needs a compatible, signed-in Claude Code CLI
                     available to this app, either from a standalone installation or the locally
-                    installed Claude Code extension in VS Code or Antigravity IDE. A recent terminal status-line capture
-                    can also provide fallback usage.
+                    installed Claude Code extension in VS Code, Cursor, or Antigravity IDE. A
+                    recent terminal status-line capture can also provide fallback usage.
                   </p>
                   <div class="integration-actions">
                     <button
@@ -666,8 +782,8 @@
                 </svg>
                 <span>
                   Reload affected editor windows and restart provider sessions to apply changes.
-                  Antigravity 2.0 and Antigravity IDE report hook activity only after a new agent
-                  turn.
+                  Cursor, Antigravity 2.0, and Antigravity IDE report hook activity only after a
+                  new agent turn.
                 </span>
               </div>
 

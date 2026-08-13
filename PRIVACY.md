@@ -22,10 +22,16 @@ so the subprocess can authenticate without VSParallel reading a credential.
 The temporary directory is removed when the query ends.
 
 VSParallel does not extract, log, store, or transmit prompts, responses, source
-files, terminal contents, transcripts, or Git data. Optional lifecycle hooks
+files, terminal contents, transcripts, or Git data. Optional hook integrations
 receive documented provider event payloads and construct new records containing
-only five core fields: a schema version, one-way session/conversation key,
-local workspace path, coarse state, and timestamp. Antigravity activity records
+only five core fields: a schema version, one-way key, local workspace path,
+coarse state, and timestamp. Cursor `workspaceOpen` records derive their key
+deterministically from the normalized path and contain no session identity or
+agent/model metadata. Cursor lifecycle records may also include bounded
+`modelName` and `agentKind` strings selected from Cursor's native user-hook
+payload. Values that are empty or exceed 128 bytes are
+omitted; model labels must use a narrow ASCII-safe character set and agent
+labels must be one of four closed values. Antigravity activity records
 may add one optional closed `modelKind` classification from hook `modelName` or
 the bounded current-model enum in the IDE conversation's latest user-input
 step, with bounded execution metadata and the last-selected-model preference as
@@ -47,12 +53,12 @@ To show its workspace overview, VSParallel stores the following metadata on the
 current device:
 
 - local workspace or `.code-workspace` paths, display names, the closed
-  `vscode` or `antigravity_ide` editor value, focus state, and heartbeat
-  timestamps reported by the companion;
+  `vscode`, `cursor`, or `antigravity_ide` editor value, focus state, and
+  heartbeat timestamps reported by the companion;
 - whether the configured Codex and Claude Code extensions are installed and
-  active in each VS Code or Antigravity IDE window, whether the window is
-  remote, and, when known, whether an installed extension runs in the local or
-  remote extension host;
+  active in each VS Code, Cursor, or Antigravity IDE window, whether the window
+  is remote, and, when known, whether an installed extension runs in the local
+  or remote extension host;
 - Codex and Claude coarse lifecycle state, a one-way hash of the provider
   session identifier, working directory, and timestamp when optional lifecycle
   hooks are installed;
@@ -60,6 +66,14 @@ current device:
   `antigravity-ide/`, containing the five core fields above and, when
   recognized, an optional closed `modelKind` and opaque `ideModelRevision`,
   with one record per documented local `workspacePaths` entry;
+- Cursor native-hook activity records under `cursor/`, containing the five
+  core fields and optional bounded `modelName` and `agentKind`, with records
+  created only for usable local paths in the `workspace_roots` values Cursor
+  supplies;
+- Cursor `workspaceOpen` observations under the same directory, containing a
+  deterministic path-derived one-way key, one normalized local workspace path,
+  fixed state `workspace_opened`, and a timestamp, but no conversation/session
+  identity or agent/model label;
 - for IDE hook activity only, metadata for the latest `USER_INPUT` row in the
   local Antigravity IDE conversation database selected directly from the
   validated hook `conversationId`, or hash-matched in memory during a desktop
@@ -97,10 +111,48 @@ name, authority, hostname, address, or account identity, and the desktop app
 does not connect to the remote host to read provider state. Lifecycle hooks and
 live usage queries remain local to the machine on which they run.
 
-The bundled companion gives VS Code and Antigravity IDE the same exact-window
-tracking. A heartbeat's editor field is a closed value and cannot inject an
-executable path; opening uses the corresponding command configured locally in
-VSParallel. Antigravity 2.0 does not host this companion. Its documented global
+The bundled companion gives VS Code, Cursor IDE, and Antigravity IDE live
+window tracking. A heartbeat's editor field is a closed value and cannot inject
+an executable path; opening uses the corresponding command configured locally
+in VSParallel. Cursor's separate Agents Window does not activate the third-party
+companion and remains hook-only. Antigravity 2.0 does not host this companion.
+
+Cursor's native `workspaceOpen`, `sessionStart`, `beforeSubmitPrompt`, `stop`,
+and `sessionEnd` user hooks in `~/.cursor/hooks.json` can execute for local
+Cursor surfaces, including the Cursor IDE and Agents Window. `workspaceOpen`
+admits only valid local paths from `workspace_roots`; it requires no
+conversation/session identity, ignores all other fields, and stores one
+path-derived `workspace_opened` observation per normalized root. `sessionStart`
+may supply the bounded composer/background fields used for the closed agent
+label, but its record is metadata-only and does not itself appear as activity.
+These hooks do not identify a native window or prove liveness, focus, or an open
+target, and they do not identify whether an unmatched event came from the IDE,
+Agents Window, or Cursor CLI. VSParallel does not scan Cursor processes or
+native-window internals; live state comes only from companion heartbeats. For
+the four lifecycle events, it admits a bounded
+conversation/session identity only long enough to hash it, usable local paths
+from `workspace_roots`, the minimum fields required to choose a coarse state,
+and optional bounded model/agent labels. The raw identity is discarded.
+Pathless events are omitted. Prompts, responses, email fields, transcripts,
+token data, error text, and all other unselected payload fields are discarded.
+An unmatched workspace-open observation appears in **Recent** as a generic
+non-live, non-focused, non-openable Cursor workspace row with no activity card.
+An unmatched lifecycle record appears as a generic recent **Cursor Agent** row
+with the same non-live limitations. Exactly one matching Cursor IDE companion
+heartbeat owns either observation instead; multiple matching windows leave it
+generic rather than guessing an owner.
+
+The primary **Set up Cursor monitoring** action installs or repairs both the
+Cursor IDE companion and these native hooks. The separate hooks-only action
+changes only `~/.cursor/hooks.json` and provides no live-window monitoring.
+
+The exact, case-sensitive environment value `CURSOR_CODE_REMOTE=true`
+suppresses all Cursor hook-record persistence because this release has no
+remote-host bridge. The adapter still returns `{}` and exits successfully, so
+it remains fail-open. Cursor user hooks are not available to cloud agents, so
+cloud-only activity is not represented.
+
+Antigravity 2.0's documented global
 hooks at `~/.gemini/config/hooks.json` are shared with Antigravity IDE and the
 Antigravity CLI. Their documented transcript roots identify the product
 surface, but do not expose a native window identity, liveness, or focus, and no
@@ -159,13 +211,15 @@ cache's managed refresh is disabled, and an existing record may remain visible
 as stale.
 
 For Codex and Claude, VSParallel can try the executable on `PATH` and the binary
-bundled with the corresponding locally installed VS Code or Antigravity IDE
-extension. To locate a bundled executable, it first asks the configured
-`VSPARALLEL_CODE_COMMAND` and `VSPARALLEL_ANTIGRAVITY_IDE_COMMAND` launchers.
+bundled with the corresponding locally installed VS Code, Cursor, or
+Antigravity IDE extension. To locate a bundled executable, it first asks the configured
+`VSPARALLEL_CODE_COMMAND`, `VSPARALLEL_CURSOR_COMMAND`, and
+`VSPARALLEL_ANTIGRAVITY_IDE_COMMAND` launchers.
 As a bounded fallback, it reads only the exact provider entries in
 `~/.vscode/extensions/extensions.json`,
 `~/.vscode-insiders/extensions/extensions.json`,
-`~/.vscode-oss/extensions/extensions.json`, and
+`~/.vscode-oss/extensions/extensions.json`,
+`~/.cursor/extensions/extensions.json`, and
 `~/.antigravity-ide/extensions/extensions.json`. A resolved path may be cached
 in process memory but is not persisted. Explicit executables selected with
 `VSPARALLEL_CODEX_COMMAND` or `VSPARALLEL_CLAUDE_COMMAND` are used literally.
@@ -177,14 +231,21 @@ bodies in each record directory and reports omissions in diagnostics. Directory
 enumeration still considers every entry when selecting those records, and old
 records are not deleted automatically.
 
-Before VSParallel changes Antigravity, Codex, or Claude Code hook configuration,
-or installs its owned Claude Code status line, it creates a private, one-time
+Before VSParallel changes Cursor, Antigravity, Codex, or Claude Code hook
+configuration, or installs its owned Claude Code status line, it creates a private, one-time
 backup of the entire original configuration file. That backup can therefore
 contain unrelated settings, custom status-line commands, environment values, or
 secrets that were already present in the provider configuration. On Unix,
 VSParallel creates these files with owner-only permissions. Antigravity
 installation merges one top-level entry named `vsparallel`; removal deletes
-only an entry it recognizes as its own. Integration removal preserves every
+only an entry it recognizes as its own. Cursor installation merges one exact
+VSParallel-owned handler into each of the native `workspaceOpen`,
+`sessionStart`, `beforeSubmitPrompt`, `stop`, and `sessionEnd` arrays; removal
+recognizes only exact current handlers or strict, safely parsed historical
+VSParallel handlers, including the prior four-handler set, leaving modified
+lookalikes untouched. Setup reports that prior set as needing an update or
+repair so reinstalling can add `workspaceOpen`. A Cursor configuration that is
+not strict UTF-8 JSON is left unchanged. Integration removal preserves every
 backup so that it cannot destroy user data.
 
 To erase VSParallel data, first uninstall its integrations in the application,
@@ -195,6 +256,7 @@ shown in Setup diagnostics and, if no longer needed, these backup files:
   `~/.codex/hooks.json.vsparallel.bak`)
 - `$CLAUDE_CONFIG_DIR/settings.json.vsparallel.bak` (normally
   `~/.claude/settings.json.vsparallel.bak`)
+- `~/.cursor/hooks.json.vsparallel.bak`
 - `~/.gemini/config/hooks.json.vsparallel.bak`
 
 Deleting those files is optional and should be done only after confirming the

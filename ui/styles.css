@@ -923,6 +923,12 @@ main {
   color: var(--accent-text-strong);
 }
 
+.workspace-application[data-editor="cursor"] {
+  border-color: var(--green-border);
+  background: var(--green-soft);
+  color: var(--green-text);
+}
+
 .workspace-application[data-editor="antigravity_2"],
 .workspace-application[data-editor="antigravity_ide"] {
   border-color: transparent;
@@ -1153,6 +1159,13 @@ main {
   margin: 5px auto 14px;
   color: var(--text-muted);
   font-size: 11px;
+}
+
+.empty-state__actions {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
 }
 
 .app-shell {

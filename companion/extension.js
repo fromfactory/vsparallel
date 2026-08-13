@@ -9,6 +9,7 @@ const SCHEMA_VERSION = 1;
 const HEARTBEAT_INTERVAL_MS = 3_000;
 const EDITOR_KINDS = Object.freeze({
   vscode: "vscode",
+  cursor: "cursor",
   antigravityIde: "antigravity_ide",
 });
 const AGENT_EXTENSION_IDS = Object.freeze({
@@ -42,6 +43,9 @@ function detectEditor(vscode) {
   }
 
   const uriScheme = environmentString(environment, "uriScheme")?.toLowerCase();
+  if (uriScheme === "cursor") {
+    return EDITOR_KINDS.cursor;
+  }
   if (uriScheme === "antigravity" || uriScheme === "antigravity-ide") {
     return EDITOR_KINDS.antigravityIde;
   }
@@ -50,6 +54,9 @@ function detectEditor(vscode) {
   }
 
   const appName = environmentString(environment, "appName")?.toLowerCase();
+  if (appName === "cursor") {
+    return EDITOR_KINDS.cursor;
+  }
   if (appName === "antigravity" || appName === "antigravity ide") {
     return EDITOR_KINDS.antigravityIde;
   }

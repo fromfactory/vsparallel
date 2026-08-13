@@ -16,6 +16,7 @@ pub const ACTIVITY_STALE_MS: i64 = 24 * 60 * 60 * 1_000;
 const MAX_RECORD_BYTES: u64 = 64 * 1024;
 const MAX_RECORD_CANDIDATES_PER_DIRECTORY: usize = 4_096;
 const MAX_FUTURE_SKEW_MS: i64 = 5 * 60 * 1_000;
+const MAX_CURSOR_METADATA_BYTES: usize = 128;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -60,6 +61,8 @@ struct AgentExtensionsRecord {
 enum CompanionEditorKind {
     #[serde(rename = "vscode")]
     VsCode,
+    #[serde(rename = "cursor")]
+    Cursor,
     #[serde(rename = "antigravity_ide")]
     AntigravityIde,
 }
@@ -68,6 +71,7 @@ impl From<CompanionEditorKind> for EditorKind {
     fn from(value: CompanionEditorKind) -> Self {
         match value {
             CompanionEditorKind::VsCode => Self::VsCode,
+            CompanionEditorKind::Cursor => Self::Cursor,
             CompanionEditorKind::AntigravityIde => Self::AntigravityIde,
         }
     }
@@ -100,22 +104,31 @@ pub(crate) struct InstanceRecord {
 #[serde(rename_all = "camelCase")]
 struct ActivityRecord {
     schema_version: u32,
-    #[allow(dead_code)]
     session_key: String,
     cwd: String,
     #[serde(skip)]
     normalized_cwd: PathBuf,
+    #[serde(skip)]
+    cursor_instance_id: Option<String>,
     state: ActivityRecordState,
     changed_at_ms: i64,
     #[serde(default)]
     model_kind: Option<AntigravityModelKind>,
     #[serde(default)]
     ide_model_revision: Option<String>,
+    #[serde(default)]
+    model_name: Option<String>,
+    #[serde(default)]
+    agent_kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum ActivityRecordState {
+    // Cursor emits this editor/workspace observation before any agent turn. It
+    // may establish a recent path, but never lifecycle or window liveness.
+    WorkspaceOpened,
+    SessionStarted,
     ActivityDetected,
     TurnFinished,
     SessionEnded,
@@ -133,6 +146,10 @@ pub struct ActivityView {
     pub detail: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_kind: Option<AntigravityModelKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_kind: Option<String>,
     pub extension_detection_available: Option<bool>,
     pub extension_installed: Option<bool>,
     pub extension_active: Option<bool>,
@@ -155,6 +172,7 @@ pub struct WorkspaceView {
     pub last_seen_at_ms: i64,
     pub started_at_ms: i64,
     pub antigravity: Option<ActivityView>,
+    pub cursor: Option<ActivityView>,
     pub codex: ActivityView,
     pub claude: ActivityView,
 }
@@ -185,6 +203,7 @@ pub struct Diagnostics {
     pub activity_stale_ms: i64,
     pub code_command: String,
     pub antigravity_ide_command: String,
+    pub cursor_command: String,
     pub valid_instance_records: usize,
     pub malformed_instance_records: usize,
     pub omitted_instance_records: usize,
@@ -197,6 +216,14 @@ pub struct Diagnostics {
     pub valid_antigravity_records: usize,
     pub malformed_antigravity_records: usize,
     pub omitted_antigravity_records: usize,
+    pub valid_cursor_records: usize,
+    pub malformed_cursor_records: usize,
+    pub omitted_cursor_records: usize,
+    pub active_cursor_instance_records: usize,
+    pub retained_cursor_instance_records: usize,
+    pub latest_cursor_instance_at_ms: Option<i64>,
+    pub recent_cursor_workspace_open_records: usize,
+    pub latest_cursor_workspace_opened_at_ms: Option<i64>,
     pub antigravity_two_hook_observed_at_ms: Option<i64>,
     pub antigravity_two_hook_event: Option<String>,
     pub antigravity_two_hook_outcome: String,
@@ -250,6 +277,7 @@ impl StateStore {
         let claude = self.load_claude(now_ms);
         let antigravity = self.load_antigravity(now_ms);
         let mut antigravity_ide = self.load_antigravity_ide(now_ms);
+        let mut cursor = self.load_cursor(now_ms);
         self.reconcile_antigravity_ide_models(&mut antigravity_ide.records, now_ms);
         let mut latest_by_id: HashMap<String, InstanceRecord> = HashMap::new();
 
@@ -271,6 +299,15 @@ impl StateStore {
             })
             .flat_map(workspace_paths)
             .collect();
+        let cursor_workspaces: Vec<(String, Vec<PathBuf>)> = latest_by_id
+            .values()
+            .filter(|record| {
+                matches!(record.editor, Some(CompanionEditorKind::Cursor))
+                    && now_ms.saturating_sub(record.last_seen_at_ms) <= STALE_RETENTION_MS
+            })
+            .map(|record| (record.instance_id.clone(), workspace_paths(record)))
+            .collect();
+        assign_cursor_heartbeat_owners(&mut cursor.records, &cursor_workspaces);
 
         let mut workspaces: Vec<_> = latest_by_id
             .into_values()
@@ -279,6 +316,7 @@ impl StateStore {
                 self.workspace_view(
                     record,
                     &antigravity_ide.records,
+                    &cursor.records,
                     &codex.records,
                     &claude.records,
                     now_ms,
@@ -292,6 +330,12 @@ impl StateStore {
             &claude.records,
             EditorKind::Antigravity2,
             &[],
+            now_ms,
+        ));
+        workspaces.extend(self.cursor_workspace_views(
+            &cursor.records,
+            &codex.records,
+            &claude.records,
             now_ms,
         ));
         workspaces.extend(self.antigravity_workspace_views(
@@ -324,12 +368,36 @@ impl StateStore {
         now_ms: i64,
         code_command: String,
         antigravity_ide_command: String,
+        cursor_command: String,
     ) -> Diagnostics {
         let instances = self.load_instances(now_ms);
         let codex = self.load_codex(now_ms);
         let claude = self.load_claude(now_ms);
         let antigravity = self.load_antigravity(now_ms);
         let antigravity_ide = self.load_antigravity_ide(now_ms);
+        let cursor = self.load_cursor(now_ms);
+        let cursor_instances = instances
+            .records
+            .iter()
+            .filter(|record| matches!(record.editor, Some(CompanionEditorKind::Cursor)));
+        let active_cursor_instance_records = cursor_instances
+            .clone()
+            .filter(|record| now_ms.saturating_sub(record.last_seen_at_ms) <= ACTIVE_TTL_MS)
+            .count();
+        let retained_cursor_instance_records = cursor_instances
+            .clone()
+            .filter(|record| now_ms.saturating_sub(record.last_seen_at_ms) <= STALE_RETENTION_MS)
+            .count();
+        let latest_cursor_instance_at_ms =
+            cursor_instances.map(|record| record.last_seen_at_ms).max();
+        let cursor_workspace_opens = cursor.records.iter().filter(|record| {
+            record.state == ActivityRecordState::WorkspaceOpened
+                && now_ms.saturating_sub(record.changed_at_ms) <= ACTIVITY_STALE_MS
+        });
+        let recent_cursor_workspace_open_records = cursor_workspace_opens.clone().count();
+        let latest_cursor_workspace_opened_at_ms = cursor_workspace_opens
+            .map(|record| record.changed_at_ms)
+            .max();
         let antigravity_hook =
             crate::antigravity_integration::antigravity_two_hook_observation(&self.root, now_ms);
         let (
@@ -372,6 +440,7 @@ impl StateStore {
             activity_stale_ms: ACTIVITY_STALE_MS,
             code_command,
             antigravity_ide_command,
+            cursor_command,
             valid_instance_records: instances.records.len(),
             malformed_instance_records: instances.malformed,
             omitted_instance_records: instances.omitted,
@@ -391,6 +460,14 @@ impl StateStore {
             omitted_antigravity_records: antigravity
                 .omitted
                 .saturating_add(antigravity_ide.omitted),
+            valid_cursor_records: cursor.records.len(),
+            malformed_cursor_records: cursor.malformed,
+            omitted_cursor_records: cursor.omitted,
+            active_cursor_instance_records,
+            retained_cursor_instance_records,
+            latest_cursor_instance_at_ms,
+            recent_cursor_workspace_open_records,
+            latest_cursor_workspace_opened_at_ms,
             antigravity_two_hook_observed_at_ms,
             antigravity_two_hook_event,
             antigravity_two_hook_outcome,
@@ -447,6 +524,7 @@ impl StateStore {
         &self,
         record: InstanceRecord,
         antigravity_records: &[ActivityRecord],
+        cursor_records: &[ActivityRecord],
         codex_records: &[ActivityRecord],
         claude_records: &[ActivityRecord],
         now_ms: i64,
@@ -487,6 +565,7 @@ impl StateStore {
             .editor
             .map(EditorKind::from)
             .unwrap_or(EditorKind::VsCode);
+        let instance_id = record.instance_id;
         let antigravity = (editor == EditorKind::AntigravityIde)
             .then(|| {
                 aggregate_activity_if_observed(
@@ -497,9 +576,19 @@ impl StateStore {
                 )
             })
             .flatten();
+        let cursor = (editor == EditorKind::Cursor)
+            .then(|| {
+                aggregate_cursor_activity_if_observed(
+                    &workspace_paths,
+                    cursor_records,
+                    Some(&instance_id),
+                    now_ms,
+                )
+            })
+            .flatten();
 
         WorkspaceView {
-            instance_id: record.instance_id,
+            instance_id,
             editor,
             editor_name: editor.display_name().to_string(),
             name,
@@ -512,6 +601,7 @@ impl StateStore {
             last_seen_at_ms: record.last_seen_at_ms,
             started_at_ms: record.started_at_ms,
             antigravity,
+            cursor,
             codex: aggregate_activity(
                 "Codex",
                 &workspace_paths,
@@ -592,6 +682,93 @@ impl StateStore {
                         records,
                         now_ms,
                     ),
+                    cursor: None,
+                    codex: aggregate_activity(
+                        "Codex",
+                        &workspace_paths,
+                        codex_records,
+                        None,
+                        None,
+                        false,
+                        now_ms,
+                    ),
+                    claude: aggregate_activity(
+                        "Claude Code",
+                        &workspace_paths,
+                        claude_records,
+                        None,
+                        None,
+                        false,
+                        now_ms,
+                    ),
+                }
+            })
+            .collect()
+    }
+
+    fn cursor_workspace_views(
+        &self,
+        records: &[ActivityRecord],
+        codex_records: &[ActivityRecord],
+        claude_records: &[ActivityRecord],
+        now_ms: i64,
+    ) -> Vec<WorkspaceView> {
+        let mut newest_by_path: HashMap<PathBuf, &ActivityRecord> = HashMap::new();
+        for record in records.iter().filter(|record| {
+            record.state != ActivityRecordState::SessionStarted
+                && record.cursor_instance_id.is_none()
+                && now_ms.saturating_sub(record.changed_at_ms) <= ACTIVITY_STALE_MS
+        }) {
+            match newest_by_path.get(&record.normalized_cwd) {
+                Some(existing) if existing.changed_at_ms >= record.changed_at_ms => {}
+                _ => {
+                    newest_by_path.insert(record.normalized_cwd.clone(), record);
+                }
+            }
+        }
+
+        newest_by_path
+            .into_iter()
+            .map(|(path, newest)| {
+                let workspace_paths = vec![path.clone()];
+                let cursor =
+                    aggregate_cursor_activity_if_observed(&workspace_paths, records, None, now_ms);
+                let lifecycle_observed = cursor.is_some();
+                let name = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| "Cursor project".to_string());
+                WorkspaceView {
+                    instance_id: format!(
+                        "{}:{}",
+                        if lifecycle_observed {
+                            "cursor-agent"
+                        } else {
+                            "cursor-workspace"
+                        },
+                        stable_path_key(&path)
+                    ),
+                    editor: EditorKind::Cursor,
+                    editor_name: if lifecycle_observed {
+                        "Cursor Agent".to_string()
+                    } else {
+                        "Cursor".to_string()
+                    },
+                    name,
+                    path: Some(path.to_string_lossy().into_owned()),
+                    openable: false,
+                    active: false,
+                    focused: false,
+                    // A workspaceOpen observation is presence metadata, not
+                    // agent activity. Real lifecycle records retain the
+                    // historical hook-only recent-activity affordance.
+                    recently_active: lifecycle_observed,
+                    remote_window: false,
+                    last_seen_at_ms: newest.changed_at_ms,
+                    started_at_ms: newest.changed_at_ms,
+                    antigravity: None,
+                    cursor,
                     codex: aggregate_activity(
                         "Codex",
                         &workspace_paths,
@@ -646,6 +823,10 @@ impl StateStore {
         self.load_activity("antigravity-ide", now_ms)
     }
 
+    fn load_cursor(&self, now_ms: i64) -> LoadResult<ActivityRecord> {
+        self.load_activity("cursor", now_ms)
+    }
+
     fn reconcile_antigravity_ide_models(&self, records: &mut [ActivityRecord], now_ms: i64) {
         let Some(directory) = self.antigravity_ide_conversations.as_deref() else {
             return;
@@ -687,11 +868,16 @@ impl StateStore {
 
     fn load_activity(&self, provider: &str, now_ms: i64) -> LoadResult<ActivityRecord> {
         let supports_model = matches!(provider, "antigravity" | "antigravity-ide");
+        let supports_cursor_metadata = provider == "cursor";
         load_records(&self.root.join(provider), |record: &mut ActivityRecord| {
             if record.schema_version != SCHEMA_VERSION
                 || record.session_key.trim().is_empty()
                 || record.session_key.len() > 128
                 || !valid_timestamp(record.changed_at_ms, now_ms)
+                || (matches!(
+                    record.state,
+                    ActivityRecordState::WorkspaceOpened | ActivityRecordState::SessionStarted
+                ) && !supports_cursor_metadata)
             {
                 return false;
             }
@@ -711,6 +897,19 @@ impl StateStore {
                     .is_some_and(|revision| !valid_sha256_token(revision))
             {
                 record.ide_model_revision = None;
+            }
+            if supports_cursor_metadata {
+                record.model_name = record
+                    .model_name
+                    .take()
+                    .and_then(normalized_cursor_model_name);
+                record.agent_kind = record
+                    .agent_kind
+                    .take()
+                    .and_then(normalized_cursor_agent_kind);
+            } else {
+                record.model_name = None;
+                record.agent_kind = None;
             }
             true
         })
@@ -782,6 +981,28 @@ fn valid_sha256_token(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn normalized_cursor_model_name(value: String) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty()
+        && value.len() <= MAX_CURSOR_METADATA_BYTES
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'-' | b'_' | b'.' | b'/' | b':' | b'+' | b'(' | b')' | b' ' | b','
+                )
+        }))
+    .then(|| value.to_string())
+}
+
+fn normalized_cursor_agent_kind(value: String) -> Option<String> {
+    matches!(
+        value.as_str(),
+        "Background agent" | "Agent" | "Ask" | "Edit"
+    )
+    .then_some(value)
 }
 
 fn load_records<T, F>(directory: &Path, validate: F) -> LoadResult<T>
@@ -986,6 +1207,23 @@ fn stable_path_key(path: &Path) -> String {
     format!("{:016x}", hasher.finish())
 }
 
+fn assign_cursor_heartbeat_owners(
+    records: &mut [ActivityRecord],
+    cursor_workspaces: &[(String, Vec<PathBuf>)],
+) {
+    for record in records {
+        let mut matching = cursor_workspaces.iter().filter(|(_, workspace_paths)| {
+            workspace_paths
+                .iter()
+                .any(|workspace| path_is_within(&record.normalized_cwd, workspace))
+        });
+        record.cursor_instance_id = match (matching.next(), matching.next()) {
+            (Some((instance_id, _)), None) => Some(instance_id.clone()),
+            _ => None,
+        };
+    }
+}
+
 fn aggregate_activity_if_observed(
     provider: &str,
     workspace_paths: &[PathBuf],
@@ -1012,6 +1250,30 @@ fn aggregate_activity_if_observed(
         })
 }
 
+fn aggregate_cursor_activity_if_observed(
+    workspace_paths: &[PathBuf],
+    records: &[ActivityRecord],
+    instance_id: Option<&str>,
+    now_ms: i64,
+) -> Option<ActivityView> {
+    let matching: Vec<_> = records
+        .iter()
+        .filter(|record| {
+            // Neither workspaceOpen nor sessionStart says that an agent turn
+            // has begun. They must not become an ActivityView.
+            !matches!(
+                record.state,
+                ActivityRecordState::WorkspaceOpened | ActivityRecordState::SessionStarted
+            ) && record.cursor_instance_id.as_deref() == instance_id
+                && workspace_paths
+                    .iter()
+                    .any(|workspace| path_is_within(&record.normalized_cwd, workspace))
+        })
+        .collect();
+    (!matching.is_empty())
+        .then(|| aggregate_matching_activity("Cursor Agent", matching, None, None, now_ms))
+}
+
 fn aggregate_activity(
     provider: &str,
     workspace_paths: &[PathBuf],
@@ -1025,7 +1287,7 @@ fn aggregate_activity(
         return pathless_activity(provider, extension, remote_window);
     }
 
-    let mut matching: Vec<&ActivityRecord> = records
+    let matching: Vec<&ActivityRecord> = records
         .iter()
         .filter(|record| {
             workspace_paths
@@ -1038,15 +1300,45 @@ fn aggregate_activity(
         return unknown_activity(provider, extension, editor_name);
     }
 
+    aggregate_matching_activity(provider, matching, extension, editor_name, now_ms)
+}
+
+fn aggregate_matching_activity(
+    provider: &str,
+    mut matching: Vec<&ActivityRecord>,
+    extension: Option<ExtensionPresenceRecord>,
+    _editor_name: Option<&str>,
+    now_ms: i64,
+) -> ActivityView {
+    if provider == "Cursor Agent" {
+        let mut newest_by_session: HashMap<&str, &ActivityRecord> = HashMap::new();
+        for record in matching {
+            match newest_by_session.get(record.session_key.as_str()) {
+                Some(existing) if !cursor_record_is_newer(record, existing) => {}
+                _ => {
+                    newest_by_session.insert(record.session_key.as_str(), record);
+                }
+            }
+        }
+        matching = newest_by_session.into_values().collect();
+    }
+
     matching.sort_by_key(|record| record.changed_at_ms);
     let newest = *matching.last().expect("matching is not empty");
     let fresh_activity = if provider == "Antigravity" {
-        // Antigravity's model qualifier and lifecycle status must describe the
-        // same most-recent record. An older unfinished conversation must not
-        // mask a newer Stop marker (or supply its stale model) for 24 hours.
+        // Antigravity qualifiers and lifecycle status must describe the same
+        // most-recent record.
         (newest.state == ActivityRecordState::ActivityDetected
             && now_ms.saturating_sub(newest.changed_at_ms) <= ACTIVITY_STALE_MS)
             .then_some(newest)
+    } else if provider == "Cursor Agent" {
+        // Each Cursor session was reduced to its newest record above. A
+        // terminal marker therefore closes only its own session, while another
+        // concurrent session can remain active with coherent metadata.
+        matching.iter().rev().copied().find(|record| {
+            record.state == ActivityRecordState::ActivityDetected
+                && now_ms.saturating_sub(record.changed_at_ms) <= ACTIVITY_STALE_MS
+        })
     } else {
         matching.iter().rev().copied().find(|record| {
             record.state == ActivityRecordState::ActivityDetected
@@ -1054,45 +1346,59 @@ fn aggregate_activity(
         })
     };
     if let Some(record) = fresh_activity {
-        return activity_view(
+        return activity_view_with_metadata(
             "activity_detected",
             "Activity detected",
             Some(record.changed_at_ms),
             format!(
                 "A {provider} turn-start hook was observed. This is a lifecycle marker, not live progress."
             ),
-            record.model_kind,
+            (
+                record.model_kind,
+                record.model_name.clone(),
+                record.agent_kind.clone(),
+            ),
             extension,
         );
     }
 
     if now_ms.saturating_sub(newest.changed_at_ms) > ACTIVITY_STALE_MS {
-        return activity_view(
+        return activity_view_with_metadata(
             "unknown",
             "Unknown",
             Some(newest.changed_at_ms),
             format!("The last {provider} lifecycle signal is stale."),
-            newest.model_kind,
+            (
+                newest.model_kind,
+                newest.model_name.clone(),
+                newest.agent_kind.clone(),
+            ),
             extension,
         );
     }
 
     match newest.state {
-        ActivityRecordState::TurnFinished | ActivityRecordState::SessionEnded => activity_view(
-            "turn_finished",
-            "Turn finished",
-            Some(newest.changed_at_ms),
-            if newest.state == ActivityRecordState::SessionEnded {
-                format!("A {provider} session-end hook was observed.")
-            } else {
-                format!("A {provider} Stop hook was observed.")
-            },
-            newest.model_kind,
-            extension,
-        ),
+        ActivityRecordState::TurnFinished | ActivityRecordState::SessionEnded => {
+            activity_view_with_metadata(
+                "turn_finished",
+                "Turn finished",
+                Some(newest.changed_at_ms),
+                if newest.state == ActivityRecordState::SessionEnded {
+                    format!("A {provider} session-end hook was observed.")
+                } else {
+                    format!("A {provider} Stop hook was observed.")
+                },
+                (
+                    newest.model_kind,
+                    newest.model_name.clone(),
+                    newest.agent_kind.clone(),
+                ),
+                extension,
+            )
+        }
         ActivityRecordState::FailedOrInterrupted
         | ActivityRecordState::Failed
-        | ActivityRecordState::Interrupted => activity_view(
+        | ActivityRecordState::Interrupted => activity_view_with_metadata(
             "failed_or_interrupted",
             "Failed/interrupted",
             Some(newest.changed_at_ms),
@@ -1102,10 +1408,35 @@ fn aggregate_activity(
             } else {
                 format!("A {provider} failure or interruption lifecycle signal was observed.")
             },
-            newest.model_kind,
+            (
+                newest.model_kind,
+                newest.model_name.clone(),
+                newest.agent_kind.clone(),
+            ),
             extension,
         ),
+        ActivityRecordState::WorkspaceOpened | ActivityRecordState::SessionStarted => {
+            unreachable!("metadata-only Cursor records are filtered before aggregation")
+        }
         ActivityRecordState::ActivityDetected => unreachable!("fresh activity returned above"),
+    }
+}
+
+fn cursor_record_is_newer(candidate: &ActivityRecord, existing: &ActivityRecord) -> bool {
+    candidate.changed_at_ms > existing.changed_at_ms
+        || (candidate.changed_at_ms == existing.changed_at_ms
+            && cursor_state_precedence(candidate.state) > cursor_state_precedence(existing.state))
+}
+
+fn cursor_state_precedence(state: ActivityRecordState) -> u8 {
+    match state {
+        ActivityRecordState::WorkspaceOpened | ActivityRecordState::SessionStarted => 0,
+        ActivityRecordState::ActivityDetected => 1,
+        ActivityRecordState::TurnFinished
+        | ActivityRecordState::SessionEnded
+        | ActivityRecordState::FailedOrInterrupted
+        | ActivityRecordState::Failed
+        | ActivityRecordState::Interrupted => 2,
     }
 }
 
@@ -1174,12 +1505,33 @@ fn activity_view(
     model_kind: Option<AntigravityModelKind>,
     extension: Option<ExtensionPresenceRecord>,
 ) -> ActivityView {
+    activity_view_with_metadata(
+        state,
+        label,
+        changed_at_ms,
+        detail,
+        (model_kind, None, None),
+        extension,
+    )
+}
+
+fn activity_view_with_metadata(
+    state: &str,
+    label: &str,
+    changed_at_ms: Option<i64>,
+    detail: String,
+    metadata: (Option<AntigravityModelKind>, Option<String>, Option<String>),
+    extension: Option<ExtensionPresenceRecord>,
+) -> ActivityView {
+    let (model_kind, model_name, agent_kind) = metadata;
     ActivityView {
         state: state.to_string(),
         label: label.to_string(),
         changed_at_ms,
         detail,
         model_kind,
+        model_name,
+        agent_kind,
         extension_detection_available: extension.map(|value| value.available),
         extension_installed: extension.map(|value| value.installed),
         extension_active: extension.map(|value| value.active),
@@ -1362,6 +1714,7 @@ mod tests {
             20_000,
             "code".into(),
             "antigravity-ide".into(),
+            "cursor".into(),
         );
         assert_eq!(
             diagnostics.valid_instance_records,
@@ -1370,13 +1723,21 @@ mod tests {
         assert_eq!(diagnostics.omitted_instance_records, 1);
         assert_eq!(diagnostics.omitted_codex_records, 0);
         assert_eq!(diagnostics.omitted_claude_records, 0);
+        assert_eq!(diagnostics.omitted_cursor_records, 0);
 
         let serialized = serde_json::to_value(diagnostics).unwrap();
         assert_eq!(serialized["codeCommand"], "code");
         assert_eq!(serialized["antigravityIdeCommand"], "antigravity-ide");
+        assert_eq!(serialized["cursorCommand"], "cursor");
         assert_eq!(serialized["omittedInstanceRecords"], 1);
         assert_eq!(serialized["omittedCodexRecords"], 0);
         assert_eq!(serialized["omittedClaudeRecords"], 0);
+        assert_eq!(serialized["omittedCursorRecords"], 0);
+        assert_eq!(serialized["activeCursorInstanceRecords"], 0);
+        assert_eq!(serialized["retainedCursorInstanceRecords"], 0);
+        assert!(serialized["latestCursorInstanceAtMs"].is_null());
+        assert_eq!(serialized["recentCursorWorkspaceOpenRecords"], 0);
+        assert!(serialized["latestCursorWorkspaceOpenedAtMs"].is_null());
         assert_eq!(serialized["antigravityTwoHookOutcome"], "not_observed");
         assert!(serialized["antigravityTwoHookObservedAtMs"].is_null());
         assert_eq!(serialized["antigravityIdeHookOutcome"], "not_observed");
@@ -1414,7 +1775,12 @@ mod tests {
         );
         let store = StateStore::new(temp.path().to_path_buf());
 
-        let observed = store.diagnostics(20_000, "code".into(), "antigravity-ide".into());
+        let observed = store.diagnostics(
+            20_000,
+            "code".into(),
+            "antigravity-ide".into(),
+            "cursor".into(),
+        );
         assert_eq!(
             observed.antigravity_two_hook_event.as_deref(),
             Some("pre-invocation")
@@ -1433,7 +1799,12 @@ mod tests {
             b"{not json",
         )
         .unwrap();
-        let unreadable = store.diagnostics(20_000, "code".into(), "antigravity-ide".into());
+        let unreadable = store.diagnostics(
+            20_000,
+            "code".into(),
+            "antigravity-ide".into(),
+            "cursor".into(),
+        );
         assert_eq!(unreadable.antigravity_two_hook_outcome, "health_unreadable");
         assert_eq!(unreadable.antigravity_ide_hook_outcome, "recorded");
     }
@@ -1493,7 +1864,12 @@ mod tests {
             .workspaces
             .iter()
             .any(|item| item.instance_id == "b" && !item.active));
-        let diagnostics = store.diagnostics(now, "code".to_string(), "antigravity-ide".to_string());
+        let diagnostics = store.diagnostics(
+            now,
+            "code".to_string(),
+            "antigravity-ide".to_string(),
+            "cursor".to_string(),
+        );
         assert_eq!(diagnostics.valid_instance_records, 2);
         assert_eq!(diagnostics.malformed_instance_records, 1);
     }
@@ -1542,7 +1918,12 @@ mod tests {
         );
         assert_eq!(
             store
-                .diagnostics(now, "code".to_string(), "antigravity-ide".to_string())
+                .diagnostics(
+                    now,
+                    "code".to_string(),
+                    "antigravity-ide".to_string(),
+                    "cursor".to_string(),
+                )
                 .malformed_instance_records,
             0
         );
@@ -1577,6 +1958,571 @@ mod tests {
                 editor: Some(EditorKind::AntigravityIde),
             })
         );
+    }
+
+    #[test]
+    fn trusted_cursor_heartbeat_is_exposed_and_selects_its_launcher_kind() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("cursor-project");
+        fs::create_dir_all(&repo).unwrap();
+        let now = 30_000;
+        let mut heartbeat = instance("cursor-window", &repo, now, true);
+        heartbeat["editor"] = json!("cursor");
+        write_json(&temp.path().join("instances/cursor-window.json"), heartbeat);
+
+        let store = StateStore::new(temp.path().to_path_buf());
+        let snapshot = store.snapshot(now);
+        assert_eq!(snapshot.workspaces.len(), 1);
+        let workspace = &snapshot.workspaces[0];
+        assert_eq!(workspace.editor, EditorKind::Cursor);
+        assert_eq!(workspace.editor_name, "Cursor");
+        assert!(workspace.openable);
+        assert!(workspace.cursor.is_none());
+        assert_eq!(
+            store.find_workspace_open_target("cursor-window", now),
+            Some(WorkspaceOpenTarget {
+                path: repo,
+                editor: Some(EditorKind::Cursor),
+            })
+        );
+    }
+
+    #[test]
+    fn diagnostics_distinguish_live_cursor_heartbeats_from_workspace_hooks() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("cursor-project");
+        fs::create_dir_all(&repo).unwrap();
+        let now = STALE_RETENTION_MS + 10_000;
+
+        for (id, age) in [
+            ("active", ACTIVE_TTL_MS),
+            ("retained", ACTIVE_TTL_MS + 1),
+            ("expired", STALE_RETENTION_MS + 1),
+        ] {
+            let mut heartbeat = instance(id, &repo, now - age, false);
+            heartbeat["editor"] = json!("cursor");
+            write_json(&temp.path().join(format!("instances/{id}.json")), heartbeat);
+        }
+        let legacy = instance("legacy-vscode", &repo, now, false);
+        write_json(&temp.path().join("instances/legacy-vscode.json"), legacy);
+        write_json(
+            &temp.path().join("cursor/workspace.json"),
+            json!({
+                "schemaVersion": 1,
+                "sessionKey": "cursor-workspace",
+                "cwd": repo,
+                "state": "workspace_opened",
+                "changedAtMs": now - 123
+            }),
+        );
+
+        let diagnostics = StateStore::new(temp.path().to_path_buf()).diagnostics(
+            now,
+            "code".to_string(),
+            "antigravity-ide".to_string(),
+            "cursor".to_string(),
+        );
+        assert_eq!(diagnostics.active_cursor_instance_records, 1);
+        assert_eq!(diagnostics.retained_cursor_instance_records, 2);
+        assert_eq!(
+            diagnostics.latest_cursor_instance_at_ms,
+            Some(now - ACTIVE_TTL_MS)
+        );
+        assert_eq!(diagnostics.recent_cursor_workspace_open_records, 1);
+        assert_eq!(
+            diagnostics.latest_cursor_workspace_opened_at_ms,
+            Some(now - 123)
+        );
+    }
+
+    #[test]
+    fn cursor_workspace_opened_synthesizes_a_non_live_workspace_without_activity() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("cursor-project");
+        fs::create_dir_all(&repo).unwrap();
+        let now = 30_000;
+        write_json(
+            &temp.path().join("cursor/workspace.json"),
+            json!({
+                "schemaVersion": 1,
+                "sessionKey": "cursor-workspace",
+                "cwd": repo,
+                "state": "workspace_opened",
+                "changedAtMs": now
+            }),
+        );
+
+        let store = StateStore::new(temp.path().to_path_buf());
+        let snapshot = store.snapshot(now);
+        assert_eq!(snapshot.workspaces.len(), 1);
+        let workspace = &snapshot.workspaces[0];
+        assert!(workspace.instance_id.starts_with("cursor-workspace:"));
+        assert_eq!(workspace.editor, EditorKind::Cursor);
+        assert_eq!(workspace.editor_name, "Cursor");
+        assert_eq!(workspace.path.as_deref(), repo.to_str());
+        assert!(!workspace.openable);
+        assert!(!workspace.active);
+        assert!(!workspace.focused);
+        assert!(!workspace.recently_active);
+        assert!(workspace.cursor.is_none());
+        assert!(store
+            .find_workspace_open_target(&workspace.instance_id, now)
+            .is_none());
+    }
+
+    #[test]
+    fn cursor_workspace_opened_reconciles_into_one_matching_heartbeat() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("cursor-project");
+        let nested = repo.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        let now = 30_000;
+        let mut heartbeat = instance("cursor-window", &repo, now, true);
+        heartbeat["editor"] = json!("cursor");
+        write_json(&temp.path().join("instances/cursor-window.json"), heartbeat);
+        write_json(
+            &temp.path().join("cursor/workspace.json"),
+            json!({
+                "schemaVersion": 1,
+                "sessionKey": "cursor-workspace",
+                "cwd": nested,
+                "state": "workspace_opened",
+                "changedAtMs": now
+            }),
+        );
+
+        let snapshot = StateStore::new(temp.path().to_path_buf()).snapshot(now);
+        assert_eq!(snapshot.workspaces.len(), 1);
+        let workspace = &snapshot.workspaces[0];
+        assert_eq!(workspace.instance_id, "cursor-window");
+        assert_eq!(workspace.editor_name, "Cursor");
+        assert!(workspace.openable);
+        assert!(workspace.active);
+        assert!(workspace.cursor.is_none());
+    }
+
+    #[test]
+    fn ambiguous_cursor_workspace_opened_stays_generic_and_non_live() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("cursor-project");
+        let nested = repo.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        let now = 30_000;
+        for instance_id in ["cursor-window-a", "cursor-window-b"] {
+            let mut heartbeat = instance(instance_id, &repo, now, true);
+            heartbeat["editor"] = json!("cursor");
+            write_json(
+                &temp.path().join(format!("instances/{instance_id}.json")),
+                heartbeat,
+            );
+        }
+        write_json(
+            &temp.path().join("cursor/workspace.json"),
+            json!({
+                "schemaVersion": 1,
+                "sessionKey": "cursor-workspace",
+                "cwd": nested,
+                "state": "workspace_opened",
+                "changedAtMs": now
+            }),
+        );
+
+        let snapshot = StateStore::new(temp.path().to_path_buf()).snapshot(now);
+        assert_eq!(snapshot.workspaces.len(), 3);
+        let generic = snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.instance_id.starts_with("cursor-workspace:"))
+            .unwrap();
+        assert_eq!(generic.editor_name, "Cursor");
+        assert!(!generic.openable);
+        assert!(!generic.active);
+        assert!(!generic.focused);
+        assert!(!generic.recently_active);
+        assert!(generic.cursor.is_none());
+    }
+
+    #[test]
+    fn cursor_same_session_completion_overrides_prior_activity_and_metadata() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("cursor-project");
+        fs::create_dir_all(&repo).unwrap();
+        let now = 30_000;
+        let mut heartbeat = instance("cursor-window", &repo, now, true);
+        heartbeat["editor"] = json!("cursor");
+        write_json(&temp.path().join("instances/cursor-window.json"), heartbeat);
+        write_json(
+            &temp.path().join("cursor/older-activity.json"),
+            json!({
+                "schemaVersion": 1,
+                "sessionKey": "same-agent",
+                "cwd": repo,
+                "state": "activity_detected",
+                "changedAtMs": now - 100,
+                "modelName": "claude-4-sonnet",
+                "agentKind": "Background agent"
+            }),
+        );
+        write_json(
+            &temp.path().join("cursor/newer-finished.json"),
+            json!({
+                "schemaVersion": 1,
+                "sessionKey": "same-agent",
+                "cwd": repo,
+                "state": "turn_finished",
+                "changedAtMs": now - 10,
+                "modelName": "gpt-5.2",
+                "agentKind": "Agent"
+            }),
+        );
+
+        let snapshot = StateStore::new(temp.path().to_path_buf()).snapshot(now);
+        assert_eq!(snapshot.workspaces.len(), 1);
+        let cursor = snapshot.workspaces[0].cursor.as_ref().unwrap();
+        assert_eq!(cursor.state, "turn_finished");
+        assert_eq!(cursor.changed_at_ms, Some(now - 10));
+        assert_eq!(cursor.model_name.as_deref(), Some("gpt-5.2"));
+        assert_eq!(cursor.agent_kind.as_deref(), Some("Agent"));
+        assert_eq!(cursor.model_kind, None);
+        let serialized = serde_json::to_value(cursor).unwrap();
+        assert_eq!(serialized["modelName"], "gpt-5.2");
+        assert_eq!(serialized["agentKind"], "Agent");
+    }
+
+    #[test]
+    fn cursor_concurrent_active_session_survives_another_sessions_completion() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("cursor-project");
+        fs::create_dir_all(&repo).unwrap();
+        let now = 30_000;
+        let mut heartbeat = instance("cursor-window", &repo, now, true);
+        heartbeat["editor"] = json!("cursor");
+        write_json(&temp.path().join("instances/cursor-window.json"), heartbeat);
+        write_json(
+            &temp.path().join("cursor/active.json"),
+            json!({
+                "schemaVersion": 1,
+                "sessionKey": "active-agent",
+                "cwd": repo,
+                "state": "activity_detected",
+                "changedAtMs": now - 100,
+                "modelName": "claude-4-sonnet",
+                "agentKind": "Background agent"
+            }),
+        );
+        write_json(
+            &temp.path().join("cursor/finished.json"),
+            json!({
+                "schemaVersion": 1,
+                "sessionKey": "finished-agent",
+                "cwd": repo,
+                "state": "turn_finished",
+                "changedAtMs": now - 10,
+                "modelName": "gpt-5.2",
+                "agentKind": "Agent"
+            }),
+        );
+
+        let snapshot = StateStore::new(temp.path().to_path_buf()).snapshot(now);
+        let cursor = snapshot.workspaces[0].cursor.as_ref().unwrap();
+        assert_eq!(cursor.state, "activity_detected");
+        assert_eq!(cursor.changed_at_ms, Some(now - 100));
+        assert_eq!(cursor.model_name.as_deref(), Some("claude-4-sonnet"));
+        assert_eq!(cursor.agent_kind.as_deref(), Some("Background agent"));
+    }
+
+    #[test]
+    fn cursor_hook_activity_synthesizes_a_recent_generic_agent_workspace() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("cursor-agent-project");
+        fs::create_dir_all(&repo).unwrap();
+        let now = 30_000;
+        write_json(
+            &temp.path().join("cursor/agent.json"),
+            json!({
+                "schemaVersion": 1,
+                "sessionKey": "cursor-agent",
+                "cwd": repo,
+                "state": "activity_detected",
+                "changedAtMs": now,
+                "modelName": "claude-4-sonnet",
+                "agentKind": "Background agent"
+            }),
+        );
+
+        let store = StateStore::new(temp.path().to_path_buf());
+        let snapshot = store.snapshot(now);
+        assert_eq!(snapshot.workspaces.len(), 1);
+        let workspace = &snapshot.workspaces[0];
+        assert!(workspace.instance_id.starts_with("cursor-agent:"));
+        assert_eq!(workspace.editor, EditorKind::Cursor);
+        assert_eq!(workspace.editor_name, "Cursor Agent");
+        assert!(!workspace.openable);
+        assert!(!workspace.active);
+        assert!(!workspace.focused);
+        assert!(workspace.recently_active);
+        let cursor = workspace.cursor.as_ref().unwrap();
+        assert_eq!(cursor.state, "activity_detected");
+        assert_eq!(cursor.model_name.as_deref(), Some("claude-4-sonnet"));
+        assert_eq!(cursor.agent_kind.as_deref(), Some("Background agent"));
+        assert!(cursor.detail.contains("Cursor Agent turn-start hook"));
+        assert!(store
+            .find_workspace_open_target(&workspace.instance_id, now)
+            .is_none());
+
+        let diagnostics = store.diagnostics(
+            now,
+            "code".into(),
+            "antigravity-ide".into(),
+            "cursor".into(),
+        );
+        assert_eq!(diagnostics.valid_cursor_records, 1);
+        assert_eq!(diagnostics.malformed_cursor_records, 0);
+        assert_eq!(diagnostics.omitted_cursor_records, 0);
+    }
+
+    #[test]
+    fn cursor_heartbeat_owns_nested_hook_activity_without_a_duplicate_row() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("cursor-project");
+        let nested = repo.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        let now = 30_000;
+        let mut heartbeat = instance("cursor-window", &repo, now, true);
+        heartbeat["editor"] = json!("cursor");
+        write_json(&temp.path().join("instances/cursor-window.json"), heartbeat);
+        write_json(
+            &temp.path().join("cursor/agent.json"),
+            json!({
+                "schemaVersion": 1,
+                "sessionKey": "cursor-agent",
+                "cwd": nested,
+                "state": "activity_detected",
+                "changedAtMs": now
+            }),
+        );
+
+        let snapshot = StateStore::new(temp.path().to_path_buf()).snapshot(now);
+        assert_eq!(snapshot.workspaces.len(), 1);
+        assert_eq!(snapshot.workspaces[0].instance_id, "cursor-window");
+        assert_eq!(
+            snapshot.workspaces[0]
+                .cursor
+                .as_ref()
+                .map(|activity| activity.state.as_str()),
+            Some("activity_detected")
+        );
+    }
+
+    #[test]
+    fn cursor_activity_covered_by_multiple_windows_stays_generic_and_unopenable() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("cursor-project");
+        let nested = repo.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        let now = 30_000;
+        for instance_id in ["cursor-window-a", "cursor-window-b"] {
+            let mut heartbeat = instance(instance_id, &repo, now, true);
+            heartbeat["editor"] = json!("cursor");
+            write_json(
+                &temp.path().join(format!("instances/{instance_id}.json")),
+                heartbeat,
+            );
+        }
+        write_json(
+            &temp.path().join("cursor/agent.json"),
+            json!({
+                "schemaVersion": 1,
+                "sessionKey": "cursor-agent",
+                "cwd": nested,
+                "state": "activity_detected",
+                "changedAtMs": now
+            }),
+        );
+
+        let snapshot = StateStore::new(temp.path().to_path_buf()).snapshot(now);
+        assert_eq!(snapshot.workspaces.len(), 3);
+        for workspace in snapshot
+            .workspaces
+            .iter()
+            .filter(|workspace| workspace.editor_name == "Cursor")
+        {
+            assert!(workspace.openable);
+            assert!(workspace.cursor.is_none());
+        }
+        let generic = snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.editor_name == "Cursor Agent")
+            .unwrap();
+        assert!(!generic.openable);
+        assert!(!generic.active);
+        assert!(!generic.focused);
+        assert_eq!(
+            generic
+                .cursor
+                .as_ref()
+                .map(|activity| activity.state.as_str()),
+            Some("activity_detected")
+        );
+    }
+
+    #[test]
+    fn cursor_session_started_metadata_does_not_create_workspace_activity() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("cursor-project");
+        fs::create_dir_all(&repo).unwrap();
+        let now = 30_000;
+        let mut heartbeat = instance("cursor-window", &repo, now, true);
+        heartbeat["editor"] = json!("cursor");
+        write_json(&temp.path().join("instances/cursor-window.json"), heartbeat);
+        write_json(
+            &temp.path().join("cursor/session.json"),
+            json!({
+                "schemaVersion": 1,
+                "sessionKey": "cursor-session",
+                "cwd": repo,
+                "state": "session_started",
+                "changedAtMs": now,
+                "agentKind": "Background agent"
+            }),
+        );
+
+        let store = StateStore::new(temp.path().to_path_buf());
+        let snapshot = store.snapshot(now);
+        assert_eq!(snapshot.workspaces.len(), 1);
+        assert_eq!(snapshot.workspaces[0].instance_id, "cursor-window");
+        assert!(snapshot.workspaces[0].cursor.is_none());
+        assert_eq!(
+            store
+                .diagnostics(
+                    now,
+                    "code".into(),
+                    "antigravity-ide".into(),
+                    "cursor".into(),
+                )
+                .valid_cursor_records,
+            1
+        );
+    }
+
+    #[test]
+    fn cursor_session_started_without_a_heartbeat_stays_hidden() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("cursor-project");
+        fs::create_dir_all(&repo).unwrap();
+        let now = 30_000;
+        write_json(
+            &temp.path().join("cursor/session.json"),
+            json!({
+                "schemaVersion": 1,
+                "sessionKey": "cursor-session",
+                "cwd": repo,
+                "state": "session_started",
+                "changedAtMs": now,
+                "agentKind": "Background agent"
+            }),
+        );
+
+        let store = StateStore::new(temp.path().to_path_buf());
+        assert!(store.snapshot(now).workspaces.is_empty());
+        assert_eq!(
+            store
+                .diagnostics(
+                    now,
+                    "code".into(),
+                    "antigravity-ide".into(),
+                    "cursor".into(),
+                )
+                .valid_cursor_records,
+            1
+        );
+    }
+
+    #[test]
+    fn malformed_cursor_metadata_is_omitted_without_exposing_extra_fields() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("cursor-project");
+        fs::create_dir_all(&repo).unwrap();
+        let now = 30_000;
+        write_json(
+            &temp.path().join("cursor/sanitized.json"),
+            json!({
+                "schemaVersion": 1,
+                "sessionKey": "sanitized",
+                "cwd": repo,
+                "state": "turn_finished",
+                "changedAtMs": now,
+                "modelName": " \n\t ",
+                "agentKind": "x".repeat(MAX_CURSOR_METADATA_BYTES + 1),
+                "prompt": "SECRET PROMPT",
+                "transcript": "SECRET TRANSCRIPT"
+            }),
+        );
+        write_json(
+            &temp.path().join("cursor/wrong-type.json"),
+            json!({
+                "schemaVersion": 1,
+                "sessionKey": "wrong-type",
+                "cwd": repo,
+                "state": "activity_detected",
+                "changedAtMs": now,
+                "modelName": {"unexpected": true}
+            }),
+        );
+
+        let store = StateStore::new(temp.path().to_path_buf());
+        let snapshot = store.snapshot(now);
+        let cursor = snapshot.workspaces[0].cursor.as_ref().unwrap();
+        assert_eq!(cursor.state, "turn_finished");
+        assert_eq!(cursor.model_name, None);
+        assert_eq!(cursor.agent_kind, None);
+        let serialized = serde_json::to_string(&snapshot).unwrap();
+        assert!(!serialized.contains("modelName"));
+        assert!(!serialized.contains("agentKind"));
+        assert!(!serialized.contains("SECRET"));
+
+        let diagnostics = store.diagnostics(
+            now,
+            "code".into(),
+            "antigravity-ide".into(),
+            "cursor".into(),
+        );
+        assert_eq!(diagnostics.valid_cursor_records, 1);
+        assert_eq!(diagnostics.malformed_cursor_records, 1);
+    }
+
+    #[test]
+    fn cursor_metadata_is_limited_to_public_display_values() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("cursor-project");
+        fs::create_dir_all(&repo).unwrap();
+        let now = 30_000;
+        write_json(
+            &temp.path().join("cursor/private.json"),
+            json!({
+                "schemaVersion": 1,
+                "sessionKey": "private",
+                "cwd": repo,
+                "state": "turn_finished",
+                "changedAtMs": now,
+                "modelName": "private<script>",
+                "agentKind": "Private orchestrator"
+            }),
+        );
+
+        let snapshot = StateStore::new(temp.path().to_path_buf()).snapshot(now);
+        let cursor = snapshot.workspaces[0].cursor.as_ref().unwrap();
+        assert_eq!(cursor.model_name, None);
+        assert_eq!(cursor.agent_kind, None);
+        let diagnostics = StateStore::new(temp.path().to_path_buf()).diagnostics(
+            now,
+            "code".into(),
+            "antigravity-ide".into(),
+            "cursor".into(),
+        );
+        assert_eq!(diagnostics.valid_cursor_records, 1);
+        assert_eq!(diagnostics.malformed_cursor_records, 0);
     }
 
     #[test]
@@ -1654,7 +2600,12 @@ mod tests {
             .find_workspace_open_target(&workspace.instance_id, now)
             .is_none());
 
-        let diagnostics = store.diagnostics(now, "code".into(), "antigravity-ide".into());
+        let diagnostics = store.diagnostics(
+            now,
+            "code".into(),
+            "antigravity-ide".into(),
+            "cursor".into(),
+        );
         assert_eq!(diagnostics.valid_antigravity_records, 1);
         assert_eq!(diagnostics.malformed_antigravity_records, 0);
         assert_eq!(diagnostics.omitted_antigravity_records, 0);
@@ -2030,7 +2981,12 @@ mod tests {
 
         let store = StateStore::new(temp.path().to_path_buf());
         assert!(store.snapshot(now).workspaces.is_empty());
-        let diagnostics = store.diagnostics(now, "code".into(), "antigravity-ide".into());
+        let diagnostics = store.diagnostics(
+            now,
+            "code".into(),
+            "antigravity-ide".into(),
+            "cursor".into(),
+        );
         assert_eq!(diagnostics.valid_antigravity_records, 1);
         assert_eq!(diagnostics.malformed_antigravity_records, 1);
     }
@@ -2058,7 +3014,12 @@ mod tests {
         assert!(store.find_workspace_open_target("untrusted", now).is_none());
         assert_eq!(
             store
-                .diagnostics(now, "code".into(), "antigravity-ide".into())
+                .diagnostics(
+                    now,
+                    "code".into(),
+                    "antigravity-ide".into(),
+                    "cursor".into(),
+                )
                 .malformed_instance_records,
             2
         );
@@ -2274,7 +3235,12 @@ mod tests {
         assert_eq!(workspace.codex.extension_remote, Some(false));
         assert_eq!(
             store
-                .diagnostics(now, "code".into(), "antigravity-ide".into())
+                .diagnostics(
+                    now,
+                    "code".into(),
+                    "antigravity-ide".into(),
+                    "cursor".into(),
+                )
                 .valid_claude_records,
             1
         );
@@ -2321,7 +3287,12 @@ mod tests {
 
         let store = StateStore::new(temp.path().to_path_buf());
         assert_eq!(store.snapshot(now).workspaces.len(), 1);
-        let diagnostics = store.diagnostics(now, "code".into(), "antigravity-ide".into());
+        let diagnostics = store.diagnostics(
+            now,
+            "code".into(),
+            "antigravity-ide".into(),
+            "cursor".into(),
+        );
         assert_eq!(diagnostics.malformed_claude_records, 1);
         assert_eq!(diagnostics.valid_claude_records, 0);
     }
@@ -2339,7 +3310,12 @@ mod tests {
         assert!(store.snapshot(123).workspaces.is_empty());
         assert_eq!(
             store
-                .diagnostics(123, "code".into(), "antigravity-ide".into())
+                .diagnostics(
+                    123,
+                    "code".into(),
+                    "antigravity-ide".into(),
+                    "cursor".into(),
+                )
                 .malformed_instance_records,
             2
         );

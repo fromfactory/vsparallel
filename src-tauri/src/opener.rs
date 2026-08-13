@@ -7,6 +7,7 @@ use std::process::Command;
 use std::thread;
 
 pub const CODE_COMMAND_ENV: &str = "VSPARALLEL_CODE_COMMAND";
+pub const CURSOR_COMMAND_ENV: &str = "VSPARALLEL_CURSOR_COMMAND";
 pub const ANTIGRAVITY_IDE_COMMAND_ENV: &str = "VSPARALLEL_ANTIGRAVITY_IDE_COMMAND";
 
 /// A trusted editor identity reported by a bundled workspace companion.
@@ -17,6 +18,8 @@ pub const ANTIGRAVITY_IDE_COMMAND_ENV: &str = "VSPARALLEL_ANTIGRAVITY_IDE_COMMAN
 pub enum EditorKind {
     #[serde(rename = "vscode")]
     VsCode,
+    #[serde(rename = "cursor")]
+    Cursor,
     #[serde(rename = "antigravity_ide")]
     AntigravityIde,
     #[serde(rename = "antigravity_2")]
@@ -27,6 +30,7 @@ impl EditorKind {
     pub const fn display_name(self) -> &'static str {
         match self {
             Self::VsCode => "VS Code",
+            Self::Cursor => "Cursor",
             Self::AntigravityIde => "Antigravity IDE",
             Self::Antigravity2 => "Antigravity 2.0",
         }
@@ -84,6 +88,10 @@ pub fn code_command() -> String {
     configured_command(CODE_COMMAND_ENV).unwrap_or_else(default_code_command)
 }
 
+pub fn cursor_command() -> String {
+    configured_command(CURSOR_COMMAND_ENV).unwrap_or_else(default_cursor_command)
+}
+
 pub fn antigravity_ide_command() -> String {
     configured_command(ANTIGRAVITY_IDE_COMMAND_ENV).unwrap_or_else(default_antigravity_ide_command)
 }
@@ -93,6 +101,7 @@ pub fn antigravity_ide_command() -> String {
 /// `VSPARALLEL_CODE_COMMAND` behavior.
 pub fn command_for_editor(editor: Option<EditorKind>) -> Option<String> {
     match editor {
+        Some(EditorKind::Cursor) => Some(cursor_command()),
         Some(EditorKind::AntigravityIde) => Some(antigravity_ide_command()),
         Some(EditorKind::VsCode) | None => Some(code_command()),
         Some(EditorKind::Antigravity2) => None,
@@ -109,6 +118,34 @@ fn configured_command(environment_variable: &str) -> Option<String> {
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn default_code_command() -> String {
     "code".to_string()
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn default_cursor_command() -> String {
+    if let Some(home) = env::var_os("HOME") {
+        let home = std::path::PathBuf::from(home);
+        let candidates = [
+            home.join(".local").join("bin").join("cursor"),
+            home.join(".local")
+                .join("share")
+                .join("cursor")
+                .join("cursor"),
+            home.join("Applications").join("Cursor.AppImage"),
+            home.join("Applications").join("cursor.AppImage"),
+        ];
+        if let Some(command) = candidates.into_iter().find(|candidate| candidate.is_file()) {
+            return command.to_string_lossy().into_owned();
+        }
+    }
+
+    for candidate in ["/usr/local/bin/cursor", "/usr/bin/cursor"] {
+        let candidate = std::path::PathBuf::from(candidate);
+        if candidate.is_file() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+
+    "cursor".to_string()
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
@@ -158,6 +195,31 @@ fn default_code_command() -> String {
     }
 
     "code".to_string()
+}
+
+#[cfg(target_os = "macos")]
+fn default_cursor_command() -> String {
+    let system =
+        std::path::PathBuf::from("/Applications/Cursor.app/Contents/Resources/app/bin/cursor");
+    if system.is_file() {
+        return system.to_string_lossy().into_owned();
+    }
+
+    if let Some(home) = env::var_os("HOME") {
+        let user = std::path::PathBuf::from(home)
+            .join("Applications")
+            .join("Cursor.app")
+            .join("Contents")
+            .join("Resources")
+            .join("app")
+            .join("bin")
+            .join("cursor");
+        if user.is_file() {
+            return user.to_string_lossy().into_owned();
+        }
+    }
+
+    "cursor".to_string()
 }
 
 #[cfg(target_os = "macos")]
@@ -217,6 +279,41 @@ fn default_code_command() -> String {
 }
 
 #[cfg(target_os = "windows")]
+fn default_cursor_command() -> String {
+    let path_directories = env::var_os("PATH")
+        .map(|value| env::split_paths(&value).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let install_roots = [
+        env::var_os("LOCALAPPDATA").map(|root| {
+            std::path::PathBuf::from(root)
+                .join("Programs")
+                .join("cursor")
+        }),
+        env::var_os("LOCALAPPDATA").map(|root| {
+            std::path::PathBuf::from(root)
+                .join("Programs")
+                .join("Cursor")
+        }),
+        env::var_os("ProgramFiles")
+            .map(std::path::PathBuf::from)
+            .map(|root| root.join("Cursor")),
+        env::var_os("ProgramFiles(x86)")
+            .map(std::path::PathBuf::from)
+            .map(|root| root.join("Cursor")),
+    ];
+
+    find_windows_cursor_executable(
+        path_directories.iter().map(std::path::PathBuf::as_path),
+        install_roots
+            .iter()
+            .flatten()
+            .map(std::path::PathBuf::as_path),
+    )
+    .map(|path| path.to_string_lossy().into_owned())
+    .unwrap_or_else(|| "Cursor.exe".to_string())
+}
+
+#[cfg(target_os = "windows")]
 fn default_antigravity_ide_command() -> String {
     let path_directories = env::var_os("PATH")
         .map(|value| env::split_paths(&value).collect::<Vec<_>>())
@@ -272,6 +369,46 @@ fn find_windows_code_executable<'a>(
         .into_iter()
         .map(|root| root.join("Code.exe"))
         .find(|candidate| candidate.is_file())
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn find_windows_cursor_executable<'a>(
+    path_directories: impl IntoIterator<Item = &'a Path>,
+    install_roots: impl IntoIterator<Item = &'a Path>,
+) -> Option<std::path::PathBuf> {
+    const EXECUTABLE_NAMES: [&str; 2] = ["Cursor.exe", "cursor.exe"];
+
+    for directory in path_directories {
+        for name in EXECUTABLE_NAMES {
+            let direct = directory.join(name);
+            if direct.is_file() {
+                return Some(direct);
+            }
+        }
+
+        if directory.join("cursor.cmd").is_file() {
+            // Cursor commonly adds `resources/app/bin` to PATH, while the
+            // native executable lives at the installation root.
+            for root in directory.ancestors().skip(1).take(4) {
+                for name in EXECUTABLE_NAMES {
+                    let native = root.join(name);
+                    if native.is_file() {
+                        return Some(native);
+                    }
+                }
+            }
+        }
+    }
+
+    for root in install_roots {
+        for name in EXECUTABLE_NAMES {
+            let candidate = root.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -415,6 +552,7 @@ mod tests {
     fn editor_kinds_have_stable_protocol_values_and_labels() {
         let cases = [
             (EditorKind::VsCode, "vscode", "VS Code"),
+            (EditorKind::Cursor, "cursor", "Cursor"),
             (
                 EditorKind::AntigravityIde,
                 "antigravity_ide",
@@ -435,6 +573,10 @@ mod tests {
             Some(code_command())
         );
         assert_eq!(
+            command_for_editor(Some(EditorKind::Cursor)),
+            Some(cursor_command())
+        );
+        assert_eq!(
             command_for_editor(Some(EditorKind::AntigravityIde)),
             Some(antigravity_ide_command())
         );
@@ -443,9 +585,22 @@ mod tests {
     }
 
     #[test]
-    fn source_specific_launch_uses_antigravity_ide_and_legacy_uses_default() {
+    fn source_specific_launch_uses_selected_editor_and_legacy_uses_default() {
         let temp = TempDir::new().unwrap();
         let launcher = RecordingLauncher::default();
+
+        let cursor_command = open_editor_with(
+            &launcher,
+            Some(EditorKind::Cursor),
+            temp.path(),
+            WorkspaceLaunchMode::PreferExisting,
+        )
+        .unwrap();
+        assert_eq!(cursor_command, super::cursor_command());
+        assert_eq!(
+            launcher.call.lock().unwrap().as_ref().unwrap().0,
+            OsString::from(super::cursor_command())
+        );
 
         let antigravity_command = open_editor_with(
             &launcher,
@@ -570,6 +725,22 @@ mod tests {
 
         assert_eq!(
             find_windows_code_executable([bin.as_path()], std::iter::empty()),
+            Some(executable)
+        );
+    }
+
+    #[test]
+    fn resolves_native_windows_cursor_without_invoking_a_batch_shell() {
+        let temp = TempDir::new().unwrap();
+        let install_root = temp.path().join("Cursor");
+        let bin = install_root.join("resources").join("app").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("cursor.cmd"), b"launcher").unwrap();
+        let executable = install_root.join("Cursor.exe");
+        std::fs::write(&executable, b"native executable").unwrap();
+
+        assert_eq!(
+            find_windows_cursor_executable([bin.as_path()], std::iter::empty()),
             Some(executable)
         );
     }

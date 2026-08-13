@@ -135,7 +135,7 @@ test("each extension-host activation gets an opaque collision-resistant identity
   assert.equal(first.instanceId.includes("session-1"), false);
 });
 
-test("classifies VS Code and Antigravity IDE using bounded public host signals", () => {
+test("classifies VS Code, Cursor, and Antigravity IDE using bounded public host signals", () => {
   assert.equal(
     detectEditor(fakeVscode({
       env: { uriScheme: "vscode", appName: "Visual Studio Code" },
@@ -147,6 +147,18 @@ test("classifies VS Code and Antigravity IDE using bounded public host signals",
       env: { uriScheme: "VSCODE-INSIDERS", appName: "Visual Studio Code - Insiders" },
     })),
     EDITOR_KINDS.vscode,
+  );
+  assert.equal(
+    detectEditor(fakeVscode({
+      env: { uriScheme: "Cursor", appName: "Unexpected raw product name" },
+    })),
+    EDITOR_KINDS.cursor,
+  );
+  assert.equal(
+    detectEditor(fakeVscode({
+      env: { uriScheme: "unknown-fork", appName: "Cursor" },
+    })),
+    EDITOR_KINDS.cursor,
   );
   assert.equal(
     detectEditor(fakeVscode({

@@ -65,8 +65,8 @@
       "../LICENSE": "LICENSE",
       "../PRIVACY.md": "PRIVACY.md"
     },
-    "shortDescription": "VS Code and Antigravity workspace activity overview",
-    "longDescription": "A privacy-preserving local workspace switcher for VS Code and Antigravity IDE windows."
+    "shortDescription": "VS Code, Cursor, and Antigravity workspace activity overview",
+    "longDescription": "A privacy-preserving local workspace and agent-activity monitor for VS Code, Cursor, and Antigravity IDE."
   },
   "plugins": {
     "updater": {

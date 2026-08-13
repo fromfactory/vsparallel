@@ -2,7 +2,7 @@
   "name": "vsparallel-companion",
   "displayName": "VSParallel Companion",
   "description": "Reports minimal workspace and agent-extension presence metadata to the local VSParallel desktop app.",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "publisher": "vsparallel",
   "license": "MIT",
   "private": true,

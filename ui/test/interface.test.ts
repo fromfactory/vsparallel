@@ -100,6 +100,27 @@ test("the main chrome omits redundant labels while retaining an accessible works
   );
 });
 
+test("the workspace empty state links directly to setup and explains Cursor fallback limits", () => {
+  const html = read("ui/index.html");
+  const css = read("ui/styles.css");
+  const javascript = read("ui/generated/app.js");
+  const emptyState = html.match(
+    /<div\b(?=[^>]*id="emptyState")[^>]*>[\s\S]*?<\/div>/i,
+  )?.[0];
+  assert.ok(emptyState, "the workspace empty state should exist");
+  assert.match(emptyState, /id="emptySetupButton"[^>]*>[\s\S]*?Open setup/i);
+  assert.match(emptyState, /only the companion\s+reports a live, focused, or openable window/i);
+  assert.match(css, /\.empty-state__actions\s*\{[^}]*display:\s*flex[^}]*justify-content:\s*center/s);
+  assert.match(
+    javascript,
+    /emptySetupButton:\s*requiredElement\("#emptySetupButton"\)/,
+  );
+  assert.match(
+    javascript,
+    /elements\.emptySetupButton\.addEventListener\("click",\s*openSettingsDialog\)/,
+  );
+});
+
 test("global Codex and Claude usage meters emphasize remaining capacity", () => {
   const html = read("ui/index.html");
   const css = read("ui/styles.css");
@@ -253,7 +274,13 @@ test("workspace activity preserves the backend's distinct no-activity label", ()
     "normalizeActivityView",
   ].map((name) => appFunction(javascript, name)).join("\n");
   const context = {} as {
-    normalizeActivityView(value: unknown): { label: string; kind: string; modelKind: string | null };
+    normalizeActivityView(value: unknown): {
+      label: string;
+      kind: string;
+      modelKind: string | null;
+      modelName: string;
+      agentKind: string;
+    };
   };
   vm.runInNewContext(
     `const MAX_JAVASCRIPT_TIMESTAMP_MS = 8_640_000_000_000_000; ${functions}`,
@@ -264,11 +291,67 @@ test("workspace activity preserves the backend's distinct no-activity label", ()
     state: "unknown",
     label: "No activity yet",
     detail: "Submit a prompt from this workspace.",
+    modelName: "gpt-5.6-codex",
+    agentKind: "Agent",
   });
   assert.equal(initial.kind, "unknown");
   assert.equal(initial.label, "No activity yet");
+  assert.equal(initial.modelName, "gpt-5.6-codex");
+  assert.equal(initial.agentKind, "Agent");
   assert.equal(context.normalizeActivityView({ state: "unknown" }).modelKind, null);
   assert.equal(context.normalizeActivityView({ state: "unknown" }).label, "Unknown");
+});
+
+test("workspace normalization preserves Cursor IDE and agent metadata", () => {
+  const javascript = read("ui/generated/app.js");
+  const functions = [
+    "isObject",
+    "asString",
+    "asFiniteNumber",
+    "asTimestamp",
+    "asNullableBoolean",
+    "normalizeStateToken",
+    "describeActivityState",
+    "normalizeAntigravityModelKind",
+    "normalizeActivityView",
+    "deriveName",
+    "normalizeWorkspace",
+  ].map((name) => appFunction(javascript, name)).join("\n");
+  const context = {} as {
+    normalizeWorkspace(value: unknown, index: number): {
+      editor: string;
+      editorName: string;
+      cursor: {
+        kind: string;
+        label: string;
+        modelName: string;
+        agentKind: string;
+      } | null;
+    };
+  };
+  vm.runInNewContext(
+    `const MAX_JAVASCRIPT_TIMESTAMP_MS = 8_640_000_000_000_000; ${functions}`,
+    context,
+  );
+
+  const workspace = context.normalizeWorkspace({
+    instanceId: "cursor-window",
+    editor: "cursor",
+    name: "project",
+    path: "/work/project",
+    cursor: {
+      state: "turn_finished",
+      modelName: "claude-4-sonnet",
+      agentKind: "Background agent",
+    },
+  }, 0);
+
+  assert.equal(workspace.editor, "cursor");
+  assert.equal(workspace.editorName, "Cursor");
+  assert.equal(workspace.cursor?.kind, "finished");
+  assert.equal(workspace.cursor?.label, "Turn finished");
+  assert.equal(workspace.cursor?.modelName, "claude-4-sonnet");
+  assert.equal(workspace.cursor?.agentKind, "Background agent");
 });
 
 test("workspace normalization preserves Antigravity source and recent hook activity", () => {
@@ -334,6 +417,7 @@ test("workspace activity aggregation keeps the highest-priority lifecycle state"
       codex: Activity;
       claude: Activity;
       antigravity: Activity | null;
+      cursor: Activity | null;
     }): Activity;
   };
   interface Activity {
@@ -352,6 +436,7 @@ test("workspace activity aggregation keeps the highest-priority lifecycle state"
     codex: activity("finished", "Turn finished"),
     claude: activity("activity", "Activity detected"),
     antigravity: activity("failure", "Failed/interrupted"),
+    cursor: null,
   });
   assert.equal(active.kind, "activity");
   assert.equal(active.label, "Activity detected");
@@ -360,6 +445,7 @@ test("workspace activity aggregation keeps the highest-priority lifecycle state"
     codex: activity("unknown", "No activity yet"),
     claude: activity("finished", "Turn finished"),
     antigravity: null,
+    cursor: null,
   });
   assert.equal(finished.kind, "finished");
   assert.equal(finished.label, "Turn finished");
@@ -374,6 +460,7 @@ test("workspace activity aggregation keeps the highest-priority lifecycle state"
       codex: activity("finished", "Turn finished"),
       claude: activity("unknown", "No activity yet"),
       antigravity,
+      cursor: null,
     }),
     antigravity,
     "Antigravity lifecycle activity should participate without synthesizing a model label",
@@ -383,9 +470,18 @@ test("workspace activity aggregation keeps the highest-priority lifecycle state"
     codex: activity("finished", "Turn finished"),
     claude: activity("failure", "Failed/interrupted"),
     antigravity: activity("unknown", "Unknown"),
+    cursor: null,
   });
   assert.equal(failure.kind, "failure");
   assert.equal(failure.label, "Failed/interrupted");
+
+  const cursor = activity("activity", "Activity detected");
+  assert.equal(context.aggregateActivity({
+    codex: activity("finished", "Turn finished"),
+    claude: activity("unknown", "No activity yet"),
+    antigravity: null,
+    cursor,
+  }), cursor);
 });
 
 test("workspaces render as cards in single Open and Recent sections", () => {
@@ -543,6 +639,7 @@ test("workspace names lead the application label hierarchy without theming the e
 
   const applicationThemes = cssBlocksMatching(css, /\.workspace-application\[data-editor=/);
   assert.match(applicationThemes, /data-editor=["']vscode["'][^{}]*\{[^}]*var\(--accent/i);
+  assert.match(applicationThemes, /data-editor=["']cursor["'][^{}]*\{[^}]*var\(--green/i);
 });
 
 test("Antigravity model labels accept only the public closed model set", () => {
@@ -685,7 +782,59 @@ test("Codex setup keeps review guidance separate from installed status", () => {
   }, "codex").reviewRequired, true);
 });
 
-test("setup summary treats VS Code and Antigravity IDE as peer editor choices", () => {
+test("Cursor setup distinguishes combined live monitoring from hooks-only setup", () => {
+  const javascript = read("ui/generated/app.js");
+  const context = {} as {
+    integrationInstallButtonLabel(component: {
+      kind: string;
+      actionLabel: string;
+    }): string;
+  };
+  vm.runInNewContext(appFunction(javascript, "integrationInstallButtonLabel"), context);
+
+  assert.equal(context.integrationInstallButtonLabel({
+    kind: "cursorCompanion",
+    actionLabel: "Install",
+  }), "Set up Cursor monitoring");
+  assert.equal(context.integrationInstallButtonLabel({
+    kind: "cursorCompanion",
+    actionLabel: "Repair",
+  }), "Repair Cursor monitoring");
+  assert.equal(context.integrationInstallButtonLabel({
+    kind: "cursorCompanion",
+    actionLabel: "Update",
+  }), "Repair Cursor monitoring");
+  assert.equal(context.integrationInstallButtonLabel({
+    kind: "cursor",
+    actionLabel: "Install",
+  }), "Install hooks only");
+  assert.equal(context.integrationInstallButtonLabel({
+    kind: "cursor",
+    actionLabel: "Repair",
+  }), "Repair hooks only");
+
+  const runIntegrationAction = sliceBetween(
+    javascript,
+    /async function\s+runIntegrationAction\s*\(/,
+    /function\s+formatNaturalList\s*\(/,
+    "runIntegrationAction",
+  );
+  assert.match(
+    runIntegrationAction,
+    /cursorCompanion:\s*\{\s*install:\s*["']install_cursor_monitoring["']/s,
+  );
+  assert.match(
+    runIntegrationAction,
+    /cursor:\s*\{\s*install:\s*["']install_cursor_hooks["']/s,
+  );
+  assert.match(
+    runIntegrationAction,
+    /catch\s*\([^)]*\)\s*\{[\s\S]*invoke\(["']get_integration_status["']/,
+    "a partially applied setup action should refresh its visible status",
+  );
+});
+
+test("setup summary treats VS Code, Cursor, and Antigravity IDE as peer editor choices", () => {
   const javascript = read("ui/generated/app.js");
   const functions = [
     "summarizeEditorCompanions",
@@ -709,11 +858,14 @@ test("setup summary treats VS Code and Antigravity IDE as peer editor choices", 
   ) => ({ kind, visualState, installed, token });
   const status = (
     vscode: ReturnType<typeof component>,
+    cursorCompanion: ReturnType<typeof component>,
     antigravityIde: ReturnType<typeof component>,
     hookState: "missing" | "ready" = "ready",
   ) => ({
     companion: vscode,
+    cursorCompanion,
     antigravityIde,
+    cursor: component("cursor", hookState, hookState === "ready"),
     antigravity: component("antigravity", hookState, hookState === "ready"),
     codex: component("codex", hookState, hookState === "ready"),
     claude: component("claude", hookState, hookState === "ready"),
@@ -721,6 +873,7 @@ test("setup summary treats VS Code and Antigravity IDE as peer editor choices", 
 
   const vscodeReady = context.describeSetupSummary(status(
     component("companion", "ready", true, "installed"),
+    component("cursorCompanion", "missing", false, "not_installed"),
     component("antigravityIde", "missing", false, "not_installed"),
   ), false, false, 0);
   assert.equal(vscodeReady.summary, "Integrations ready");
@@ -728,13 +881,23 @@ test("setup summary treats VS Code and Antigravity IDE as peer editor choices", 
 
   const antigravityReady = context.describeSetupSummary(status(
     component("companion", "error", false, "unavailable"),
+    component("cursorCompanion", "missing", false, "not_installed"),
     component("antigravityIde", "ready", true, "installed"),
   ), true, false, 0);
   assert.equal(antigravityReady.summary, "Ready");
   assert.equal(antigravityReady.attention, false);
 
+  const cursorReady = context.describeSetupSummary(status(
+    component("companion", "error", false, "unavailable"),
+    component("cursorCompanion", "ready", true, "installed"),
+    component("antigravityIde", "error", false, "unavailable"),
+  ), true, false, 0);
+  assert.equal(cursorReady.summary, "Ready");
+  assert.equal(cursorReady.attention, false);
+
   const neitherReady = context.describeSetupSummary(status(
     component("companion", "missing", false, "not_installed"),
+    component("cursorCompanion", "missing", false, "not_installed"),
     component("antigravityIde", "error", false, "unavailable"),
   ), true, false, 0);
   assert.equal(neitherReady.summary, "Editor setup needed");
@@ -742,33 +905,67 @@ test("setup summary treats VS Code and Antigravity IDE as peer editor choices", 
 
   const optionalHooksMissing = context.describeSetupSummary(status(
     component("companion", "ready", true, "installed"),
+    component("cursorCompanion", "missing", false, "not_installed"),
     component("antigravityIde", "missing", false, "not_installed"),
     "missing",
   ), true, false, 0);
   assert.equal(optionalHooksMissing.summary, "Optional setup");
   assert.equal(optionalHooksMissing.attention, false);
+
+  const unavailableCursor = context.describeSetupSummary(status(
+    component("companion", "ready", true, "installed"),
+    component("cursorCompanion", "error", false, "unavailable"),
+    component("antigravityIde", "error", false, "unavailable"),
+    "missing",
+  ), true, false, 0);
+  assert.equal(unavailableCursor.summary, "Optional setup");
+  assert.equal(unavailableCursor.attention, false);
 });
 
-test("setup-all skips either editor whose CLI is unavailable", () => {
+test("setup-all skips each editor whose CLI is unavailable", () => {
   const javascript = read("ui/generated/app.js");
   const context = {} as {
     availableEditorSetupKinds(status: unknown): string[];
   };
   vm.runInNewContext(appFunction(javascript, "availableEditorSetupKinds"), context);
 
-  const kinds = (companion: string, antigravityIde: string) => Array.from(
+  const kinds = (companion: string, cursorCompanion: string, antigravityIde: string) => Array.from(
     context.availableEditorSetupKinds({
       companion: { token: companion },
+      cursorCompanion: { token: cursorCompanion },
       antigravityIde: { token: antigravityIde },
     }),
   );
-  assert.deepEqual(kinds("not_installed", "not_installed"), [
+  assert.deepEqual(kinds("not_installed", "not_installed", "not_installed"), [
     "companion",
+    "cursorCompanion",
     "antigravityIde",
   ]);
-  assert.deepEqual(kinds("unavailable", "not_installed"), ["antigravityIde"]);
-  assert.deepEqual(kinds("not_installed", "unavailable"), ["companion"]);
-  assert.deepEqual(kinds("unavailable", "unavailable"), []);
+  assert.deepEqual(kinds("unavailable", "not_installed", "not_installed"), [
+    "cursorCompanion",
+    "antigravityIde",
+  ]);
+  assert.deepEqual(kinds("not_installed", "unavailable", "unavailable"), ["companion"]);
+  assert.deepEqual(kinds("unavailable", "unavailable", "unavailable"), []);
+
+  const setupAll = sliceBetween(
+    javascript,
+    /async function\s+setupAllIntegrations\s*\(/,
+    /function\s+openSettingsDialog\s*\(/,
+    "setupAllIntegrations",
+  );
+  assert.match(
+    setupAll,
+    /command:\s*["']install_cursor_monitoring["']/,
+  );
+  assert.match(
+    setupAll,
+    /cursorHookFallbackSteps[\s\S]*editorKinds\.includes\(["']cursorCompanion["']\)[\s\S]*command:\s*["']install_cursor_hooks["']/,
+  );
+  assert.match(
+    setupAll,
+    /Live Cursor IDE heartbeats begin after reload; the Agents Window remains hook-only/,
+  );
 });
 
 test("setup separates activity hooks from provider usage requirements", () => {
@@ -787,26 +984,50 @@ test("setup separates activity hooks from provider usage requirements", () => {
   assert.match(integrationText, /Codex activity hooks/i);
   assert.match(integrationText, /Claude Code activity hooks/i);
   assert.match(integrationText, /Antigravity IDE companion/i);
+  assert.match(integrationText, /Cursor companion/i);
+  assert.match(integrationText, /Cursor hooks only/i);
+  assert.match(integrationText, /Cursor IDE and Agents Window/i);
+  assert.match(integrationText, /workspaceOpen observation creates recent workspace evidence/i);
+  assert.match(integrationText, /not a live, focused, or openable window or an agent-activity card/i);
+  assert.match(integrationText, /all five managed handlers—including workspaceOpen—are current/i);
   assert.match(integrationText, /Antigravity activity hooks/i);
   assert.match(integrationText, /Recent activity only/i);
   assert.match(integrationText, /Start an agent turn after installation/i);
   assert.match(integrationText, /workspace-level \.agents\/hooks\.json can override/i);
   assert.match(
     integrationText,
-    /Install at least one editor companion—VS Code or Antigravity IDE—to track live workspaces/i,
+    /Install at least one editor companion—VS Code, Cursor, or Antigravity IDE—to track live workspaces/i,
   );
   const antigravityIdeCard = integrationSection.match(
     /<article\b(?=[^>]*id="antigravityIdeCard")[^>]*>[\s\S]*?<\/article>/i,
   );
   assert.ok(antigravityIdeCard, "the Antigravity IDE companion card should exist");
   assert.doesNotMatch(antigravityIdeCard[0], /optional-label|>\s*Optional\s*</i);
+  const cursorCompanionCard = integrationSection.match(
+    /<article\b(?=[^>]*id="cursorCompanionCard")[^>]*>[\s\S]*?<\/article>/i,
+  );
+  assert.ok(cursorCompanionCard, "the Cursor companion card should exist");
+  assert.doesNotMatch(cursorCompanionCard[0], /optional-label|>\s*Optional\s*</i);
+  assert.match(cursorCompanionCard[0], /Set up Cursor monitoring/i);
+  assert.match(cursorCompanionCard[0], /Reload Cursor IDE windows before live heartbeats begin/i);
+  assert.match(cursorCompanionCard[0], /Agents Window remains\s+hook-only/i);
+  assert.match(cursorCompanionCard[0], /not a live or openable window/i);
+  assert.match(cursorCompanionCard[0], /Uninstall companion/i);
+  assert.match(cursorCompanionCard[0], /removes live IDE support only/i);
+  const cursorHooksCard = integrationSection.match(
+    /<article\b(?=[^>]*id="cursorCard")[^>]*>[\s\S]*?<\/article>/i,
+  );
+  assert.ok(cursorHooksCard, "the Cursor hooks-only card should exist");
+  assert.match(cursorHooksCard[0], /Cursor hooks only/i);
+  assert.match(cursorHooksCard[0], /Recent activity only/i);
+  assert.match(cursorHooksCard[0], /Install hooks only/i);
   assert.match(
     integrationText,
-    /compatible, signed-in Codex CLI available to this app, either from a standalone installation or the locally installed Codex extension in VS Code or Antigravity IDE/i,
+    /compatible, signed-in Codex CLI available to this app, either from a standalone installation or the locally installed Codex extension in VS Code, Cursor, or Antigravity IDE/i,
   );
   assert.match(
     integrationText,
-    /compatible, signed-in Claude Code CLI available to this app, either from a standalone installation or the locally installed Claude Code extension in VS Code or Antigravity IDE/i,
+    /compatible, signed-in Claude Code CLI available to this app, either from a standalone installation or the locally installed Claude Code extension in VS Code, Cursor, or Antigravity IDE/i,
   );
   assert.match(integrationText, /recent terminal status-line capture can also provide fallback usage/i);
   assert.equal(
@@ -823,12 +1044,53 @@ test("setup separates activity hooks from provider usage requirements", () => {
   assert.match(javascript, /Claude Code activity hooks installed\. Usage remaining is separate/);
   assert.match(javascript, /Antigravity 2\.0 hook execution/);
   assert.match(javascript, /Antigravity IDE hook execution/);
+  assert.match(javascript, /Cursor hook records/);
+  assert.match(javascript, /Cursor live heartbeat/);
+  assert.match(javascript, /Cursor workspace hook/);
+  assert.match(javascript, /Cursor command/);
+  assert.match(
+    javascript,
+    /Opening a local workspace can create recent workspace evidence; start a new turn in the Cursor IDE or Agents Window for lifecycle status/,
+  );
+  assert.match(
+    javascript,
+    /live IDE heartbeats begin after reload\. The Agents Window remains hook-only/,
+  );
   assert.match(
     javascript,
     /Opening an Antigravity 2\.0 Project or Antigravity IDE workspace does not fire hooks/,
   );
   assert.match(javascript, /No available editor companion CLI was detected/);
   assert.doesNotMatch(javascript, /All integrations are installed|still needs/i);
+});
+
+test("Cursor heartbeat diagnostics keep hook-only Agents Window evidence informational", () => {
+  const javascript = read("ui/generated/app.js");
+  const context = {} as {
+    describeCursorHeartbeatDiagnostic(
+      activeRecords: number,
+      retainedRecords: number,
+      latestDescription: string,
+      recentWorkspaceOpens: number,
+    ): string;
+  };
+  vm.runInNewContext(
+    appFunction(javascript, "describeCursorHeartbeatDiagnostic"),
+    context,
+  );
+
+  assert.equal(
+    context.describeCursorHeartbeatDiagnostic(2, 3, "just now", 1),
+    "2 active · 3 retained · latest just now",
+  );
+  assert.match(
+    context.describeCursorHeartbeatDiagnostic(0, 0, "unavailable", 1),
+    /hook source may be the hook-only Agents Window; reload Cursor IDE for OPEN/,
+  );
+  assert.match(
+    context.describeCursorHeartbeatDiagnostic(0, 1, "5 minutes ago", 0),
+    /No active Cursor IDE heartbeat.*Agents Window is hook-only/,
+  );
 });
 
 test("the interface uses the reference icon on every in-app brand surface", () => {
@@ -873,6 +1135,9 @@ test("workspace rows omit redundant leading lifecycle icons while keeping provid
   assert.match(javascript, /antigravityModelLabel\(workspace\.antigravity\.modelKind\)/);
   assert.match(javascript, /antigravityModelFamilyLabel\(workspace\.antigravity\.modelKind\)/);
   assert.match(javascript, /createProviderState\(\s*"Antigravity",\s*workspace\.antigravity,/);
+  assert.match(javascript, /createProviderState\(\s*"Cursor Agent",\s*workspace\.cursor,/);
+  assert.match(javascript, /workspace\.cursor\.agentKind/);
+  assert.match(javascript, /workspace\.cursor\.modelName/);
   assert.match(javascript, /`Antigravity \(\$\{modelLabel\}\), latest model reported by Antigravity`/);
   assert.match(javascript, /"Antigravity built-in model",\s*modelFamily,\s*modelLabel/);
   assert.match(javascript, /latest model reported by Antigravity/);
