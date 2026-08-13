@@ -378,6 +378,14 @@ test("floating mode is compact translucent glass with an opaque fallback", () =>
     css,
     /data-window-mode="floating"\][^{}]*\.activity-providers\s*\{[^}]*display:\s*none/,
   );
+  assert.match(
+    css,
+    /data-window-mode="floating"\][^{}]*\.workspace-meta\s*\{[^}]*display:\s*none/,
+  );
+  assert.match(
+    css,
+    /data-window-mode="floating"\][^{}]*\.workspace-name\s*\{[^}]*font-size:\s*15px[^}]*font-weight:\s*680/s,
+  );
   assert.match(css, /\.workspace-compact-status\s*\{[^}]*display:\s*none/s);
   assert.match(
     css,
@@ -395,6 +403,10 @@ test("floating mode is compact translucent glass with an opaque fallback", () =>
     css,
     /data-window-mode="floating"\][^{}]*\.workspace-compact-status\[data-state="finished"\]\s*\{[^}]*color:\s*var\(--green-text\)/s,
   );
+  const compactStatusStyles = Array.from(
+    css.matchAll(/([^{}]*\.workspace-compact-status[^{}]*)\{([^{}]*)\}/g),
+  ).map((match) => match[2]).join("\n");
+  assert.doesNotMatch(compactStatusStyles, /\b(?:background|border(?:-color|-radius)?)\s*:/);
   assert.match(
     css,
     /data-window-mode="floating"\][^{}]*\.usage-overview\s*\{[^}]*padding:\s*5px 6px 6px/,

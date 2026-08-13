@@ -2285,7 +2285,7 @@ html[data-workspace-opening="true"] .app-shell {
 }
 
 :root[data-window-mode="floating"] .workspace-meta {
-  margin-top: 1px;
+  display: none;
 }
 
 :root[data-window-mode="floating"] .workspace-application {
@@ -2297,7 +2297,12 @@ html[data-workspace-opening="true"] .app-shell {
 
 :root[data-window-mode="floating"] .workspace-name,
 :root[data-window-mode="floating"] .workspace-title-line {
-  line-height: 16px;
+  line-height: 20px;
+}
+
+:root[data-window-mode="floating"] .workspace-name {
+  font-size: 15px;
+  font-weight: 680;
 }
 
 :root[data-window-mode="floating"] .workspace-path {
@@ -2310,10 +2315,7 @@ html[data-workspace-opening="true"] .app-shell {
   max-width: 100%;
   align-items: center;
   justify-self: end;
-  padding: 0 6px;
   overflow: hidden;
-  border: 1px solid var(--border-strong);
-  border-radius: 999px;
   color: var(--text-muted);
   font-size: 9px;
   font-weight: 650;
@@ -2323,20 +2325,14 @@ html[data-workspace-opening="true"] .app-shell {
 }
 
 :root[data-window-mode="floating"] .workspace-compact-status[data-state="activity"] {
-  border-color: var(--accent-border);
-  background: var(--accent-soft);
   color: var(--accent-text);
 }
 
 :root[data-window-mode="floating"] .workspace-compact-status[data-state="finished"] {
-  border-color: var(--green-border);
-  background: var(--green-soft);
   color: var(--green-text);
 }
 
 :root[data-window-mode="floating"] .workspace-compact-status[data-state="failure"] {
-  border-color: var(--red-border);
-  background: var(--red-soft);
   color: var(--red-text);
 }
 
