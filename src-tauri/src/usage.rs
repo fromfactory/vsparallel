@@ -253,6 +253,12 @@ pub fn build_usage_snapshot_with<
     let claude = claude_live
         .or_else(|| {
             state_root
+                .filter(|root| {
+                    crate::state::integration_source_is_enabled_at(
+                        root,
+                        crate::state::IntegrationSource::ClaudeHooks,
+                    )
+                })
                 .map(|root| load_claude_usage(root, now_ms))
                 .filter(|view| view.remaining_percent.is_some())
         })
@@ -1421,7 +1427,12 @@ pub fn run_claude_statusline<R: Read, W: Write>(
     state_root: Option<&Path>,
     captured_at_ms: i64,
 ) -> i32 {
-    if let Some(state_root) = state_root {
+    if let Some(state_root) = state_root.filter(|root| {
+        crate::state::integration_source_is_enabled_at(
+            root,
+            crate::state::IntegrationSource::ClaudeHooks,
+        )
+    }) {
         let _ = capture_claude_usage(&mut input, state_root, captured_at_ms);
     }
     let _ = output.flush();
@@ -1972,6 +1983,23 @@ mod tests {
             fallback.claude.detail,
             "Usage limits captured by Claude Code."
         );
+
+        crate::state::set_integration_source_enabled_at(
+            temp.path(),
+            crate::state::IntegrationSource::ClaudeHooks,
+            false,
+        )
+        .unwrap();
+        let disabled = build_usage_snapshot_with(
+            &FakeRunner(Err("signed out".to_string())),
+            OsStr::new("fake-codex"),
+            &FakeClaudeRunner(Err("unsupported".to_string())),
+            OsStr::new("fake-claude"),
+            Some(temp.path()),
+            2_000,
+        );
+        assert_eq!(disabled.claude.remaining_percent, None);
+        assert_eq!(disabled.claude.state, "unavailable");
     }
 
     #[test]
@@ -2507,6 +2535,28 @@ mod tests {
         assert_eq!(view.state, "available");
         assert_eq!(view.remaining_percent, Some(55.0));
         assert_eq!(view.windows[0].remaining_percent, 79.5);
+    }
+
+    #[test]
+    fn disabled_claude_integration_suppresses_late_statusline_writes() {
+        let temp = TempDir::new().unwrap();
+        crate::state::set_integration_source_enabled_at(
+            temp.path(),
+            crate::state::IntegrationSource::ClaudeHooks,
+            false,
+        )
+        .unwrap();
+        let input = br#"{
+            "rate_limits": {
+                "five_hour": {"used_percentage": 20, "resets_at": 1800000000}
+            }
+        }"#;
+
+        let (code, output) = claude_input(temp.path(), input, 1_000);
+
+        assert_eq!(code, 0);
+        assert!(output.is_empty());
+        assert!(!claude_record_path(temp.path()).exists());
     }
 
     #[test]

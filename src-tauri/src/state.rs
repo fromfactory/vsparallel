@@ -10,10 +10,28 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::{hash_map::DefaultHasher, BTreeSet, BinaryHeap, HashMap};
 use std::env;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
+use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+#[cfg(windows)]
+use std::os::windows::{ffi::OsStrExt, fs::MetadataExt};
+
+#[cfg(windows)]
+const MOVEFILE_REPLACE_EXISTING: u32 = 0x0000_0001;
+#[cfg(windows)]
+const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn MoveFileExW(existing_file_name: *const u16, new_file_name: *const u16, flags: u32) -> i32;
+}
 
 pub const SCHEMA_VERSION: u32 = 1;
 pub const ACTIVE_TTL_MS: i64 = 15_000;
@@ -24,6 +42,86 @@ const MAX_RECORD_CANDIDATES_PER_DIRECTORY: usize = 4_096;
 const MAX_FUTURE_SKEW_MS: i64 = 5 * 60 * 1_000;
 const MAX_CURSOR_METADATA_BYTES: usize = 128;
 const MAX_ZED_WORKSPACES_DISPLAYED: usize = 64;
+const INTEGRATION_DISABLE_DIRECTORY: &str = "integration-disabled";
+const DISPLAY_PREFERENCES_FILENAME: &str = "display-preferences.json";
+const DISPLAY_PREFERENCES_SCHEMA_VERSION: u32 = 1;
+const MAX_DISPLAY_PREFERENCES_BYTES: u64 = 16 * 1024;
+
+static DISPLAY_PREFERENCES_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IntegrationSource {
+    VsCodeCompanion,
+    CursorCompanion,
+    AntigravityIdeCompanion,
+    CursorHooks,
+    AntigravityHooks,
+    CodexHooks,
+    ClaudeHooks,
+}
+
+impl IntegrationSource {
+    const fn disable_marker(self) -> &'static str {
+        match self {
+            Self::VsCodeCompanion => "vscode-companion",
+            Self::CursorCompanion => "cursor-companion",
+            Self::AntigravityIdeCompanion => "antigravity-ide-companion",
+            Self::CursorHooks => "cursor-hooks",
+            Self::AntigravityHooks => "antigravity-hooks",
+            Self::CodexHooks => "codex-hooks",
+            Self::ClaudeHooks => "claude-hooks",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct EditorVisibility {
+    pub(crate) vscode: bool,
+    pub(crate) cursor: bool,
+    pub(crate) antigravity: bool,
+    pub(crate) zed: bool,
+}
+
+impl Default for EditorVisibility {
+    fn default() -> Self {
+        Self {
+            vscode: true,
+            cursor: true,
+            antigravity: true,
+            zed: true,
+        }
+    }
+}
+
+impl EditorVisibility {
+    pub(crate) fn includes(&self, editor: EditorKind) -> bool {
+        match editor {
+            EditorKind::VsCode => self.vscode,
+            EditorKind::Cursor => self.cursor,
+            EditorKind::AntigravityIde | EditorKind::Antigravity2 => self.antigravity,
+            EditorKind::Zed => self.zed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct DisplayPreferences {
+    pub(crate) schema_version: u32,
+    pub(crate) editors: EditorVisibility,
+    pub(crate) usage_limit_percentage: bool,
+}
+
+impl Default for DisplayPreferences {
+    fn default() -> Self {
+        Self {
+            schema_version: DISPLAY_PREFERENCES_SCHEMA_VERSION,
+            editors: EditorVisibility::default(),
+            usage_limit_percentage: true,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1138,7 +1236,15 @@ impl StateStore {
     }
 
     fn load_instances(&self, now_ms: i64) -> LoadResult<InstanceRecord> {
-        load_records(
+        let vscode_enabled =
+            integration_source_is_enabled_at(&self.root, IntegrationSource::VsCodeCompanion);
+        let cursor_enabled =
+            integration_source_is_enabled_at(&self.root, IntegrationSource::CursorCompanion);
+        let antigravity_ide_enabled = integration_source_is_enabled_at(
+            &self.root,
+            IntegrationSource::AntigravityIdeCompanion,
+        );
+        let mut result = load_records(
             &self.root.join("instances"),
             |record: &mut InstanceRecord| {
                 record.schema_version == SCHEMA_VERSION
@@ -1149,7 +1255,15 @@ impl StateStore {
                     && record.started_at_ms
                         <= record.last_seen_at_ms.saturating_add(MAX_FUTURE_SKEW_MS)
             },
-        )
+        );
+        result.records.retain(|record| match record.editor {
+            // Heartbeats written before the editor discriminator was added
+            // came only from VS Code.
+            None | Some(CompanionEditorKind::VsCode) => vscode_enabled,
+            Some(CompanionEditorKind::Cursor) => cursor_enabled,
+            Some(CompanionEditorKind::AntigravityIde) => antigravity_ide_enabled,
+        });
+        result
     }
 
     fn load_codex(&self, now_ms: i64) -> LoadResult<ActivityRecord> {
@@ -1212,6 +1326,26 @@ impl StateStore {
     }
 
     fn load_activity(&self, provider: &str, now_ms: i64) -> LoadResult<ActivityRecord> {
+        let source = match provider {
+            "codex" => IntegrationSource::CodexHooks,
+            "claude" => IntegrationSource::ClaudeHooks,
+            "cursor" => IntegrationSource::CursorHooks,
+            "antigravity" | "antigravity-ide" => IntegrationSource::AntigravityHooks,
+            _ => {
+                return LoadResult {
+                    records: Vec::new(),
+                    malformed: 0,
+                    omitted: 0,
+                }
+            }
+        };
+        if !integration_source_is_enabled_at(&self.root, source) {
+            return LoadResult {
+                records: Vec::new(),
+                malformed: 0,
+                omitted: 0,
+            };
+        }
         let supports_model = matches!(provider, "antigravity" | "antigravity-ide");
         let supports_cursor_metadata = provider == "cursor";
         load_records(&self.root.join(provider), |record: &mut ActivityRecord| {
@@ -1319,6 +1453,730 @@ pub fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
         .unwrap_or(0)
+}
+
+/// Returns whether observations from one installed component may be consumed.
+/// Missing markers deliberately mean enabled so existing installations and
+/// upgrades keep working without a migration step. Invalid marker state fails
+/// closed and suppresses the source.
+pub(crate) fn integration_source_is_enabled_at(root: &Path, source: IntegrationSource) -> bool {
+    match fs::symlink_metadata(root) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return true,
+        Ok(metadata) if state_root_is_safe(&metadata) => {}
+        _ => return false,
+    }
+
+    let directory = root.join(INTEGRATION_DISABLE_DIRECTORY);
+    match fs::symlink_metadata(&directory) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return true,
+        Ok(metadata) if metadata.is_dir() && !is_link_or_reparse_point(&metadata) => {}
+        _ => return false,
+    }
+
+    let marker = directory.join(source.disable_marker());
+    match fs::symlink_metadata(marker) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+        // A regular marker is the expected disabled state. Unexpected entries
+        // also fail closed instead of accidentally re-enabling tracking.
+        Ok(_) | Err(_) => false,
+    }
+}
+
+pub(crate) fn integration_source_is_enabled(source: IntegrationSource) -> Result<bool, String> {
+    Ok(integration_source_is_enabled_at(
+        &state_dir_from_environment()?,
+        source,
+    ))
+}
+
+/// Clears a disable marker only after a caller has verified installation.
+pub(crate) fn enable_integration_source(source: IntegrationSource) -> Result<(), String> {
+    let root = state_dir_from_environment()?;
+    set_integration_source_enabled_at(&root, source, true)
+}
+
+/// Persists a disable marker and removes currently retained observations.
+/// Normal component uninstalls call this only after external verification;
+/// Uninstall All may also call it after an external failure so the global
+/// stop-tracking request remains effective while the failure is reported.
+pub(crate) fn disable_integration_source_and_purge(
+    source: IntegrationSource,
+) -> Result<(), String> {
+    let root = state_dir_from_environment()?;
+    set_integration_source_enabled_at(&root, source, false)?;
+    purge_integration_source_at(&root, source)
+}
+
+/// Completes the global companion cleanup after every companion source has
+/// been disabled. At that point every regular JSON entry in the app-owned
+/// instances directory belongs to a disabled source, including records that
+/// are too malformed or large for source-specific ownership detection.
+pub(crate) fn purge_all_companion_instance_records_if_disabled() -> Result<(), String> {
+    let root = state_dir_from_environment()?;
+    purge_all_companion_instance_records_if_disabled_at(&root)
+}
+
+pub(crate) fn set_integration_source_enabled_at(
+    root: &Path,
+    source: IntegrationSource,
+    enabled: bool,
+) -> Result<(), String> {
+    ensure_state_root(root)?;
+    let directory = root.join(INTEGRATION_DISABLE_DIRECTORY);
+    if enabled {
+        match fs::symlink_metadata(&directory) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Ok(metadata) if metadata.is_dir() && !is_link_or_reparse_point(&metadata) => {}
+            Ok(_) => {
+                return Err(format!(
+                    "{} is not a regular disable-marker directory",
+                    directory.display()
+                ))
+            }
+            Err(error) => {
+                return Err(format!(
+                    "could not inspect {}: {error}",
+                    directory.display()
+                ))
+            }
+        }
+        let marker = directory.join(source.disable_marker());
+        return match fs::symlink_metadata(&marker) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Ok(metadata) if metadata.is_file() && !is_link_or_reparse_point(&metadata) => {
+                fs::remove_file(&marker)
+                    .map_err(|error| format!("could not remove {}: {error}", marker.display()))?;
+                sync_directory(&directory);
+                Ok(())
+            }
+            Ok(_) => Err(format!(
+                "{} is not a regular disable marker",
+                marker.display()
+            )),
+            Err(error) => Err(format!("could not inspect {}: {error}", marker.display())),
+        };
+    }
+
+    ensure_private_directory(&directory)?;
+    sync_directory(root);
+    let marker = directory.join(source.disable_marker());
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    match options.open(&marker) {
+        Ok(mut file) => {
+            file.write_all(b"disabled\n")
+                .and_then(|_| file.sync_all())
+                .map_err(|error| format!("could not write {}: {error}", marker.display()))?;
+            sync_directory(&directory);
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(&marker)
+                .map_err(|inspect| format!("could not inspect {}: {inspect}", marker.display()))?;
+            if metadata.is_file() && !is_link_or_reparse_point(&metadata) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{} is not a regular disable marker",
+                    marker.display()
+                ))
+            }
+        }
+        Err(error) => Err(format!("could not create {}: {error}", marker.display())),
+    }
+}
+
+fn ensure_private_directory(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() && !is_link_or_reparse_point(&metadata) => {}
+        Ok(_) => return Err(format!("{} is not a regular directory", path.display())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            fs::create_dir_all(path)
+                .map_err(|error| format!("could not create {}: {error}", path.display()))?;
+            let metadata = fs::symlink_metadata(path)
+                .map_err(|error| format!("could not inspect {}: {error}", path.display()))?;
+            if !metadata.is_dir() || is_link_or_reparse_point(&metadata) {
+                return Err(format!("{} is not a regular directory", path.display()));
+            }
+        }
+        Err(error) => return Err(format!("could not inspect {}: {error}", path.display())),
+    }
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("could not secure {}: {error}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) {
+    if let Ok(directory) = fs::File::open(path) {
+        let _ = directory.sync_all();
+    }
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) {}
+
+fn ensure_state_root(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if state_root_is_safe(&metadata) => return Ok(()),
+        Ok(metadata) if metadata.is_dir() && !is_link_or_reparse_point(&metadata) => {
+            return Err(format!(
+                "{} is world-writable; secure the state directory before continuing",
+                path.display()
+            ));
+        }
+        Ok(_) => return Err(format!("{} is not a regular directory", path.display())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("could not inspect {}: {error}", path.display())),
+    }
+
+    fs::create_dir_all(path)
+        .map_err(|error| format!("could not create {}: {error}", path.display()))?;
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("could not inspect {}: {error}", path.display()))?;
+    if !metadata.is_dir() || is_link_or_reparse_point(&metadata) {
+        return Err(format!("{} is not a regular directory", path.display()));
+    }
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("could not secure {}: {error}", path.display()))?;
+    Ok(())
+}
+
+fn state_root_is_safe(metadata: &fs::Metadata) -> bool {
+    if !metadata.is_dir() || is_link_or_reparse_point(metadata) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        // A private per-user group is common with a 0002 umask, including in
+        // test and development environments. Rejecting other-user writes is
+        // the portable boundary we can enforce without changing ownership or
+        // permissions on a caller-supplied state root.
+        metadata.permissions().mode() & 0o002 == 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn purge_integration_source_at(root: &Path, source: IntegrationSource) -> Result<(), String> {
+    match source {
+        IntegrationSource::VsCodeCompanion
+        | IntegrationSource::CursorCompanion
+        | IntegrationSource::AntigravityIdeCompanion => {
+            purge_companion_instance_records(root, source)
+        }
+        IntegrationSource::CursorHooks => remove_managed_state_entry(root, "cursor"),
+        IntegrationSource::CodexHooks => remove_managed_state_entry(root, "codex"),
+        IntegrationSource::ClaudeHooks => {
+            let mut errors = Vec::new();
+            if let Err(error) = remove_managed_state_entry(root, "claude") {
+                errors.push(error);
+            }
+            if let Err(error) = remove_managed_state_file(root, "usage", "claude.json") {
+                errors.push(error);
+            }
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(errors.join("; "))
+            }
+        }
+        IntegrationSource::AntigravityHooks => {
+            let mut errors = Vec::new();
+            for entry in ["antigravity", "antigravity-ide", "antigravity-hook-health"] {
+                if let Err(error) = remove_managed_state_entry(root, entry) {
+                    errors.push(error);
+                }
+            }
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(errors.join("; "))
+            }
+        }
+    }
+}
+
+fn purge_companion_instance_records(root: &Path, source: IntegrationSource) -> Result<(), String> {
+    let directory = root.join("instances");
+    match fs::symlink_metadata(&directory) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Ok(metadata) if metadata.is_dir() && !is_link_or_reparse_point(&metadata) => {}
+        Ok(_) => {
+            return Err(format!(
+                "{} is not a regular workspace-record directory",
+                directory.display()
+            ))
+        }
+        Err(error) => {
+            return Err(format!(
+                "could not inspect {}: {error}",
+                directory.display()
+            ))
+        }
+    }
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "could not read retained workspace records in {}: {error}",
+                directory.display()
+            ))
+        }
+    };
+    let mut errors = Vec::new();
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                errors.push(format!(
+                    "could not inspect a retained workspace record: {error}"
+                ));
+                continue;
+            }
+        };
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata)
+                if metadata.is_file()
+                    && !is_link_or_reparse_point(&metadata)
+                    && metadata.len() <= MAX_RECORD_BYTES =>
+            {
+                metadata
+            }
+            _ => continue,
+        };
+        if metadata.len() == 0 {
+            continue;
+        }
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                errors.push(format!("could not read {}: {error}", path.display()));
+                continue;
+            }
+        };
+        let Ok(record) = serde_json::from_slice::<InstanceRecord>(&bytes) else {
+            continue;
+        };
+        let owned = match source {
+            IntegrationSource::VsCodeCompanion => {
+                matches!(record.editor, None | Some(CompanionEditorKind::VsCode))
+            }
+            IntegrationSource::CursorCompanion => {
+                matches!(record.editor, Some(CompanionEditorKind::Cursor))
+            }
+            IntegrationSource::AntigravityIdeCompanion => {
+                matches!(record.editor, Some(CompanionEditorKind::AntigravityIde))
+            }
+            _ => false,
+        };
+        if owned {
+            if let Err(error) = fs::remove_file(&path) {
+                if error.kind() != io::ErrorKind::NotFound {
+                    errors.push(format!("could not remove {}: {error}", path.display()));
+                }
+            }
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+fn purge_all_companion_instance_records_if_disabled_at(root: &Path) -> Result<(), String> {
+    ensure_state_root(root)?;
+    for source in [
+        IntegrationSource::VsCodeCompanion,
+        IntegrationSource::CursorCompanion,
+        IntegrationSource::AntigravityIdeCompanion,
+    ] {
+        if !integration_source_is_explicitly_disabled_at(root, source)? {
+            return Err(format!(
+                "cannot clear all retained companion records while {} remains enabled",
+                source.disable_marker()
+            ));
+        }
+    }
+    purge_all_companion_instance_records(root)
+}
+
+fn integration_source_is_explicitly_disabled_at(
+    root: &Path,
+    source: IntegrationSource,
+) -> Result<bool, String> {
+    let directory = root.join(INTEGRATION_DISABLE_DIRECTORY);
+    match fs::symlink_metadata(&directory) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Ok(metadata) if metadata.is_dir() && !is_link_or_reparse_point(&metadata) => {}
+        Ok(_) => {
+            return Err(format!(
+                "{} is not a regular disable-marker directory",
+                directory.display()
+            ))
+        }
+        Err(error) => {
+            return Err(format!(
+                "could not inspect {}: {error}",
+                directory.display()
+            ))
+        }
+    }
+
+    let marker = directory.join(source.disable_marker());
+    match fs::symlink_metadata(&marker) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Ok(metadata) if metadata.is_file() && !is_link_or_reparse_point(&metadata) => Ok(true),
+        Ok(_) => Err(format!(
+            "{} is not a regular disable marker",
+            marker.display()
+        )),
+        Err(error) => Err(format!("could not inspect {}: {error}", marker.display())),
+    }
+}
+
+fn purge_all_companion_instance_records(root: &Path) -> Result<(), String> {
+    let directory = root.join("instances");
+    match fs::symlink_metadata(&directory) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Ok(metadata) if metadata.is_dir() && !is_link_or_reparse_point(&metadata) => {}
+        Ok(_) => {
+            return Err(format!(
+                "{} is not a regular workspace-record directory",
+                directory.display()
+            ))
+        }
+        Err(error) => {
+            return Err(format!(
+                "could not inspect {}: {error}",
+                directory.display()
+            ))
+        }
+    }
+
+    let mut errors = Vec::new();
+    let entries = fs::read_dir(&directory).map_err(|error| {
+        format!(
+            "could not read retained workspace records in {}: {error}",
+            directory.display()
+        )
+    })?;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                errors.push(format!(
+                    "could not inspect a retained workspace record: {error}"
+                ));
+                continue;
+            }
+        };
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        match fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.is_file() && !is_link_or_reparse_point(&metadata) => {
+                if let Err(error) = fs::remove_file(&path) {
+                    if error.kind() != io::ErrorKind::NotFound {
+                        errors.push(format!("could not remove {}: {error}", path.display()));
+                    }
+                }
+            }
+            Ok(_) => errors.push(format!(
+                "{} is not a regular workspace record and was not followed",
+                path.display()
+            )),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => errors.push(format!("could not inspect {}: {error}", path.display())),
+        }
+    }
+    sync_directory(&directory);
+
+    match fs::read_dir(&directory) {
+        Ok(entries) => {
+            for entry in entries {
+                match entry {
+                    Ok(entry)
+                        if entry.path().extension().and_then(|value| value.to_str())
+                            == Some("json") =>
+                    {
+                        errors.push(format!(
+                            "retained workspace record {} remains after cleanup",
+                            entry.path().display()
+                        ));
+                    }
+                    Ok(_) => {}
+                    Err(error) => errors.push(format!(
+                        "could not verify a retained workspace record was removed: {error}"
+                    )),
+                }
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => errors.push(format!(
+            "could not verify retained workspace cleanup in {}: {error}",
+            directory.display()
+        )),
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+fn remove_managed_state_entry(root: &Path, name: &str) -> Result<(), String> {
+    let path = root.join(name);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("could not inspect {}: {error}", path.display())),
+    };
+    let result = if metadata.is_dir() && !is_link_or_reparse_point(&metadata) {
+        fs::remove_dir_all(&path)
+    } else {
+        // A symlink or unexpected file is removed as an entry; its target is
+        // never traversed.
+        fs::remove_file(&path)
+    };
+    result.map_err(|error| format!("could not remove {}: {error}", path.display()))
+}
+
+fn remove_managed_state_file(
+    root: &Path,
+    directory_name: &str,
+    file_name: &str,
+) -> Result<(), String> {
+    let directory = root.join(directory_name);
+    let metadata = match fs::symlink_metadata(&directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "could not inspect {}: {error}",
+                directory.display()
+            ))
+        }
+    };
+    if !metadata.is_dir() || is_link_or_reparse_point(&metadata) {
+        return Err(format!(
+            "{} is not a regular directory",
+            directory.display()
+        ));
+    }
+    let path = directory.join(file_name);
+    match fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Ok(_) => {}
+        Err(error) => return Err(format!("could not inspect {}: {error}", path.display())),
+    }
+    // Removing a symlink here removes only the managed directory entry and
+    // never its target.
+    fs::remove_file(&path)
+        .map_err(|error| format!("could not remove {}: {error}", path.display()))?;
+    // Remove the directory only when this was its last managed cache. Other
+    // usage files are unrelated and must be preserved.
+    let _ = fs::remove_dir(&directory);
+    Ok(())
+}
+
+pub(crate) fn display_preferences_from_environment() -> Result<DisplayPreferences, String> {
+    load_display_preferences_at(&state_dir_from_environment()?)
+}
+
+pub(crate) fn set_editor_visibility_from_environment(
+    editor: &str,
+    visible: bool,
+) -> Result<DisplayPreferences, String> {
+    update_display_preferences_from_environment(|preferences| {
+        apply_editor_visibility(preferences, editor, visible)
+    })
+}
+
+fn apply_editor_visibility(
+    preferences: &mut DisplayPreferences,
+    editor: &str,
+    visible: bool,
+) -> Result<(), String> {
+    match editor {
+        "vscode" => preferences.editors.vscode = visible,
+        "cursor" => preferences.editors.cursor = visible,
+        "antigravity" | "antigravity_ide" | "antigravity_2" => {
+            preferences.editors.antigravity = visible
+        }
+        "zed" => preferences.editors.zed = visible,
+        _ => return Err("editor must be one of vscode, cursor, antigravity, or zed".to_string()),
+    }
+    Ok(())
+}
+
+pub(crate) fn set_usage_limit_percentage_visible_from_environment(
+    visible: bool,
+) -> Result<DisplayPreferences, String> {
+    update_display_preferences_from_environment(|preferences| {
+        preferences.usage_limit_percentage = visible;
+        Ok(())
+    })
+}
+
+fn update_display_preferences_from_environment<F>(update: F) -> Result<DisplayPreferences, String>
+where
+    F: FnOnce(&mut DisplayPreferences) -> Result<(), String>,
+{
+    let root = state_dir_from_environment()?;
+    let lock = DISPLAY_PREFERENCES_WRITE_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = lock
+        .lock()
+        .map_err(|_| "display preferences are temporarily unavailable".to_string())?;
+    let mut preferences = load_display_preferences_at(&root)?;
+    update(&mut preferences)?;
+    save_display_preferences_at(&root, &preferences)?;
+    Ok(preferences)
+}
+
+fn load_display_preferences_at(root: &Path) -> Result<DisplayPreferences, String> {
+    match fs::symlink_metadata(root) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(DisplayPreferences::default());
+        }
+        Ok(metadata) if state_root_is_safe(&metadata) => {}
+        Ok(_) => return Err(format!("{} is not a safe state directory", root.display())),
+        Err(error) => return Err(format!("could not inspect {}: {error}", root.display())),
+    }
+
+    let path = root.join(DISPLAY_PREFERENCES_FILENAME);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(DisplayPreferences::default())
+        }
+        Err(error) => return Err(format!("could not inspect {}: {error}", path.display())),
+    };
+    if !metadata.is_file()
+        || is_link_or_reparse_point(&metadata)
+        || metadata.len() > MAX_DISPLAY_PREFERENCES_BYTES
+    {
+        return Err(format!(
+            "{} is not a valid preferences file",
+            path.display()
+        ));
+    }
+    let bytes =
+        fs::read(&path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    let preferences: DisplayPreferences = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("could not parse {}: {error}", path.display()))?;
+    if preferences.schema_version != DISPLAY_PREFERENCES_SCHEMA_VERSION {
+        return Err(format!(
+            "{} has an unsupported schema version",
+            path.display()
+        ));
+    }
+    Ok(preferences)
+}
+
+fn save_display_preferences_at(
+    root: &Path,
+    preferences: &DisplayPreferences,
+) -> Result<(), String> {
+    ensure_state_root(root)?;
+    let path = root.join(DISPLAY_PREFERENCES_FILENAME);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_file() && !is_link_or_reparse_point(&metadata) => {}
+        Ok(_) => return Err(format!("{} is not a regular file", path.display())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("could not inspect {}: {error}", path.display())),
+    }
+    let mut bytes = serde_json::to_vec_pretty(preferences)
+        .map_err(|error| format!("could not serialize display preferences: {error}"))?;
+    bytes.push(b'\n');
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".display-preferences-")
+        .tempfile_in(root)
+        .map_err(|error| format!("could not create display preferences: {error}"))?;
+    #[cfg(unix)]
+    temporary
+        .as_file()
+        .set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|error| format!("could not secure display preferences: {error}"))?;
+    temporary
+        .write_all(&bytes)
+        .and_then(|_| temporary.as_file().sync_all())
+        .map_err(|error| format!("could not write display preferences: {error}"))?;
+    replace_temporary_preferences_file(temporary, &path)?;
+    Ok(())
+}
+
+fn is_link_or_reparse_point(metadata: &fs::Metadata) -> bool {
+    if metadata.file_type().is_symlink() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_temporary_preferences_file(
+    temporary: tempfile::NamedTempFile,
+    target: &Path,
+) -> Result<(), String> {
+    temporary
+        .persist(target)
+        .map_err(|error| format!("could not replace {}: {}", target.display(), error.error))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn replace_temporary_preferences_file(
+    temporary: tempfile::NamedTempFile,
+    target: &Path,
+) -> Result<(), String> {
+    let temporary = temporary.into_temp_path();
+    let source_wide = nul_terminated_wide_path(temporary.as_ref())?;
+    let target_wide = nul_terminated_wide_path(target)?;
+    let replaced = unsafe {
+        MoveFileExW(
+            source_wide.as_ptr(),
+            target_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if replaced == 0 {
+        Err(format!("could not atomically replace {}", target.display()))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn nul_terminated_wide_path(path: &Path) -> Result<Vec<u16>, String> {
+    let mut encoded: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if encoded.is_empty() || encoded.contains(&0) {
+        return Err("display preferences path was invalid".to_string());
+    }
+    encoded.push(0);
+    Ok(encoded)
 }
 
 pub fn state_dir_from_environment() -> Result<PathBuf, String> {
@@ -2064,6 +2922,8 @@ mod tests {
     use serde_json::json;
     use std::cell::Cell;
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::{symlink, PermissionsExt};
     use std::time::Duration;
     use tempfile::TempDir;
 
@@ -2162,6 +3022,330 @@ mod tests {
             "lastSeenAtMs": seen,
             "startedAtMs": seen - 1000
         })
+    }
+
+    #[test]
+    fn display_preferences_default_to_visible_and_replace_atomically() {
+        let temp = TempDir::new().unwrap();
+        let defaults = load_display_preferences_at(temp.path()).unwrap();
+        assert_eq!(defaults, DisplayPreferences::default());
+        assert!(defaults.editors.vscode);
+        assert!(defaults.editors.cursor);
+        assert!(defaults.editors.antigravity);
+        assert!(defaults.editors.zed);
+        assert!(defaults.usage_limit_percentage);
+
+        let mut changed = defaults;
+        changed.editors.cursor = false;
+        changed.usage_limit_percentage = false;
+        save_display_preferences_at(temp.path(), &changed).unwrap();
+        assert_eq!(load_display_preferences_at(temp.path()).unwrap(), changed);
+
+        changed.editors.vscode = false;
+        save_display_preferences_at(temp.path(), &changed).unwrap();
+        assert_eq!(load_display_preferences_at(temp.path()).unwrap(), changed);
+        assert!(!changed.editors.includes(EditorKind::VsCode));
+        assert!(!changed.editors.includes(EditorKind::Cursor));
+        assert!(changed.editors.includes(EditorKind::AntigravityIde));
+        assert!(changed.editors.includes(EditorKind::Antigravity2));
+        assert!(changed.editors.includes(EditorKind::Zed));
+
+        let before_invalid = changed.clone();
+        assert!(apply_editor_visibility(&mut changed, "unknown-editor", false).is_err());
+        assert_eq!(changed, before_invalid);
+    }
+
+    #[test]
+    fn verified_companion_uninstall_suppresses_a_still_writing_editor_only() {
+        let temp = TempDir::new().unwrap();
+        let vscode_repo = temp.path().join("vscode-project");
+        let cursor_repo = temp.path().join("cursor-project");
+        fs::create_dir_all(&vscode_repo).unwrap();
+        fs::create_dir_all(&cursor_repo).unwrap();
+        let now = 30_000;
+
+        let mut vscode = instance("vscode-window", &vscode_repo, now, true);
+        vscode["editor"] = json!("vscode");
+        write_json(&temp.path().join("instances/vscode.json"), vscode);
+        let mut cursor = instance("cursor-window", &cursor_repo, now, true);
+        cursor["editor"] = json!("cursor");
+        write_json(&temp.path().join("instances/cursor.json"), cursor.clone());
+
+        set_integration_source_enabled_at(temp.path(), IntegrationSource::CursorCompanion, false)
+            .unwrap();
+        purge_integration_source_at(temp.path(), IntegrationSource::CursorCompanion).unwrap();
+        assert!(temp.path().join("instances/vscode.json").is_file());
+        assert!(!temp.path().join("instances/cursor.json").exists());
+
+        // An editor window opened before CLI uninstall may keep its extension
+        // host alive and recreate the heartbeat. The persisted marker must
+        // keep that late write out of both the main snapshot and tray source.
+        write_json(&temp.path().join("instances/cursor-late.json"), cursor);
+        let disabled = StateStore::new(temp.path().to_path_buf()).snapshot(now);
+        assert_eq!(disabled.workspaces.len(), 1);
+        assert_eq!(disabled.workspaces[0].editor, EditorKind::VsCode);
+
+        set_integration_source_enabled_at(temp.path(), IntegrationSource::CursorCompanion, true)
+            .unwrap();
+        let reenabled = StateStore::new(temp.path().to_path_buf()).snapshot(now);
+        assert_eq!(reenabled.workspaces.len(), 2);
+        assert!(reenabled
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.editor == EditorKind::Cursor));
+    }
+
+    #[test]
+    fn vscode_companion_cleanup_removes_legacy_records_and_preserves_cursor() {
+        let temp = TempDir::new().unwrap();
+        let vscode_repo = temp.path().join("legacy-vscode-project");
+        let cursor_repo = temp.path().join("cursor-project");
+        fs::create_dir_all(&vscode_repo).unwrap();
+        fs::create_dir_all(&cursor_repo).unwrap();
+        write_json(
+            &temp.path().join("instances/legacy-vscode.json"),
+            instance("legacy-vscode", &vscode_repo, 30_000, true),
+        );
+        let mut cursor = instance("cursor", &cursor_repo, 30_000, true);
+        cursor["editor"] = json!("cursor");
+        write_json(&temp.path().join("instances/cursor.json"), cursor);
+        fs::write(temp.path().join("instances/malformed.json"), b"{not json").unwrap();
+
+        purge_integration_source_at(temp.path(), IntegrationSource::VsCodeCompanion).unwrap();
+
+        assert!(!temp.path().join("instances/legacy-vscode.json").exists());
+        assert!(temp.path().join("instances/cursor.json").is_file());
+        assert!(temp.path().join("instances/malformed.json").is_file());
+    }
+
+    #[test]
+    fn global_companion_cleanup_removes_all_regular_json_after_all_sources_are_disabled() {
+        let temp = TempDir::new().unwrap();
+        for source in [
+            IntegrationSource::VsCodeCompanion,
+            IntegrationSource::CursorCompanion,
+            IntegrationSource::AntigravityIdeCompanion,
+        ] {
+            set_integration_source_enabled_at(temp.path(), source, false).unwrap();
+        }
+        let instances = temp.path().join("instances");
+        fs::create_dir_all(&instances).unwrap();
+        fs::write(instances.join("valid.json"), b"{}\n").unwrap();
+        fs::write(instances.join("malformed.json"), b"{not json").unwrap();
+        fs::write(instances.join("empty.json"), b"").unwrap();
+        fs::write(
+            instances.join("oversized.json"),
+            vec![b'x'; MAX_RECORD_BYTES as usize + 1],
+        )
+        .unwrap();
+        fs::write(instances.join("keep.txt"), b"unrelated").unwrap();
+
+        purge_all_companion_instance_records_if_disabled_at(temp.path()).unwrap();
+
+        for name in [
+            "valid.json",
+            "malformed.json",
+            "empty.json",
+            "oversized.json",
+        ] {
+            assert!(!instances.join(name).exists(), "{name} was not removed");
+        }
+        assert_eq!(fs::read(instances.join("keep.txt")).unwrap(), b"unrelated");
+    }
+
+    #[test]
+    fn global_companion_cleanup_refuses_to_run_while_any_source_is_enabled() {
+        let temp = TempDir::new().unwrap();
+        for source in [
+            IntegrationSource::VsCodeCompanion,
+            IntegrationSource::CursorCompanion,
+        ] {
+            set_integration_source_enabled_at(temp.path(), source, false).unwrap();
+        }
+        let residual = temp.path().join("instances/malformed.json");
+        fs::create_dir_all(residual.parent().unwrap()).unwrap();
+        fs::write(&residual, b"{not json").unwrap();
+
+        let error = purge_all_companion_instance_records_if_disabled_at(temp.path()).unwrap_err();
+
+        assert!(error.contains("antigravity-ide-companion"));
+        assert!(error.contains("remains enabled"));
+        assert!(residual.is_file());
+    }
+
+    #[test]
+    fn claude_uninstall_removes_activity_and_only_its_managed_usage_cache() {
+        let temp = TempDir::new().unwrap();
+        write_json(
+            &temp.path().join("claude/activity.json"),
+            json!({"owned": true}),
+        );
+        write_json(
+            &temp.path().join("usage/claude.json"),
+            json!({"owned": true}),
+        );
+        write_json(
+            &temp.path().join("usage/other.json"),
+            json!({"owned": false}),
+        );
+
+        set_integration_source_enabled_at(temp.path(), IntegrationSource::ClaudeHooks, false)
+            .unwrap();
+        purge_integration_source_at(temp.path(), IntegrationSource::ClaudeHooks).unwrap();
+
+        assert!(!temp.path().join("claude").exists());
+        assert!(!temp.path().join("usage/claude.json").exists());
+        assert!(temp.path().join("usage/other.json").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enabling_rejects_a_symlinked_disable_marker_directory() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("state");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let outside_marker = outside.join(IntegrationSource::CursorHooks.disable_marker());
+        fs::write(&outside_marker, b"do not remove").unwrap();
+        symlink(&outside, root.join(INTEGRATION_DISABLE_DIRECTORY)).unwrap();
+
+        assert!(
+            set_integration_source_enabled_at(&root, IntegrationSource::CursorHooks, true).is_err()
+        );
+        assert_eq!(fs::read(&outside_marker).unwrap(), b"do not remove");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_disable_marker_directory_is_resecured_before_use() {
+        let temp = TempDir::new().unwrap();
+        let directory = temp.path().join(INTEGRATION_DISABLE_DIRECTORY);
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o777)).unwrap();
+
+        set_integration_source_enabled_at(temp.path(), IntegrationSource::CursorHooks, false)
+            .unwrap();
+
+        assert_eq!(
+            fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert!(directory
+            .join(IntegrationSource::CursorHooks.disable_marker())
+            .is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_state_roots_fail_closed_without_changing_their_permissions() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("shared-state");
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o777)).unwrap();
+
+        assert!(!integration_source_is_enabled_at(
+            &root,
+            IntegrationSource::CursorHooks
+        ));
+        assert!(load_display_preferences_at(&root).is_err());
+        assert!(
+            set_integration_source_enabled_at(&root, IntegrationSource::CursorHooks, false,)
+                .is_err()
+        );
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o777
+        );
+        assert!(!root.join(INTEGRATION_DISABLE_DIRECTORY).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_state_roots_fail_closed_without_touching_the_target() {
+        let temp = TempDir::new().unwrap();
+        let outside = temp.path().join("outside-state");
+        let root = temp.path().join("linked-state");
+        fs::create_dir(&outside).unwrap();
+        symlink(&outside, &root).unwrap();
+
+        assert!(!integration_source_is_enabled_at(
+            &root,
+            IntegrationSource::CursorHooks
+        ));
+        assert!(load_display_preferences_at(&root).is_err());
+        assert!(
+            set_integration_source_enabled_at(&root, IntegrationSource::CursorHooks, false,)
+                .is_err()
+        );
+        assert!(!outside.join(INTEGRATION_DISABLE_DIRECTORY).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn companion_cleanup_never_traverses_a_symlinked_instances_directory() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("state");
+        let outside = temp.path().join("outside-instances");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let mut cursor = instance("outside-cursor", &repo, 30_000, true);
+        cursor["editor"] = json!("cursor");
+        let outside_record = outside.join("cursor.json");
+        write_json(&outside_record, cursor);
+        symlink(&outside, root.join("instances")).unwrap();
+
+        assert!(purge_integration_source_at(&root, IntegrationSource::CursorCompanion).is_err());
+        assert!(outside_record.is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn companion_cleanup_skips_symlinked_record_files() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("state");
+        let instances = root.join("instances");
+        fs::create_dir_all(&instances).unwrap();
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        let mut cursor = instance("outside-cursor", &repo, 30_000, true);
+        cursor["editor"] = json!("cursor");
+        let outside_record = temp.path().join("outside-cursor.json");
+        write_json(&outside_record, cursor);
+        let linked_record = instances.join("linked-cursor.json");
+        symlink(&outside_record, &linked_record).unwrap();
+
+        purge_integration_source_at(&root, IntegrationSource::CursorCompanion).unwrap();
+        assert!(outside_record.is_file());
+        assert!(fs::symlink_metadata(linked_record).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn global_companion_cleanup_reports_symlinked_json_without_following_it() {
+        let temp = TempDir::new().unwrap();
+        for source in [
+            IntegrationSource::VsCodeCompanion,
+            IntegrationSource::CursorCompanion,
+            IntegrationSource::AntigravityIdeCompanion,
+        ] {
+            set_integration_source_enabled_at(temp.path(), source, false).unwrap();
+        }
+        let instances = temp.path().join("instances");
+        fs::create_dir_all(&instances).unwrap();
+        let outside_record = temp.path().join("outside.json");
+        fs::write(&outside_record, b"outside").unwrap();
+        let linked_record = instances.join("linked.json");
+        symlink(&outside_record, &linked_record).unwrap();
+
+        let error = purge_all_companion_instance_records_if_disabled_at(temp.path()).unwrap_err();
+
+        assert!(error.contains("not a regular workspace record"));
+        assert!(error.contains("remains after cleanup"));
+        assert_eq!(fs::read(&outside_record).unwrap(), b"outside");
+        assert!(fs::symlink_metadata(linked_record).is_ok());
     }
 
     #[test]

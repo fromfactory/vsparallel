@@ -800,6 +800,12 @@ fn run_antigravity_hook_with<R: Read, W: Write>(
     };
 
     let surface = payload.surface;
+    let persistence_enabled = state_root.as_ref().is_ok_and(|root| {
+        crate::state::integration_source_is_enabled_at(
+            root,
+            crate::state::IntegrationSource::AntigravityHooks,
+        )
+    });
     let (outcome, workspace_count) = if parsed.is_err() {
         (AntigravityHookOutcome::InvalidPayload, 0)
     } else if surface.state_directory().is_none() {
@@ -819,7 +825,10 @@ fn run_antigravity_hook_with<R: Read, W: Write>(
             // launch a competing read/merge/write that could race a Stop
             // process and reopen or replace a completed turn.
             (AntigravityHookOutcome::Recorded, records.len() as u32)
-        } else if let (Ok(root), Some(directory)) = (state_root, surface.state_directory()) {
+        } else if persistence_enabled {
+            let (Ok(root), Some(directory)) = (state_root, surface.state_directory()) else {
+                unreachable!("enabled Antigravity persistence has a state root and directory")
+            };
             let attempted = records.len();
             let recorded = records
                 .into_iter()
@@ -845,7 +854,10 @@ fn run_antigravity_hook_with<R: Read, W: Write>(
         }
     };
 
-    if let Ok(root) = state_root {
+    if persistence_enabled {
+        let Ok(root) = state_root else {
+            unreachable!("enabled Antigravity persistence has a state root")
+        };
         let observation = AntigravityHookObservation {
             schema_version: SCHEMA_VERSION,
             event: event.observation_name().to_string(),

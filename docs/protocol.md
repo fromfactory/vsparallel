@@ -414,10 +414,9 @@ Agents Window rather than another Cursor agent surface owns it.
 
 ### Cursor hook installation
 
-The primary **Set up Cursor monitoring** action installs or repairs the Cursor
-companion and these native hooks together. A separate hooks-only action manages
-the same hook configuration without installing the companion and therefore
-provides only recent, non-live fallback observations.
+The single **Cursor** integration row installs or repairs the Cursor companion
+and these native hooks together. The experimental Desktop Bridge option is
+managed separately and is never enabled by this setup action.
 
 VSParallel manages one fail-open command handler in each native flat hook array
 `workspaceOpen`, `sessionStart`, `beforeSubmitPrompt`, `stop`, and `sessionEnd`
@@ -438,13 +437,15 @@ unexpected keys and a safely parsed absolute executable/event command.
 Modified lookalikes remain user-owned. Malformed managed hook arrays, an
 unsupported top-level version, oversized configuration, or link/reparse-point
 configuration aborts without writing. Updates are atomic; uninstall removes
-only recognized VSParallel-owned handlers and retains the backup. Existing
-records under `cursor/` are not deleted automatically. Status and repair
-require all five current handlers, so an older four-handler installation is
-reported as update- or repair-needed. Reinstall adds the managed
-`workspaceOpen` handler while preserving unrelated hooks. Uninstall recognizes
-and removes both the current set and strictly recognized legacy VSParallel
-handlers.
+only recognized VSParallel-owned handlers and retains the backup. After the
+companion and hook removal is verified, VSParallel purges Cursor-owned
+heartbeat and hook records and suppresses both sources so a still-running
+Cursor process cannot make them visible again before reload. Reinstall removes
+that suppression. Status and repair require all five current handlers, so an
+older four-handler installation is reported as update- or repair-needed.
+Reinstall adds the managed `workspaceOpen` handler while preserving unrelated
+hooks. Uninstall recognizes and removes both the current set and strictly
+recognized legacy VSParallel handlers.
 
 ### Codex, Claude, and Antigravity lifecycle reduction
 
@@ -518,6 +519,10 @@ model is actively inferring at that moment.
 
 ### Antigravity hook installation
 
+The single **Antigravity** integration row installs or repairs the Antigravity
+IDE companion and the shared Antigravity activity hooks together. Its normal
+uninstall removes both components as one verified operation.
+
 VSParallel manages one top-level entry named `vsparallel` in the documented
 global `~/.gemini/config/hooks.json`. It installs fail-open command handlers for
 `PreInvocation`, `PostToolUse` with matcher `*`, and `Stop`; a recording failure
@@ -529,10 +534,9 @@ Before its first change, VSParallel makes the one-time full-file backup
 `~/.gemini/config/hooks.json.vsparallel.bak`. Uninstall removes only a
 recognized VSParallel-owned entry and deliberately retains the backup. After
 uninstalling the integration and confirming the remaining hook configuration,
-the user may delete that backup manually. Existing files under the shared
-state root's `antigravity/`, `antigravity-ide/`, and
-`antigravity-hook-health/` directories
-are likewise not deleted automatically.
+the user may delete that backup manually. Once companion and hook removal is
+verified, VSParallel purges its Antigravity heartbeat, activity, and hook-health
+records and suppresses both sources until the integration is installed again.
 
 ### Antigravity hook execution health
 
@@ -694,6 +698,65 @@ the exact provider entries in these local registry files:
 
 The resulting extension path may be cached in process memory but is not
 persisted.
+
+## Integration lifecycle and display preferences
+
+Setup presents one core integration row each for **VS Code**, **Cursor**, and
+**Antigravity**. The VS Code row manages its companion. Cursor and Antigravity
+each treat their companion and native activity hooks as one install, repair, or
+uninstall operation. Codex and Claude Code lifecycle hooks remain separate
+optional rows. Zed has no installable integration because its adapter is
+read-only and automatic.
+
+The experimental Cursor Desktop Bridge remains a separate, default-off option.
+Core setup and per-editor uninstall do not change that preference. The global
+**Uninstall all** operation disables it and attempts to remove every normal
+integration.
+
+A normal per-integration uninstall is reported as complete only after the
+relevant external companion or hook removal is verified. VSParallel then
+creates an owner-private marker under `integration-disabled/` and purges records
+owned by that source. **Uninstall all** writes those markers and performs the
+local purge for every installable integration source even if an optional editor
+CLI is absent or malformed external configuration prevents physical removal.
+An unavailable optional-editor CLI remains visible as an unverified-removal
+warning, while a failed attempted removal remains an error. Snapshot loading
+honors the marker, so a still-running editor extension or hook process
+cannot make its source visible again before it is reloaded. Verified reinstall
+removes the marker. These operations never remove unrelated provider settings
+or the one-time configuration backups described above. They also do not disable
+automatic read-only Zed discovery or live provider usage checks.
+
+Display preferences are stored atomically as `display-preferences.json` in the
+shared state root. The UI also keeps the same values in webview-local storage as
+a fallback when app-wide preference synchronization is unavailable:
+
+```json
+{
+  "schemaVersion": 1,
+  "editors": {
+    "vscode": true,
+    "cursor": true,
+    "antigravity": true,
+    "zed": true
+  },
+  "usageLimitPercentage": true
+}
+```
+
+Every value defaults to `true`. Editor preferences filter workspace rows in the
+main snapshot presentation and native tray; `antigravity` covers both
+Antigravity IDE and Antigravity 2.0. `usageLimitPercentage` controls whether the
+global usage percentages are displayed. These are presentation preferences:
+changing them neither installs nor disables an integration and does not alter
+provider configuration.
+
+During ordinary retention, inactive companion heartbeats disappear from the UI
+after 60 seconds and lifecycle observations older than 24 hours no longer
+produce current activity; old files are not removed merely because they age.
+An uninstall request is the explicit exception and purges records belonging to
+the removed source while leaving other editors and providers intact; the global
+operation applies that local cleanup even if physical removal is unavailable.
 
 ## Privacy invariant
 

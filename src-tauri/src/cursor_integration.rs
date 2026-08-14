@@ -418,6 +418,14 @@ fn run_cursor_hook_with<R: Read, W: Write>(
     let payload =
         serde_json::from_reader::<_, HookPayload>(CappedReader::new(reader, MAX_HOOK_INPUT_BYTES));
     if let (false, Ok(payload), Some(root)) = (remote_workspace, payload, state_root) {
+        if !crate::state::integration_source_is_enabled_at(
+            root,
+            crate::state::IntegrationSource::CursorHooks,
+        ) {
+            let _ = writer.write_all(b"{}\n");
+            let _ = writer.flush();
+            return 0;
+        }
         for (record_key, record) in records_from_payload(event, &payload, changed_at_ms) {
             // Monitoring is observational. Parsing, path, and persistence
             // failures must never interrupt or alter Cursor's agent loop.

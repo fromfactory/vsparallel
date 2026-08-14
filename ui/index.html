@@ -275,14 +275,11 @@
 
           <div class="empty-state" id="emptyState" hidden>
             <span class="empty-state__mark" aria-hidden="true">◇</span>
-            <h3>No workspaces detected</h3>
-            <p>
+            <h3 id="emptyStateTitle">No workspaces detected</h3>
+            <p id="emptyStateDescription">
               Open a folder in VS Code, Cursor, or Antigravity IDE with its VSParallel companion
               enabled, or open one in Zed for automatic read-only monitoring from local metadata.
-              Cursor hooks can also record a recent workspace open; the optional
-              experimental Cursor desktop bridge can correlate a live agent thread, but it does not
-              provide focus or a safe open target. Start a turn in Cursor's Agents Window or an
-              Antigravity or Zed workspace to see agent activity and model information when available.
+              Start an agent turn to see activity and model information when available.
             </p>
             <div class="empty-state__actions">
               <button
@@ -327,7 +324,21 @@
             </div>
           </div>
           <div class="settings-dialog__header-actions">
-            <span class="diagnostics-summary" id="diagnosticsSummary">Local only</span>
+            <span class="help-popover diagnostics-summary-popover">
+              <button
+                class="help-popover__trigger diagnostics-summary"
+                id="diagnosticsSummary"
+                type="button"
+                aria-label="Setup status details"
+                aria-describedby="diagnosticsSummaryDetail"
+              >Local only</button>
+              <span
+                class="help-popover__content"
+                id="diagnosticsSummaryDetail"
+                role="tooltip"
+                popover="manual"
+              >Setup status has not been checked yet.</span>
+            </span>
             <button
               class="icon-button"
               id="settingsCloseButton"
@@ -377,6 +388,84 @@
             </div>
           </fieldset>
 
+          <details class="visibility-section settings-disclosure">
+            <summary>
+              <span>
+                <strong>Visibility</strong>
+                <small>Editors and usage limits</small>
+              </span>
+              <svg class="monitor-diagnostics__chevron" viewBox="0 0 16 16" aria-hidden="true">
+                <path d="m4.5 6 3.5 3.5L11.5 6" />
+              </svg>
+            </summary>
+            <div class="visibility-section__body">
+              <p class="visibility-description">Choose what appears in the workspace list and usage overview.</p>
+              <div class="settings-list">
+              <label class="settings-row">
+                <span>
+                  <strong>VS Code workspaces</strong>
+                  <small>Show detected VS Code windows and recent workspaces.</small>
+                </span>
+                <span class="setting-switch">
+                  <input type="checkbox" role="switch" data-editor-visibility="vscode" checked />
+                  <span class="setting-switch__track" aria-hidden="true">
+                    <span class="setting-switch__thumb"></span>
+                  </span>
+                </span>
+              </label>
+              <label class="settings-row">
+                <span>
+                  <strong>Cursor workspaces</strong>
+                  <small>Show detected Cursor IDE and agent workspaces.</small>
+                </span>
+                <span class="setting-switch">
+                  <input type="checkbox" role="switch" data-editor-visibility="cursor" checked />
+                  <span class="setting-switch__track" aria-hidden="true">
+                    <span class="setting-switch__thumb"></span>
+                  </span>
+                </span>
+              </label>
+              <label class="settings-row">
+                <span>
+                  <strong>Antigravity workspaces</strong>
+                  <small>Show Antigravity IDE and Antigravity 2.0 activity.</small>
+                </span>
+                <span class="setting-switch">
+                  <input type="checkbox" role="switch" data-editor-visibility="antigravity" checked />
+                  <span class="setting-switch__track" aria-hidden="true">
+                    <span class="setting-switch__thumb"></span>
+                  </span>
+                </span>
+              </label>
+              <label class="settings-row">
+                <span>
+                  <strong>Zed workspaces</strong>
+                  <small>Show workspaces found in Zed's local metadata.</small>
+                </span>
+                <span class="setting-switch">
+                  <input type="checkbox" role="switch" data-editor-visibility="zed" checked />
+                  <span class="setting-switch__track" aria-hidden="true">
+                    <span class="setting-switch__thumb"></span>
+                  </span>
+                </span>
+              </label>
+              <label class="settings-row settings-row--separated">
+                <span>
+                  <strong>Usage limit percentages</strong>
+                  <small>Show Codex and Claude usage-limit cards.</small>
+                </span>
+                <span class="setting-switch">
+                  <input id="usageVisibilityInput" type="checkbox" role="switch" checked />
+                  <span class="setting-switch__track" aria-hidden="true">
+                    <span class="setting-switch__thumb"></span>
+                  </span>
+                </span>
+              </label>
+              </div>
+              <p class="visibility-status" id="visibilityStatus" role="status" aria-live="polite" hidden></p>
+            </div>
+          </details>
+
           <div class="privacy-note" id="settingsDialogDescription">
             <svg class="privacy-note__icon" viewBox="0 0 16 16" aria-hidden="true">
               <path d="M8 1.75 13 3.6v3.65c0 3.1-1.88 5.65-5 7-3.12-1.35-5-3.9-5-7V3.6l5-1.85Z" />
@@ -410,18 +499,28 @@
                 <div>
                   <h3 id="integrationHeading">Integrations</h3>
                   <p id="integrationDescription">
-                    Companions track live workspaces. Hooks add lifecycle status. Zed monitoring is
-                    automatic and read-only; it uses local workspace and agent metadata.
+                    Install one complete integration per editor. Zed monitoring is automatic and read-only;
+                    it uses local workspace and agent metadata.
                   </p>
                 </div>
-                <button
-                  class="setup-button setup-button--primary setup-all-button"
-                  id="setupAllButton"
-                  type="button"
-                  disabled
-                >
-                  Set up monitoring
-                </button>
+                <div class="integration-toolbar">
+                  <button
+                    class="setup-button setup-button--primary setup-all-button"
+                    id="setupAllButton"
+                    type="button"
+                    disabled
+                  >
+                    Set up monitoring
+                  </button>
+                  <button
+                    class="setup-button setup-button--danger"
+                    id="uninstallAllButton"
+                    type="button"
+                    disabled
+                  >
+                    Uninstall all
+                  </button>
+                </div>
               </div>
 
               <div class="integration-list" id="integrationList" aria-busy="true">
@@ -434,12 +533,12 @@
                       </svg>
                       <div>
                         <div class="integration-card__title-row">
-                          <h4>VS Code companion</h4>
+                          <h4>VS Code</h4>
                           <span class="help-popover">
                             <button
                               class="help-popover__trigger"
                               type="button"
-                              aria-label="About the VS Code companion"
+                              aria-label="About the VS Code integration"
                               aria-describedby="companionHelp"
                             >?</button>
                             <span
@@ -448,8 +547,8 @@
                               role="tooltip"
                               popover="manual"
                             >
-                              Reports live VS Code workspaces through the bundled companion. Reload
-                              open VS Code windows after installing or updating it.
+                              Installs the bundled companion for live VS Code workspace detection.
+                              Reload open VS Code windows after installing or updating it.
                               <span class="help-popover__status" id="companionHelpStatus">
                                 Checking current status…
                               </span>
@@ -457,7 +556,7 @@
                           </span>
                         </div>
                         <p class="integration-detail" id="companionDetail">
-                          Live VS Code workspaces
+                          Live workspace detection
                         </p>
                       </div>
                     </div>
@@ -496,7 +595,7 @@
                       </svg>
                       <div>
                         <div class="integration-card__title-row">
-                          <h4>Cursor companion</h4>
+                          <h4>Cursor</h4>
                           <span class="help-popover">
                             <button
                               class="help-popover__trigger"
@@ -510,11 +609,8 @@
                               role="tooltip"
                               popover="manual"
                             >
-                              Setup manages the Cursor companion and activity hooks together. Reload
-                              Cursor IDE windows before live heartbeats begin. Agents Window activity
-                              is hook-only unless experimental thread monitoring makes an exact match;
-                              even then, VSParallel cannot focus or open it. Removing the companion
-                              leaves activity hooks installed.
+                              Installs and removes the Cursor companion and activity hooks together.
+                              Reload Cursor IDE windows after making a change.
                               <span class="help-popover__status" id="cursorCompanionHelpStatus">
                                 Checking current status…
                               </span>
@@ -522,7 +618,7 @@
                           </span>
                         </div>
                         <p class="integration-detail" id="cursorCompanionDetail">
-                          Live IDE workspaces · recent agent activity
+                          Live workspaces and agent activity
                         </p>
                       </div>
                     </div>
@@ -542,7 +638,7 @@
                       type="button"
                       disabled
                     >
-                      Set up Cursor monitoring
+                      Install
                     </button>
                     <button
                       class="setup-button setup-button--danger"
@@ -551,7 +647,7 @@
                       disabled
                       hidden
                     >
-                      Uninstall companion
+                      Uninstall
                     </button>
                   </div>
                 </article>
@@ -561,6 +657,7 @@
                   id="cursorAgentsBridgeCard"
                   aria-describedby="cursorAgentsMonitoringHint"
                   aria-busy="false"
+                  hidden
                 >
                   <div class="integration-card__header">
                     <div class="integration-card__identity">
@@ -650,12 +747,12 @@
                       </svg>
                       <div>
                         <div class="integration-card__title-row">
-                          <h4>Antigravity IDE companion</h4>
+                          <h4>Antigravity</h4>
                           <span class="help-popover">
                             <button
                               class="help-popover__trigger"
                               type="button"
-                              aria-label="About the Antigravity IDE companion"
+                              aria-label="About the Antigravity integration"
                               aria-describedby="antigravityIdeHelp"
                             >?</button>
                             <span
@@ -664,8 +761,8 @@
                               role="tooltip"
                               popover="manual"
                             >
-                              Reports live Antigravity IDE workspaces through the bundled companion.
-                              Reload open Antigravity IDE windows after installing or updating it.
+                              Installs and removes the Antigravity IDE companion and activity hooks
+                              together. Reload open windows and start a new turn after installation.
                               <span class="help-popover__status" id="antigravityIdeHelpStatus">
                                 Checking current status…
                               </span>
@@ -673,7 +770,7 @@
                           </span>
                         </div>
                         <p class="integration-detail" id="antigravityIdeDetail">
-                          Live Antigravity IDE workspaces
+                          Live workspaces and agent activity
                         </p>
                       </div>
                     </div>
@@ -707,145 +804,6 @@
                   </div>
                 </article>
 
-                <article class="integration-card" id="cursorCard">
-                  <div class="integration-card__header">
-                    <div class="integration-card__identity">
-                      <svg class="integration-card__icon" viewBox="0 0 24 24" aria-hidden="true">
-                        <path d="M5 4.5 19 12 5 19.5V4.5Z" />
-                        <circle cx="10" cy="12" r="2.5" />
-                      </svg>
-                      <div>
-                        <div class="integration-card__title-row">
-                          <h4>
-                            Cursor hooks only
-                            <span class="optional-label">Optional</span>
-                          </h4>
-                          <span class="help-popover">
-                            <button
-                              class="help-popover__trigger"
-                              type="button"
-                              aria-label="About Cursor hooks"
-                              aria-describedby="cursorHooksHelp"
-                            >?</button>
-                            <span
-                              class="help-popover__content"
-                              id="cursorHooksHelp"
-                              role="tooltip"
-                              popover="manual"
-                            >
-                              Hooks observe local workspace opens and agent turns in Cursor IDE and
-                              Agents Window. They create recent evidence, not a focusable or openable
-                              live window. Start a turn to see Activity detected or Turn finished.
-                              Unmatched activity is labeled Cursor Agent because hooks do not identify
-                              its surface. Cloud and remote agents are not covered.
-                              <span class="help-popover__status" id="cursorHooksHelpStatus">
-                                Checking current status…
-                              </span>
-                            </span>
-                          </span>
-                        </div>
-                        <p class="integration-detail" id="cursorDetail">
-                          Recent workspace and agent activity
-                        </p>
-                      </div>
-                    </div>
-                    <span class="integration-status" id="cursorStatus" data-state="checking">
-                      Checking…
-                    </span>
-                  </div>
-                  <p class="integration-meta" id="cursorMeta" hidden></p>
-                  <div class="integration-actions">
-                    <button
-                      class="setup-button setup-button--primary"
-                      id="cursorInstallButton"
-                      type="button"
-                      disabled
-                    >
-                      Install hooks only
-                    </button>
-                    <button
-                      class="setup-button setup-button--danger"
-                      id="cursorUninstallButton"
-                      type="button"
-                      disabled
-                      hidden
-                    >
-                      Uninstall
-                    </button>
-                  </div>
-                </article>
-
-                <article class="integration-card" id="antigravityCard">
-                  <div class="integration-card__header">
-                    <div class="integration-card__identity">
-                      <svg class="integration-card__icon" viewBox="0 0 24 24" aria-hidden="true">
-                        <path d="M12 3v18M5 8l7-5 7 5M5 16l7 5 7-5" />
-                        <circle cx="12" cy="12" r="3" />
-                      </svg>
-                      <div>
-                        <div class="integration-card__title-row">
-                          <h4>
-                            Antigravity activity hooks
-                            <span class="optional-label">Optional</span>
-                          </h4>
-                          <span class="help-popover">
-                            <button
-                              class="help-popover__trigger"
-                              type="button"
-                              aria-label="About Antigravity activity hooks"
-                              aria-describedby="antigravityHooksHelp"
-                            >?</button>
-                            <span
-                              class="help-popover__content"
-                              id="antigravityHooksHelp"
-                              role="tooltip"
-                              popover="manual"
-                            >
-                              Opening a Project or workspace alone does not fire these hooks; start an
-                              agent turn after installation. A workspace-level .agents/hooks.json can
-                              override the global hook. Events identify the Antigravity 2.0 or IDE
-                              surface and workspace, but not an exact live, focused, or openable window.
-                              <span class="help-popover__status" id="antigravityHooksHelpStatus">
-                                Checking current status…
-                              </span>
-                            </span>
-                          </span>
-                        </div>
-                        <p class="integration-detail" id="antigravityDetail">
-                          Recent agent activity · start a turn
-                        </p>
-                      </div>
-                    </div>
-                    <span
-                      class="integration-status"
-                      id="antigravityStatus"
-                      data-state="checking"
-                    >
-                      Checking…
-                    </span>
-                  </div>
-                  <p class="integration-meta" id="antigravityMeta" hidden></p>
-                  <div class="integration-actions">
-                    <button
-                      class="setup-button setup-button--primary"
-                      id="antigravityInstallButton"
-                      type="button"
-                      disabled
-                    >
-                      Install
-                    </button>
-                    <button
-                      class="setup-button setup-button--danger"
-                      id="antigravityUninstallButton"
-                      type="button"
-                      disabled
-                      hidden
-                    >
-                      Uninstall
-                    </button>
-                  </div>
-                </article>
-
                 <article class="integration-card" id="codexCard">
                   <div class="integration-card__header">
                     <div class="integration-card__identity">
@@ -856,7 +814,7 @@
                       <div>
                         <div class="integration-card__title-row">
                           <h4>
-                            Codex activity hooks
+                            Codex
                             <span class="optional-label">Optional</span>
                           </h4>
                           <span class="help-popover">
@@ -882,7 +840,7 @@
                           </span>
                         </div>
                         <p class="integration-detail" id="codexDetail">
-                          Lifecycle hooks · CLI usage
+                          Agent activity hooks
                         </p>
                       </div>
                     </div>
@@ -926,7 +884,7 @@
                       <div>
                         <div class="integration-card__title-row">
                           <h4>
-                            Claude Code activity hooks
+                            Claude Code
                             <span class="optional-label">Optional</span>
                           </h4>
                           <span class="help-popover">
@@ -953,7 +911,7 @@
                           </span>
                         </div>
                         <p class="integration-detail" id="claudeDetail">
-                          Lifecycle hooks · CLI usage
+                          Agent activity hooks
                         </p>
                       </div>
                     </div>
@@ -1003,7 +961,7 @@
             <summary>
               <span>
                 <strong>Advanced diagnostics</strong>
-                <small>Local paths and record health</small>
+                <small>Local paths, health, and experimental options</small>
               </span>
               <svg class="monitor-diagnostics__chevron" viewBox="0 0 16 16" aria-hidden="true">
                 <path d="m4.5 6 3.5 3.5L11.5 6" />
@@ -1019,6 +977,15 @@
                 Open diagnostics to inspect the local monitor.
               </p>
               <dl class="diagnostics-list" id="diagnosticsList"></dl>
+              <section class="experimental-section" aria-labelledby="experimentalHeading">
+                <div class="subsection-heading">
+                  <div>
+                    <h3 id="experimentalHeading">Experimental</h3>
+                    <p>Optional features that may change or be unavailable.</p>
+                  </div>
+                </div>
+                <div id="experimentalIntegrations"></div>
+              </section>
               <button
                 class="quiet-button settings-refresh-button"
                 id="diagnosticsRefreshButton"

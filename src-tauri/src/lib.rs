@@ -22,7 +22,7 @@ use opener::{
     ProcessWorkspaceLauncher, WorkspaceLaunchMode,
 };
 use serde::Serialize;
-use state::{now_ms, Diagnostics, Snapshot, StateStore};
+use state::{now_ms, Diagnostics, DisplayPreferences, IntegrationSource, Snapshot, StateStore};
 use std::ffi::OsStr;
 use std::path::PathBuf;
 #[cfg(any(target_os = "macos", test))]
@@ -183,12 +183,47 @@ async fn get_usage() -> Result<usage::UsageSnapshot, String> {
     run_background(|| Ok(usage::get_usage_snapshot())).await
 }
 
+#[tauri::command]
+async fn get_display_preferences() -> Result<DisplayPreferences, String> {
+    run_background(state::display_preferences_from_environment).await
+}
+
+#[tauri::command]
+async fn set_editor_visibility(
+    editor: String,
+    visible: bool,
+) -> Result<DisplayPreferences, String> {
+    run_background(move || state::set_editor_visibility_from_environment(&editor, visible)).await
+}
+
+#[tauri::command]
+async fn set_usage_limit_percentage_visible(visible: bool) -> Result<DisplayPreferences, String> {
+    run_background(move || state::set_usage_limit_percentage_visible_from_environment(visible))
+        .await
+}
+
 fn current_snapshot() -> Result<Snapshot, String> {
     let now_ms = now_ms();
     let cursor_agents = cursor_agents_bridge::poll(now_ms, false);
     let zed = zed_integration::load_zed_snapshot_from_environment(now_ms);
     let store = StateStore::from_environment()?;
-    Ok(store.snapshot_with_integrations(now_ms, cursor_agents.snapshot.as_ref(), Some(&zed)))
+    let snapshot =
+        store.snapshot_with_integrations(now_ms, cursor_agents.snapshot.as_ref(), Some(&zed));
+    filter_snapshot_with_preferences(snapshot, state::display_preferences_from_environment)
+}
+
+fn filter_snapshot_with_preferences<F>(
+    mut snapshot: Snapshot,
+    load_preferences: F,
+) -> Result<Snapshot, String>
+where
+    F: FnOnce() -> Result<DisplayPreferences, String>,
+{
+    let preferences = load_preferences()?;
+    snapshot
+        .workspaces
+        .retain(|workspace| preferences.editors.includes(workspace.editor));
+    Ok(snapshot)
 }
 
 #[tauri::command]
@@ -231,9 +266,7 @@ async fn get_integration_status() -> Result<IntegrationStatusView, String> {
 #[tauri::command]
 async fn install_companion() -> Result<IntegrationStatusView, String> {
     run_background(|| {
-        let command = code_command();
-        let result = companion_integration::install_companion(OsStr::new(&command))?;
-        let status = verified_companion_status(result)?;
+        let status = install_vscode_companion_component()?;
         Ok(build_integration_status_with_companion(status, true))
     })
     .await
@@ -242,9 +275,7 @@ async fn install_companion() -> Result<IntegrationStatusView, String> {
 #[tauri::command]
 async fn uninstall_companion() -> Result<IntegrationStatusView, String> {
     run_background(|| {
-        let command = code_command();
-        let result = companion_integration::uninstall_companion(OsStr::new(&command))?;
-        let status = verified_companion_status(result)?;
+        let status = uninstall_vscode_companion_component()?;
         Ok(build_integration_status_with_companion(status, true))
     })
     .await
@@ -253,13 +284,7 @@ async fn uninstall_companion() -> Result<IntegrationStatusView, String> {
 #[tauri::command]
 async fn install_cursor_companion() -> Result<IntegrationStatusView, String> {
     run_background(|| {
-        let command = cursor_command();
-        let result = companion_integration::install_companion_for_editor(
-            OsStr::new(&command),
-            "Cursor",
-            companion_integration::CURSOR_PROFILE_ENV,
-        )?;
-        let status = verified_companion_status(result)?;
+        let status = install_cursor_companion_component()?;
         Ok(build_integration_status_with_cursor_companion(status, true))
     })
     .await
@@ -278,19 +303,30 @@ async fn install_cursor_monitoring() -> Result<IntegrationStatusView, String> {
         // obvious configuration failures cannot leave a partial installation.
         let config_dir = cursor_integration::cursor_config_dir_from_environment()?;
         let executable = integration_executable()?;
-        let command = cursor_command();
-        let companion_status = install_cursor_monitoring_components(
-            || {
-                let result = companion_integration::install_companion_for_editor(
-                    OsStr::new(&command),
-                    "Cursor",
-                    companion_integration::CURSOR_PROFILE_ENV,
-                )?;
-                verified_companion_status(result)
-            },
-            || cursor_integration::install_cursor_integration(&config_dir, &executable),
-        )?;
+        let companion_status =
+            install_cursor_monitoring_components(install_cursor_companion_component, || {
+                cursor_integration::install_cursor_integration(&config_dir, &executable)
+            })?;
+        enable_verified_source(IntegrationSource::CursorHooks, "Cursor activity hooks")?;
 
+        Ok(build_integration_status_with_cursor_companion(
+            companion_status,
+            true,
+        ))
+    })
+    .await
+}
+
+/// Removes the stable Cursor integration as one logical unit. Experimental
+/// Desktop Bridge monitoring remains an independent opt-in setting.
+#[tauri::command]
+async fn uninstall_cursor_monitoring() -> Result<IntegrationStatusView, String> {
+    run_background(|| {
+        let companion_status = uninstall_combined_monitoring_components(
+            "Cursor",
+            uninstall_cursor_companion_component,
+            uninstall_cursor_hooks_component,
+        )?;
         Ok(build_integration_status_with_cursor_companion(
             companion_status,
             true,
@@ -324,13 +360,7 @@ where
 #[tauri::command]
 async fn uninstall_cursor_companion() -> Result<IntegrationStatusView, String> {
     run_background(|| {
-        let command = cursor_command();
-        let result = companion_integration::uninstall_companion_for_editor(
-            OsStr::new(&command),
-            "Cursor",
-            companion_integration::CURSOR_PROFILE_ENV,
-        )?;
-        let status = verified_companion_status(result)?;
+        let status = uninstall_cursor_companion_component()?;
         Ok(build_integration_status_with_cursor_companion(status, true))
     })
     .await
@@ -339,13 +369,7 @@ async fn uninstall_cursor_companion() -> Result<IntegrationStatusView, String> {
 #[tauri::command]
 async fn install_antigravity_ide_companion() -> Result<IntegrationStatusView, String> {
     run_background(|| {
-        let command = antigravity_ide_command();
-        let result = companion_integration::install_companion_for_editor(
-            OsStr::new(&command),
-            "Antigravity IDE",
-            companion_integration::ANTIGRAVITY_IDE_PROFILE_ENV,
-        )?;
-        let status = verified_companion_status(result)?;
+        let status = install_antigravity_ide_companion_component()?;
         Ok(build_integration_status_with_antigravity_ide_companion(
             status, true,
         ))
@@ -356,15 +380,48 @@ async fn install_antigravity_ide_companion() -> Result<IntegrationStatusView, St
 #[tauri::command]
 async fn uninstall_antigravity_ide_companion() -> Result<IntegrationStatusView, String> {
     run_background(|| {
-        let command = antigravity_ide_command();
-        let result = companion_integration::uninstall_companion_for_editor(
-            OsStr::new(&command),
-            "Antigravity IDE",
-            companion_integration::ANTIGRAVITY_IDE_PROFILE_ENV,
-        )?;
-        let status = verified_companion_status(result)?;
+        let status = uninstall_antigravity_ide_companion_component()?;
         Ok(build_integration_status_with_antigravity_ide_companion(
             status, true,
+        ))
+    })
+    .await
+}
+
+/// Installs the Antigravity IDE heartbeat companion and the shared stable
+/// Antigravity lifecycle hooks behind one normal setup action.
+#[tauri::command]
+async fn install_antigravity_monitoring() -> Result<IntegrationStatusView, String> {
+    run_background(|| {
+        let config_dir = antigravity_integration::antigravity_config_dir_from_environment()?;
+        let executable = integration_executable()?;
+        let companion_status = install_antigravity_monitoring_components(
+            install_antigravity_ide_companion_component,
+            || antigravity_integration::install_antigravity_integration(&config_dir, &executable),
+        )?;
+        enable_verified_source(
+            IntegrationSource::AntigravityHooks,
+            "Antigravity activity hooks",
+        )?;
+        Ok(build_integration_status_with_antigravity_ide_companion(
+            companion_status,
+            true,
+        ))
+    })
+    .await
+}
+
+#[tauri::command]
+async fn uninstall_antigravity_monitoring() -> Result<IntegrationStatusView, String> {
+    run_background(|| {
+        let companion_status = uninstall_combined_monitoring_components(
+            "Antigravity",
+            uninstall_antigravity_ide_companion_component,
+            uninstall_antigravity_hooks_component,
+        )?;
+        Ok(build_integration_status_with_antigravity_ide_companion(
+            companion_status,
+            true,
         ))
     })
     .await
@@ -373,9 +430,7 @@ async fn uninstall_antigravity_ide_companion() -> Result<IntegrationStatusView, 
 #[tauri::command]
 async fn install_codex_hooks() -> Result<IntegrationStatusView, String> {
     run_background(|| {
-        let codex_home = codex_integration::codex_home_from_environment()?;
-        let executable = integration_executable()?;
-        codex_integration::install_codex_integration(&codex_home, &executable)?;
+        install_codex_hooks_component()?;
         Ok(build_integration_status(true))
     })
     .await
@@ -384,9 +439,7 @@ async fn install_codex_hooks() -> Result<IntegrationStatusView, String> {
 #[tauri::command]
 async fn uninstall_codex_hooks() -> Result<IntegrationStatusView, String> {
     run_background(|| {
-        let codex_home = codex_integration::codex_home_from_environment()?;
-        let executable = integration_executable()?;
-        codex_integration::uninstall_codex_integration(&codex_home, &executable)?;
+        uninstall_codex_hooks_component()?;
         Ok(build_integration_status(true))
     })
     .await
@@ -395,9 +448,7 @@ async fn uninstall_codex_hooks() -> Result<IntegrationStatusView, String> {
 #[tauri::command]
 async fn install_claude_hooks() -> Result<IntegrationStatusView, String> {
     run_background(|| {
-        let claude_config_dir = claude_integration::claude_config_dir_from_environment()?;
-        let executable = integration_executable()?;
-        claude_integration::install_claude_integration(&claude_config_dir, &executable)?;
+        install_claude_hooks_component()?;
         Ok(build_integration_status(true))
     })
     .await
@@ -406,9 +457,7 @@ async fn install_claude_hooks() -> Result<IntegrationStatusView, String> {
 #[tauri::command]
 async fn uninstall_claude_hooks() -> Result<IntegrationStatusView, String> {
     run_background(|| {
-        let claude_config_dir = claude_integration::claude_config_dir_from_environment()?;
-        let executable = integration_executable()?;
-        claude_integration::uninstall_claude_integration(&claude_config_dir, &executable)?;
+        uninstall_claude_hooks_component()?;
         Ok(build_integration_status(true))
     })
     .await
@@ -417,10 +466,7 @@ async fn uninstall_claude_hooks() -> Result<IntegrationStatusView, String> {
 #[tauri::command]
 async fn install_cursor_hooks() -> Result<IntegrationStatusView, String> {
     run_background(|| {
-        let config_dir = cursor_integration::cursor_config_dir_from_environment()?;
-        let executable = integration_executable()?;
-        let change = cursor_integration::install_cursor_integration(&config_dir, &executable)?;
-        verify_cursor_change(&change, true)?;
+        install_cursor_hooks_component()?;
         Ok(build_integration_status(false))
     })
     .await
@@ -429,10 +475,7 @@ async fn install_cursor_hooks() -> Result<IntegrationStatusView, String> {
 #[tauri::command]
 async fn uninstall_cursor_hooks() -> Result<IntegrationStatusView, String> {
     run_background(|| {
-        let config_dir = cursor_integration::cursor_config_dir_from_environment()?;
-        let executable = integration_executable()?;
-        let change = cursor_integration::uninstall_cursor_integration(&config_dir, &executable)?;
-        verify_cursor_change(&change, false)?;
+        uninstall_cursor_hooks_component()?;
         Ok(build_integration_status(false))
     })
     .await
@@ -441,11 +484,7 @@ async fn uninstall_cursor_hooks() -> Result<IntegrationStatusView, String> {
 #[tauri::command]
 async fn install_antigravity_hooks() -> Result<IntegrationStatusView, String> {
     run_background(|| {
-        let config_dir = antigravity_integration::antigravity_config_dir_from_environment()?;
-        let executable = integration_executable()?;
-        let change =
-            antigravity_integration::install_antigravity_integration(&config_dir, &executable)?;
-        verify_antigravity_change(&change, true)?;
+        install_antigravity_hooks_component()?;
         Ok(build_integration_status(true))
     })
     .await
@@ -454,14 +493,387 @@ async fn install_antigravity_hooks() -> Result<IntegrationStatusView, String> {
 #[tauri::command]
 async fn uninstall_antigravity_hooks() -> Result<IntegrationStatusView, String> {
     run_background(|| {
-        let config_dir = antigravity_integration::antigravity_config_dir_from_environment()?;
-        let executable = integration_executable()?;
-        let change =
-            antigravity_integration::uninstall_antigravity_integration(&config_dir, &executable)?;
-        verify_antigravity_change(&change, false)?;
+        uninstall_antigravity_hooks_component()?;
         Ok(build_integration_status(true))
     })
     .await
+}
+
+#[tauri::command]
+async fn uninstall_all_integrations() -> Result<IntegrationStatusView, String> {
+    run_background(|| {
+        let mut failures = Vec::new();
+        let code = code_command();
+        let vscode_status = companion_integration::companion_status(OsStr::new(&code));
+        collect_uninstall_all_result(
+            &mut failures,
+            "VS Code companion",
+            IntegrationSource::VsCodeCompanion,
+            uninstall_companion_for_all(
+                vscode_status,
+                companion_integration::command_is_available(OsStr::new(&code)),
+                uninstall_vscode_companion_component,
+            ),
+        );
+        collect_uninstall_all_result(
+            &mut failures,
+            "Cursor activity hooks",
+            IntegrationSource::CursorHooks,
+            uninstall_cursor_hooks_component(),
+        );
+        let cursor = cursor_command();
+        let cursor_status = companion_integration::companion_status_for_editor(
+            OsStr::new(&cursor),
+            "Cursor",
+            companion_integration::CURSOR_PROFILE_ENV,
+        );
+        collect_uninstall_all_result(
+            &mut failures,
+            "Cursor companion",
+            IntegrationSource::CursorCompanion,
+            uninstall_companion_for_all(
+                cursor_status,
+                companion_integration::command_is_available(OsStr::new(&cursor)),
+                uninstall_cursor_companion_component,
+            ),
+        );
+        collect_uninstall_all_result(
+            &mut failures,
+            "Antigravity activity hooks",
+            IntegrationSource::AntigravityHooks,
+            uninstall_antigravity_hooks_component(),
+        );
+        let antigravity = antigravity_ide_command();
+        let antigravity_status = companion_integration::companion_status_for_editor(
+            OsStr::new(&antigravity),
+            "Antigravity IDE",
+            companion_integration::ANTIGRAVITY_IDE_PROFILE_ENV,
+        );
+        collect_uninstall_all_result(
+            &mut failures,
+            "Antigravity IDE companion",
+            IntegrationSource::AntigravityIdeCompanion,
+            uninstall_companion_for_all(
+                antigravity_status,
+                companion_integration::command_is_available(OsStr::new(&antigravity)),
+                uninstall_antigravity_ide_companion_component,
+            ),
+        );
+        collect_uninstall_all_result(
+            &mut failures,
+            "Codex activity hooks",
+            IntegrationSource::CodexHooks,
+            uninstall_codex_hooks_component(),
+        );
+        collect_uninstall_all_result(
+            &mut failures,
+            "Claude Code activity hooks",
+            IntegrationSource::ClaudeHooks,
+            uninstall_claude_hooks_component(),
+        );
+        collect_uninstall_result(
+            &mut failures,
+            "retained companion workspace records",
+            state::purge_all_companion_instance_records_if_disabled(),
+        );
+        collect_uninstall_result(
+            &mut failures,
+            "experimental Cursor Agents Window monitoring",
+            cursor_agents_bridge::set_enabled(false, now_ms()).and_then(|poll| {
+                (!poll.status.enabled)
+                    .then_some(())
+                    .ok_or_else(|| "monitoring still reports enabled".to_string())
+            }),
+        );
+
+        if failures.is_empty() {
+            Ok(build_integration_status(true))
+        } else {
+            Err(format!(
+                "Some integrations could not be fully uninstalled: {}",
+                failures.join("; ")
+            ))
+        }
+    })
+    .await
+}
+
+fn install_vscode_companion_component() -> Result<CompanionStatus, String> {
+    let command = code_command();
+    let result = companion_integration::install_companion(OsStr::new(&command))?;
+    let status = verified_companion_status(result)?;
+    enable_verified_source(IntegrationSource::VsCodeCompanion, "VS Code companion")?;
+    Ok(status)
+}
+
+fn uninstall_vscode_companion_component() -> Result<CompanionStatus, String> {
+    let command = code_command();
+    let result = companion_integration::uninstall_companion(OsStr::new(&command))?;
+    let status = verified_companion_status(result)?;
+    disable_verified_source(IntegrationSource::VsCodeCompanion, "VS Code companion")?;
+    Ok(status)
+}
+
+fn install_cursor_companion_component() -> Result<CompanionStatus, String> {
+    let command = cursor_command();
+    let result = companion_integration::install_companion_for_editor(
+        OsStr::new(&command),
+        "Cursor",
+        companion_integration::CURSOR_PROFILE_ENV,
+    )?;
+    let status = verified_companion_status(result)?;
+    enable_verified_source(IntegrationSource::CursorCompanion, "Cursor companion")?;
+    Ok(status)
+}
+
+fn uninstall_cursor_companion_component() -> Result<CompanionStatus, String> {
+    let command = cursor_command();
+    let result = companion_integration::uninstall_companion_for_editor(
+        OsStr::new(&command),
+        "Cursor",
+        companion_integration::CURSOR_PROFILE_ENV,
+    )?;
+    let status = verified_companion_status(result)?;
+    disable_verified_source(IntegrationSource::CursorCompanion, "Cursor companion")?;
+    Ok(status)
+}
+
+fn install_antigravity_ide_companion_component() -> Result<CompanionStatus, String> {
+    let command = antigravity_ide_command();
+    let result = companion_integration::install_companion_for_editor(
+        OsStr::new(&command),
+        "Antigravity IDE",
+        companion_integration::ANTIGRAVITY_IDE_PROFILE_ENV,
+    )?;
+    let status = verified_companion_status(result)?;
+    enable_verified_source(
+        IntegrationSource::AntigravityIdeCompanion,
+        "Antigravity IDE companion",
+    )?;
+    Ok(status)
+}
+
+fn uninstall_antigravity_ide_companion_component() -> Result<CompanionStatus, String> {
+    let command = antigravity_ide_command();
+    let result = companion_integration::uninstall_companion_for_editor(
+        OsStr::new(&command),
+        "Antigravity IDE",
+        companion_integration::ANTIGRAVITY_IDE_PROFILE_ENV,
+    )?;
+    let status = verified_companion_status(result)?;
+    disable_verified_source(
+        IntegrationSource::AntigravityIdeCompanion,
+        "Antigravity IDE companion",
+    )?;
+    Ok(status)
+}
+
+fn install_cursor_hooks_component() -> Result<(), String> {
+    let config_dir = cursor_integration::cursor_config_dir_from_environment()?;
+    let executable = integration_executable()?;
+    let change = cursor_integration::install_cursor_integration(&config_dir, &executable)?;
+    verify_cursor_change(&change, true)?;
+    enable_verified_source(IntegrationSource::CursorHooks, "Cursor activity hooks")
+}
+
+fn uninstall_cursor_hooks_component() -> Result<(), String> {
+    let config_dir = cursor_integration::cursor_config_dir_from_environment()?;
+    let executable = integration_executable()?;
+    let change = cursor_integration::uninstall_cursor_integration(&config_dir, &executable)?;
+    verify_cursor_change(&change, false)?;
+    disable_verified_source(IntegrationSource::CursorHooks, "Cursor activity hooks")
+}
+
+fn install_antigravity_hooks_component() -> Result<(), String> {
+    let config_dir = antigravity_integration::antigravity_config_dir_from_environment()?;
+    let executable = integration_executable()?;
+    let change =
+        antigravity_integration::install_antigravity_integration(&config_dir, &executable)?;
+    verify_antigravity_change(&change, true)?;
+    enable_verified_source(
+        IntegrationSource::AntigravityHooks,
+        "Antigravity activity hooks",
+    )
+}
+
+fn uninstall_antigravity_hooks_component() -> Result<(), String> {
+    let config_dir = antigravity_integration::antigravity_config_dir_from_environment()?;
+    let executable = integration_executable()?;
+    let change =
+        antigravity_integration::uninstall_antigravity_integration(&config_dir, &executable)?;
+    verify_antigravity_change(&change, false)?;
+    disable_verified_source(
+        IntegrationSource::AntigravityHooks,
+        "Antigravity activity hooks",
+    )
+}
+
+fn install_codex_hooks_component() -> Result<(), String> {
+    let codex_home = codex_integration::codex_home_from_environment()?;
+    let executable = integration_executable()?;
+    let change = codex_integration::install_codex_integration(&codex_home, &executable)?;
+    verify_codex_change(&change, true)?;
+    enable_verified_source(IntegrationSource::CodexHooks, "Codex activity hooks")
+}
+
+fn uninstall_codex_hooks_component() -> Result<(), String> {
+    let codex_home = codex_integration::codex_home_from_environment()?;
+    let executable = integration_executable()?;
+    let change = codex_integration::uninstall_codex_integration(&codex_home, &executable)?;
+    verify_codex_change(&change, false)?;
+    disable_verified_source(IntegrationSource::CodexHooks, "Codex activity hooks")
+}
+
+fn install_claude_hooks_component() -> Result<(), String> {
+    let claude_config_dir = claude_integration::claude_config_dir_from_environment()?;
+    let executable = integration_executable()?;
+    let change = claude_integration::install_claude_integration(&claude_config_dir, &executable)?;
+    verify_claude_change(&change, true)?;
+    enable_verified_source(IntegrationSource::ClaudeHooks, "Claude Code activity hooks")
+}
+
+fn uninstall_claude_hooks_component() -> Result<(), String> {
+    let claude_config_dir = claude_integration::claude_config_dir_from_environment()?;
+    let executable = integration_executable()?;
+    let change = claude_integration::uninstall_claude_integration(&claude_config_dir, &executable)?;
+    verify_claude_change(&change, false)?;
+    disable_verified_source(IntegrationSource::ClaudeHooks, "Claude Code activity hooks")
+}
+
+fn install_antigravity_monitoring_components<C, H>(
+    install_companion: C,
+    install_hooks: H,
+) -> Result<CompanionStatus, String>
+where
+    C: FnOnce() -> Result<CompanionStatus, String>,
+    H: FnOnce() -> Result<antigravity_integration::AntigravityIntegrationChange, String>,
+{
+    let companion_status = install_companion()?;
+    let change = install_hooks().map_err(|error| {
+        format!(
+            "The Antigravity IDE companion was installed, but Antigravity activity hooks could not be configured: {error}"
+        )
+    })?;
+    verify_antigravity_change(&change, true).map_err(|error| {
+        format!(
+            "The Antigravity IDE companion was installed, but Antigravity activity hooks could not be verified: {error}"
+        )
+    })?;
+    Ok(companion_status)
+}
+
+fn uninstall_combined_monitoring_components<C, H>(
+    editor_name: &str,
+    uninstall_companion: C,
+    uninstall_hooks: H,
+) -> Result<CompanionStatus, String>
+where
+    C: FnOnce() -> Result<CompanionStatus, String>,
+    H: FnOnce() -> Result<(), String>,
+{
+    let mut failures = Vec::new();
+    if let Err(error) = uninstall_hooks() {
+        failures.push(format!("activity hooks: {error}"));
+    }
+    let companion_status = match uninstall_companion() {
+        Ok(status) => Some(status),
+        Err(error) => {
+            failures.push(format!("companion: {error}"));
+            None
+        }
+    };
+    if failures.is_empty() {
+        companion_status.ok_or_else(|| format!("{editor_name} companion status was unavailable"))
+    } else {
+        Err(format!(
+            "{editor_name} monitoring was only partially uninstalled: {}",
+            failures.join("; ")
+        ))
+    }
+}
+
+fn enable_verified_source(source: IntegrationSource, label: &str) -> Result<(), String> {
+    state::enable_integration_source(source).map_err(|error| {
+        format!(
+            "{label} was installed and verified, but its local observation state could not be enabled: {error}"
+        )
+    })
+}
+
+fn disable_verified_source(source: IntegrationSource, label: &str) -> Result<(), String> {
+    state::disable_integration_source_and_purge(source).map_err(|error| {
+        format!(
+            "{label} was uninstalled and verified, but its retained local observations could not be disabled and cleared: {error}"
+        )
+    })
+}
+
+fn collect_uninstall_result(
+    failures: &mut Vec<String>,
+    component: &str,
+    result: Result<(), String>,
+) {
+    if let Err(error) = result {
+        failures.push(format!("{component}: {error}"));
+    }
+}
+
+fn uninstall_companion_for_all<F>(
+    status: CompanionStatus,
+    command_available: bool,
+    uninstall: F,
+) -> Result<(), String>
+where
+    F: FnOnce() -> Result<CompanionStatus, String>,
+{
+    match status.state {
+        CompanionStatusState::NotInstalled => Ok(()),
+        // An optional editor that is not present on this machine should not
+        // make the global local-cleanup action fail. The returned integration
+        // status remains `unavailable`, allowing the UI to warn that physical
+        // companion removal could not be verified.
+        CompanionStatusState::Unavailable if !command_available => Ok(()),
+        CompanionStatusState::Unavailable
+        | CompanionStatusState::Current
+        | CompanionStatusState::DifferentVersion
+        | CompanionStatusState::VersionUnknown => uninstall().map(|_| ()),
+    }
+}
+
+fn collect_uninstall_all_result(
+    failures: &mut Vec<String>,
+    component: &str,
+    source: IntegrationSource,
+    uninstall_result: Result<(), String>,
+) {
+    collect_uninstall_all_result_with_cleanup(
+        failures,
+        component,
+        source,
+        uninstall_result,
+        state::disable_integration_source_and_purge,
+    );
+}
+
+fn collect_uninstall_all_result_with_cleanup<F>(
+    failures: &mut Vec<String>,
+    component: &str,
+    source: IntegrationSource,
+    uninstall_result: Result<(), String>,
+    local_cleanup: F,
+) where
+    F: FnOnce(IntegrationSource) -> Result<(), String>,
+{
+    if let Err(error) = uninstall_result {
+        failures.push(format!("{component}: {error}"));
+    }
+    // Uninstall All is also the global stop-tracking control. Even if an
+    // unavailable CLI or malformed external config prevents physical removal,
+    // persist the local disable state and purge retained observations while
+    // keeping the external-removal failure above actionable.
+    if let Err(error) = local_cleanup(source) {
+        failures.push(format!("{component} local cleanup: {error}"));
+    }
 }
 
 fn verify_antigravity_change(
@@ -479,6 +891,32 @@ fn verify_antigravity_change(
 
 fn verify_cursor_change(
     change: &cursor_integration::CursorIntegrationChange,
+    expected_installed: bool,
+) -> Result<(), String> {
+    if change.status.installed == expected_installed
+        && (expected_installed || change.status.state == "not_installed")
+    {
+        Ok(())
+    } else {
+        Err(change.status.message.clone())
+    }
+}
+
+fn verify_codex_change(
+    change: &codex_integration::CodexIntegrationChange,
+    expected_installed: bool,
+) -> Result<(), String> {
+    if change.status.installed == expected_installed
+        && (expected_installed || change.status.state == "not_installed")
+    {
+        Ok(())
+    } else {
+        Err(change.status.message.clone())
+    }
+}
+
+fn verify_claude_change(
+    change: &claude_integration::ClaudeIntegrationChange,
     expected_installed: bool,
 ) -> Result<(), String> {
     if change.status.installed == expected_installed
@@ -547,9 +985,18 @@ fn build_integration_status_with_companions(
             companion_integration::ANTIGRAVITY_IDE_PROFILE_ENV,
         )
     });
-    let companion = companion_view(companion_status);
-    let cursor_companion = companion_view_for(cursor_status, "Cursor");
-    let antigravity_ide = companion_view_for(antigravity_ide_status, "Antigravity IDE");
+    let companion = companion_view_for_source(
+        companion_status,
+        "VS Code",
+        IntegrationSource::VsCodeCompanion,
+    );
+    let cursor_companion =
+        companion_view_for_source(cursor_status, "Cursor", IntegrationSource::CursorCompanion);
+    let antigravity_ide = companion_view_for_source(
+        antigravity_ide_status,
+        "Antigravity IDE",
+        IntegrationSource::AntigravityIdeCompanion,
+    );
     let cursor = cursor_view();
     let antigravity = antigravity_view();
     let codex = codex_view();
@@ -575,11 +1022,33 @@ fn verified_companion_status(result: CompanionOperationResult) -> Result<Compani
     }
 }
 
+#[cfg(test)]
 fn companion_view(status: CompanionStatus) -> CompanionIntegrationView {
     companion_view_for(status, "VS Code")
 }
 
+#[cfg(test)]
 fn companion_view_for(status: CompanionStatus, editor_name: &str) -> CompanionIntegrationView {
+    companion_view_for_enabled_source(status, editor_name, true)
+}
+
+fn companion_view_for_source(
+    status: CompanionStatus,
+    editor_name: &str,
+    source: IntegrationSource,
+) -> CompanionIntegrationView {
+    companion_view_for_enabled_source(
+        status,
+        editor_name,
+        state::integration_source_is_enabled(source).unwrap_or(false),
+    )
+}
+
+fn companion_view_for_enabled_source(
+    status: CompanionStatus,
+    editor_name: &str,
+    observation_enabled: bool,
+) -> CompanionIntegrationView {
     let (state, label, fallback_detail): (&str, String, String) = match status.state {
         CompanionStatusState::Current => (
             "installed",
@@ -611,13 +1080,43 @@ fn companion_view_for(status: CompanionStatus, editor_name: &str) -> CompanionIn
             format!("VSParallel could not query the {editor_name} extension installation."),
         ),
     };
-    CompanionIntegrationView {
+    let mut view = CompanionIntegrationView {
         state: state.to_string(),
         label,
         detail: status.detail.unwrap_or(fallback_detail),
         installed_version: status.installed_version,
         target_version: status.bundled_version,
+    };
+    if !observation_enabled && view.state != "not_installed" && view.state != "unavailable" {
+        view.state = "repair_needed".to_string();
+        view.label = "Repair needed".to_string();
+        view.detail.push_str(
+            " Local observation is disabled after a prior uninstall; choose Repair to re-enable it.",
+        );
     }
+    view
+}
+
+fn lifecycle_view_for_source(
+    view: LifecycleIntegrationView,
+    source: IntegrationSource,
+) -> LifecycleIntegrationView {
+    let observation_enabled = state::integration_source_is_enabled(source).unwrap_or(false);
+    lifecycle_view_for_enabled_source(view, observation_enabled)
+}
+
+fn lifecycle_view_for_enabled_source(
+    mut view: LifecycleIntegrationView,
+    observation_enabled: bool,
+) -> LifecycleIntegrationView {
+    if !observation_enabled && view.state != "not_installed" && view.state != "unavailable" {
+        view.state = "repair_needed".to_string();
+        view.label = "Repair needed".to_string();
+        view.detail.push_str(
+            " Local observation is disabled after a prior uninstall; choose Repair to re-enable it.",
+        );
+    }
+    view
 }
 
 fn codex_view() -> LifecycleIntegrationView {
@@ -688,13 +1187,16 @@ fn codex_view() -> LifecycleIntegrationView {
                     None,
                 ),
             };
-            LifecycleIntegrationView {
-                state: state.to_string(),
-                label: label.to_string(),
-                detail,
-                config_path: Some(status.config_path),
-                review_required,
-            }
+            lifecycle_view_for_source(
+                LifecycleIntegrationView {
+                    state: state.to_string(),
+                    label: label.to_string(),
+                    detail,
+                    config_path: Some(status.config_path),
+                    review_required,
+                },
+                IntegrationSource::CodexHooks,
+            )
         }
         Err(error) => unavailable_codex_view(
             format!("VSParallel could not safely read the Codex hook configuration: {error}"),
@@ -745,13 +1247,16 @@ fn claude_view() -> LifecycleIntegrationView {
                     _ => ("unavailable", "Status unavailable"),
                 }
             };
-            LifecycleIntegrationView {
-                state: state.to_string(),
-                label: label.to_string(),
-                detail: status.message,
-                config_path: Some(status.config_path),
-                review_required: None,
-            }
+            lifecycle_view_for_source(
+                LifecycleIntegrationView {
+                    state: state.to_string(),
+                    label: label.to_string(),
+                    detail: status.message,
+                    config_path: Some(status.config_path),
+                    review_required: None,
+                },
+                IntegrationSource::ClaudeHooks,
+            )
         }
         Err(error) => unavailable_claude_view(
             format!("VSParallel could not safely read the Claude Code hook configuration: {error}"),
@@ -789,13 +1294,16 @@ fn cursor_view() -> LifecycleIntegrationView {
                 "partial" => ("repair_needed", "Repair needed"),
                 _ => ("unavailable", "Status unavailable"),
             };
-            LifecycleIntegrationView {
-                state: state.to_string(),
-                label: label.to_string(),
-                detail: status.message,
-                config_path: Some(status.config_path),
-                review_required: None,
-            }
+            lifecycle_view_for_source(
+                LifecycleIntegrationView {
+                    state: state.to_string(),
+                    label: label.to_string(),
+                    detail: status.message,
+                    config_path: Some(status.config_path),
+                    review_required: None,
+                },
+                IntegrationSource::CursorHooks,
+            )
         }
         Err(error) => unavailable_cursor_view(
             format!("VSParallel could not safely read the Cursor hook configuration: {error}"),
@@ -866,13 +1374,16 @@ fn antigravity_view() -> LifecycleIntegrationView {
                     ),
                 }
             };
-            LifecycleIntegrationView {
-                state: state.to_string(),
-                label,
-                detail,
-                config_path: Some(status.config_path),
-                review_required: None,
-            }
+            lifecycle_view_for_source(
+                LifecycleIntegrationView {
+                    state: state.to_string(),
+                    label,
+                    detail,
+                    config_path: Some(status.config_path),
+                    review_required: None,
+                },
+                IntegrationSource::AntigravityHooks,
+            )
         }
         Err(error) => unavailable_antigravity_view(
             format!("VSParallel could not safely read the Antigravity hook configuration: {error}"),
@@ -2521,6 +3032,9 @@ pub fn run() {
             is_release_build,
             get_snapshot,
             get_usage,
+            get_display_preferences,
+            set_editor_visibility,
+            set_usage_limit_percentage_visible,
             get_diagnostics,
             get_integration_status,
             get_cursor_agents_bridge_status,
@@ -2528,9 +3042,12 @@ pub fn run() {
             uninstall_companion,
             install_cursor_companion,
             install_cursor_monitoring,
+            uninstall_cursor_monitoring,
             uninstall_cursor_companion,
             install_antigravity_ide_companion,
             uninstall_antigravity_ide_companion,
+            install_antigravity_monitoring,
+            uninstall_antigravity_monitoring,
             install_cursor_hooks,
             uninstall_cursor_hooks,
             install_codex_hooks,
@@ -2539,6 +3056,7 @@ pub fn run() {
             uninstall_claude_hooks,
             install_antigravity_hooks,
             uninstall_antigravity_hooks,
+            uninstall_all_integrations,
             open_workspace,
             hide_window,
             get_window_chrome_state,
@@ -2916,6 +3434,39 @@ mod tests {
     }
 
     #[test]
+    fn installed_components_report_repair_when_local_observation_is_suppressed() {
+        let companion = companion_view_for_enabled_source(
+            companion_status(CompanionStatusState::Current),
+            "Cursor",
+            false,
+        );
+        assert_eq!(companion.state, "repair_needed");
+        assert_eq!(companion.label, "Repair needed");
+        assert!(companion.detail.contains("Local observation is disabled"));
+
+        let missing = companion_view_for_enabled_source(
+            companion_status(CompanionStatusState::NotInstalled),
+            "Cursor",
+            false,
+        );
+        assert_eq!(missing.state, "not_installed");
+
+        let lifecycle = lifecycle_view_for_enabled_source(
+            LifecycleIntegrationView {
+                state: "installed".to_string(),
+                label: "Installed".to_string(),
+                detail: "Cursor activity monitoring is installed.".to_string(),
+                config_path: None,
+                review_required: None,
+            },
+            false,
+        );
+        assert_eq!(lifecycle.state, "repair_needed");
+        assert_eq!(lifecycle.label, "Repair needed");
+        assert!(lifecycle.detail.contains("Local observation is disabled"));
+    }
+
+    #[test]
     fn integration_executable_must_be_an_absolute_existing_file() {
         assert!(validate_integration_executable(PathBuf::from("relative"), "test").is_err());
 
@@ -3017,6 +3568,123 @@ mod tests {
         )
         .unwrap();
         assert_eq!(status.state, CompanionStatusState::Current);
+    }
+
+    #[test]
+    fn combined_uninstall_attempts_both_components_and_reports_each_failure() {
+        use std::cell::Cell;
+
+        let hooks_called = Cell::new(false);
+        let companion_called = Cell::new(false);
+        let error = uninstall_combined_monitoring_components(
+            "Cursor",
+            || {
+                companion_called.set(true);
+                Err("CLI unavailable".to_string())
+            },
+            || {
+                hooks_called.set(true);
+                Err("hooks.json is read-only".to_string())
+            },
+        )
+        .unwrap_err();
+
+        assert!(hooks_called.get());
+        assert!(companion_called.get());
+        assert!(error.contains("activity hooks"));
+        assert!(error.contains("hooks.json is read-only"));
+        assert!(error.contains("companion"));
+        assert!(error.contains("CLI unavailable"));
+
+        let status = uninstall_combined_monitoring_components(
+            "Cursor",
+            || Ok(companion_status(CompanionStatusState::NotInstalled)),
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(status.state, CompanionStatusState::NotInstalled);
+    }
+
+    #[test]
+    fn uninstall_all_warns_via_status_for_absent_clis_and_attempts_known_installs() {
+        use std::cell::Cell;
+
+        let unavailable_called = Cell::new(false);
+        uninstall_companion_for_all(
+            companion_status(CompanionStatusState::Unavailable),
+            false,
+            || {
+                unavailable_called.set(true);
+                Err("missing CLI".to_string())
+            },
+        )
+        .unwrap();
+        assert!(!unavailable_called.get());
+
+        let failing_cli_called = Cell::new(false);
+        let error = uninstall_companion_for_all(
+            companion_status(CompanionStatusState::Unavailable),
+            true,
+            || {
+                failing_cli_called.set(true);
+                Err("status timed out".to_string())
+            },
+        )
+        .unwrap_err();
+        assert!(failing_cli_called.get());
+        assert!(error.contains("status timed out"));
+
+        let installed_called = Cell::new(false);
+        let error = uninstall_companion_for_all(
+            companion_status(CompanionStatusState::Current),
+            true,
+            || {
+                installed_called.set(true);
+                Err("uninstall failed".to_string())
+            },
+        )
+        .unwrap_err();
+        assert!(installed_called.get());
+        assert!(error.contains("uninstall failed"));
+    }
+
+    #[test]
+    fn uninstall_all_keeps_external_failure_and_still_runs_local_cleanup() {
+        use std::cell::Cell;
+
+        let cleanup_called = Cell::new(false);
+        let mut failures = Vec::new();
+        collect_uninstall_all_result_with_cleanup(
+            &mut failures,
+            "Cursor companion",
+            IntegrationSource::CursorCompanion,
+            Err("external removal could not be verified".to_string()),
+            |source| {
+                assert_eq!(source, IntegrationSource::CursorCompanion);
+                cleanup_called.set(true);
+                Ok(())
+            },
+        );
+
+        assert!(cleanup_called.get());
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("external removal could not be verified"));
+    }
+
+    #[test]
+    fn snapshot_filter_propagates_preference_load_failures() {
+        let snapshot = Snapshot {
+            schema_version: state::SCHEMA_VERSION,
+            generated_at_ms: 123,
+            workspaces: Vec::new(),
+        };
+
+        let error = filter_snapshot_with_preferences(snapshot, || {
+            Err("display preferences are malformed".to_string())
+        })
+        .unwrap_err();
+
+        assert_eq!(error, "display preferences are malformed");
     }
 
     #[test]

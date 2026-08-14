@@ -16,6 +16,8 @@
     IntegrationKind,
     "companion" | "cursorCompanion" | "antigravityIde"
   >;
+  type VisibleIntegrationKind = EditorIntegrationKind | "codex" | "claude";
+  type EditorVisibilityKind = "vscode" | "cursor" | "antigravity" | "zed";
   type IntegrationActionKind = IntegrationKind | "all";
   type IntegrationOperation = "install" | "uninstall";
   type IntegrationVisualState = "missing" | "ready" | "warning" | "error";
@@ -45,7 +47,7 @@
   type UsageKind = "codex" | "claude";
   type UsageState = "available" | "stale" | "unavailable";
   type NoticeKind = "error" | "warning";
-  type IntegrationMessageKind = "neutral" | "error" | "success";
+  type IntegrationMessageKind = "neutral" | "warning" | "error" | "success";
   type UpdatePhase =
     | "idle"
     | "checking"
@@ -59,6 +61,7 @@
     | "close_window"
     | "get_cursor_agents_bridge_status"
     | "get_diagnostics"
+    | "get_display_preferences"
     | "get_integration_status"
     | "get_snapshot"
     | "get_usage"
@@ -70,12 +73,16 @@
     | "install_cursor_companion"
     | "install_cursor_hooks"
     | "install_cursor_monitoring"
+    | "uninstall_cursor_monitoring"
     | "install_antigravity_hooks"
     | "install_antigravity_ide_companion"
+    | "install_antigravity_monitoring"
     | "is_release_build"
     | "open_workspace"
     | "restore_full_window"
     | "set_cursor_agents_monitoring_enabled"
+    | "set_editor_visibility"
+    | "set_usage_limit_percentage_visible"
     | "set_window_chrome_theme"
     | "toggle_window_maximize"
     | "uninstall_claude_hooks"
@@ -84,7 +91,9 @@
     | "uninstall_cursor_companion"
     | "uninstall_cursor_hooks"
     | "uninstall_antigravity_hooks"
-    | "uninstall_antigravity_ide_companion";
+    | "uninstall_antigravity_ide_companion"
+    | "uninstall_antigravity_monitoring"
+    | "uninstall_all_integrations";
 
   interface ActivityView {
     kind: ActivityKind;
@@ -213,6 +222,17 @@
     uninstallButton: HTMLButtonElement;
   }
 
+  interface VisibilityPreferences {
+    editors: Record<EditorVisibilityKind, boolean>;
+    usage: boolean;
+  }
+
+  interface DisplayPreferencesResponse {
+    schemaVersion: 1;
+    editors: Record<EditorVisibilityKind, boolean>;
+    usageLimitPercentage: boolean;
+  }
+
   interface WindowChromeState {
     schemaVersion: 1;
     platform: string;
@@ -257,15 +277,16 @@
     diagnosticsLoaded: boolean;
     diagnosticsUnavailable: boolean;
     diagnosticWarningCount: number;
+    diagnosticWarnings: string[];
     setupRefreshPending: boolean;
-    setupRefreshPromise: Promise<[void, void, void]> | null;
+    setupRefreshPromise: Promise<[void, void, void, void]> | null;
     integrationPending: boolean;
     integrationLoaded: boolean;
     integrationStatus: IntegrationStatus | null;
     integrationAction: IntegrationAction | null;
     cursorAgentsBridgePending: boolean;
     cursorAgentsBridgeStatus: CursorAgentsBridgeStatus | null;
-    pendingUninstall: IntegrationKind | null;
+    pendingUninstall: IntegrationActionKind | null;
     openingInstanceId: string | null;
     lastGoodSnapshot: Snapshot | null;
     lastUsage: UsageSnapshot | null;
@@ -274,6 +295,8 @@
     windowChromeRequestId: number;
     windowChromeRefreshTimer: number | null;
     themePreference: ThemePreference;
+    editorVisibility: Record<EditorVisibilityKind, boolean>;
+    usageVisible: boolean;
     updatePhase: UpdatePhase;
     availableUpdate: AvailableUpdate | null;
     dismissedUpdateVersion: string | null;
@@ -319,6 +342,7 @@
   const UPDATE_CHECK_TIMEOUT_MS = 15_000;
   const UPDATE_DOWNLOAD_TIMEOUT_MS = 5 * 60_000;
   const THEME_STORAGE_KEY = "vsparallel.appearance";
+  const VISIBILITY_STORAGE_KEY = "vsparallel.visibility";
   const THEME_PREFERENCES: ReadonlySet<string> = new Set(["system", "light", "dark"]);
   const INTEGRATION_KINDS = [
     "companion",
@@ -329,12 +353,86 @@
     "codex",
     "claude",
   ] as const;
+  const VISIBLE_INTEGRATION_KINDS = [
+    "companion",
+    "cursorCompanion",
+    "antigravityIde",
+    "codex",
+    "claude",
+  ] as const satisfies readonly VisibleIntegrationKind[];
+  const EDITOR_VISIBILITY_KINDS = [
+    "vscode",
+    "cursor",
+    "antigravity",
+    "zed",
+  ] as const satisfies readonly EditorVisibilityKind[];
   const MAX_JAVASCRIPT_TIMESTAMP_MS = 8_640_000_000_000_000;
   const tauriApi = (window as TauriWindow).__TAURI__;
   const tauriInvoke = tauriApi?.core?.invoke;
   const tauriUpdater = tauriApi?.updater;
   const tauriProcess = tauriApi?.process;
   const lightThemeQuery = window.matchMedia("(prefers-color-scheme: light)");
+
+  function defaultVisibilityPreferences(): VisibilityPreferences {
+    return {
+      editors: {
+        vscode: true,
+        cursor: true,
+        antigravity: true,
+        zed: true,
+      },
+      usage: true,
+    };
+  }
+
+  function loadVisibilityPreferences(): VisibilityPreferences {
+    const preferences = defaultVisibilityPreferences();
+    try {
+      const rawValue = window.localStorage.getItem(VISIBILITY_STORAGE_KEY);
+      if (!rawValue) {
+        return preferences;
+      }
+      const raw = JSON.parse(rawValue) as unknown;
+      if (!isObject(raw)) {
+        return preferences;
+      }
+      const rawEditors = isObject(raw.editors) ? raw.editors : {};
+      EDITOR_VISIBILITY_KINDS.forEach((kind) => {
+        if (typeof rawEditors[kind] === "boolean") {
+          preferences.editors[kind] = rawEditors[kind];
+        }
+      });
+      if (typeof raw.usage === "boolean") {
+        preferences.usage = raw.usage;
+      }
+    } catch (_error) {
+      // Visibility defaults remain enabled when a stored preference is unreadable.
+    }
+    return preferences;
+  }
+
+  function normalizeDisplayPreferences(rawValue: unknown): DisplayPreferencesResponse {
+    const raw = parseBridgeValue(rawValue);
+    if (!isObject(raw) || raw.schemaVersion !== SCHEMA_VERSION || !isObject(raw.editors)) {
+      throw new Error("VSParallel returned invalid display preferences.");
+    }
+    const rawEditors = raw.editors;
+    const editors = defaultVisibilityPreferences().editors;
+    EDITOR_VISIBILITY_KINDS.forEach((kind) => {
+      if (typeof rawEditors[kind] !== "boolean") {
+        throw new Error("VSParallel returned incomplete editor visibility preferences.");
+      }
+      editors[kind] = rawEditors[kind];
+    });
+    if (typeof raw.usageLimitPercentage !== "boolean") {
+      throw new Error("VSParallel returned an invalid usage visibility preference.");
+    }
+    return {
+      schemaVersion: SCHEMA_VERSION,
+      editors,
+      usageLimitPercentage: raw.usageLimitPercentage,
+    };
+  }
 
   const elements = {
     connectionBar: requiredElement<HTMLDivElement>("#connectionBar"),
@@ -372,6 +470,8 @@
     updateNowButton: requiredElement<HTMLButtonElement>("#updateNowButton"),
     updateLaterButton: requiredElement<HTMLButtonElement>("#updateLaterButton"),
     emptyState: requiredElement<HTMLDivElement>("#emptyState"),
+    emptyStateTitle: requiredElement<HTMLHeadingElement>("#emptyStateTitle"),
+    emptyStateDescription: requiredElement<HTMLParagraphElement>("#emptyStateDescription"),
     emptySetupButton: requiredElement<HTMLButtonElement>("#emptySetupButton"),
     emptyRefreshButton: requiredElement<HTMLButtonElement>("#emptyRefreshButton"),
     launchOverlay: requiredElement<HTMLDivElement>("#launchOverlay"),
@@ -381,11 +481,13 @@
     settingsCloseButton: requiredElement<HTMLButtonElement>("#settingsCloseButton"),
     checkForUpdatesButton: requiredElement<HTMLButtonElement>("#checkForUpdatesButton"),
     updateCheckStatus: requiredElement<HTMLParagraphElement>("#updateCheckStatus"),
-    diagnosticsSummary: requiredElement<HTMLSpanElement>("#diagnosticsSummary"),
+    diagnosticsSummary: requiredElement<HTMLButtonElement>("#diagnosticsSummary"),
+    diagnosticsSummaryDetail: requiredElement<HTMLSpanElement>("#diagnosticsSummaryDetail"),
     diagnosticsList: requiredElement<HTMLDListElement>("#diagnosticsList"),
     diagnosticsStatus: requiredElement<HTMLParagraphElement>("#diagnosticsStatus"),
     diagnosticsRefreshButton: requiredElement<HTMLButtonElement>("#diagnosticsRefreshButton"),
     setupAllButton: requiredElement<HTMLButtonElement>("#setupAllButton"),
+    uninstallAllButton: requiredElement<HTMLButtonElement>("#uninstallAllButton"),
     integrationList: requiredElement<HTMLDivElement>("#integrationList"),
     integrationMessage: requiredElement<HTMLParagraphElement>("#integrationMessage"),
     companionCard: requiredElement<HTMLElement>("#companionCard"),
@@ -420,6 +522,7 @@
     cursorAgentsMonitoringEnabled: requiredElement<HTMLInputElement>(
       "#cursorAgentsMonitoringEnabled",
     ),
+    experimentalIntegrations: requiredElement<HTMLDivElement>("#experimentalIntegrations"),
     antigravityIdeCard: requiredElement<HTMLElement>("#antigravityIdeCard"),
     antigravityIdeStatus: requiredElement<HTMLSpanElement>("#antigravityIdeStatus"),
     antigravityIdeDetail: requiredElement<HTMLParagraphElement>("#antigravityIdeDetail"),
@@ -432,26 +535,6 @@
     ),
     antigravityIdeUninstallButton: requiredElement<HTMLButtonElement>(
       "#antigravityIdeUninstallButton",
-    ),
-    cursorCard: requiredElement<HTMLElement>("#cursorCard"),
-    cursorStatus: requiredElement<HTMLSpanElement>("#cursorStatus"),
-    cursorDetail: requiredElement<HTMLParagraphElement>("#cursorDetail"),
-    cursorHooksHelpStatus: requiredElement<HTMLSpanElement>("#cursorHooksHelpStatus"),
-    cursorMeta: requiredElement<HTMLParagraphElement>("#cursorMeta"),
-    cursorInstallButton: requiredElement<HTMLButtonElement>("#cursorInstallButton"),
-    cursorUninstallButton: requiredElement<HTMLButtonElement>("#cursorUninstallButton"),
-    antigravityCard: requiredElement<HTMLElement>("#antigravityCard"),
-    antigravityStatus: requiredElement<HTMLSpanElement>("#antigravityStatus"),
-    antigravityDetail: requiredElement<HTMLParagraphElement>("#antigravityDetail"),
-    antigravityHooksHelpStatus: requiredElement<HTMLSpanElement>(
-      "#antigravityHooksHelpStatus",
-    ),
-    antigravityMeta: requiredElement<HTMLParagraphElement>("#antigravityMeta"),
-    antigravityInstallButton: requiredElement<HTMLButtonElement>(
-      "#antigravityInstallButton",
-    ),
-    antigravityUninstallButton: requiredElement<HTMLButtonElement>(
-      "#antigravityUninstallButton",
     ),
     codexCard: requiredElement<HTMLElement>("#codexCard"),
     codexStatus: requiredElement<HTMLSpanElement>("#codexStatus"),
@@ -477,6 +560,11 @@
     appearanceInputs: Array.from(
       document.querySelectorAll<HTMLInputElement>('input[name="appearance"]'),
     ),
+    editorVisibilityInputs: Array.from(
+      document.querySelectorAll<HTMLInputElement>("[data-editor-visibility]"),
+    ),
+    usageVisibilityInput: requiredElement<HTMLInputElement>("#usageVisibilityInput"),
+    visibilityStatus: requiredElement<HTMLParagraphElement>("#visibilityStatus"),
   };
 
   const initialThemePreference: ThemePreference = isThemePreference(
@@ -484,6 +572,7 @@
   )
     ? document.documentElement.dataset.themePreference
     : "system";
+  const initialVisibilityPreferences = loadVisibilityPreferences();
 
   const state: AppState = {
     refreshPending: false,
@@ -492,6 +581,7 @@
     diagnosticsLoaded: false,
     diagnosticsUnavailable: false,
     diagnosticWarningCount: 0,
+    diagnosticWarnings: [],
     setupRefreshPending: false,
     setupRefreshPromise: null,
     integrationPending: false,
@@ -509,6 +599,8 @@
     windowChromeRequestId: 0,
     windowChromeRefreshTimer: null,
     themePreference: initialThemePreference,
+    editorVisibility: initialVisibilityPreferences.editors,
+    usageVisible: initialVisibilityPreferences.usage,
     updatePhase: "idle",
     availableUpdate: null,
     dismissedUpdateVersion: null,
@@ -1744,6 +1836,19 @@
     return section;
   }
 
+  function workspaceVisibilityKind(workspace: Workspace): EditorVisibilityKind {
+    if (workspace.editor === "antigravity_2" || workspace.editor === "antigravity_ide") {
+      return "antigravity";
+    }
+    return workspace.editor;
+  }
+
+  function visibleWorkspaces(workspaces: readonly Workspace[]): Workspace[] {
+    return workspaces.filter(
+      (workspace) => state.editorVisibility[workspaceVisibilityKind(workspace)],
+    );
+  }
+
   function renderSnapshot(snapshot: Snapshot): void {
     const focusedOpenButton = document.activeElement
       ?.closest<HTMLButtonElement>(".open-button") ?? null;
@@ -1751,8 +1856,9 @@
       && elements.workspaceList.contains(focusedOpenButton)
       ? focusedOpenButton.dataset.instanceId
       : "";
+    const displayedWorkspaces = visibleWorkspaces(snapshot.workspaces);
     const fragment = document.createDocumentFragment();
-    groupWorkspaces(snapshot.workspaces).forEach((group) => {
+    groupWorkspaces(displayedWorkspaces).forEach((group) => {
       fragment.append(createWorkspaceGroup(group));
     });
 
@@ -1766,13 +1872,22 @@
       replacement?.focus({ preventScroll: true });
     }
     elements.workspaceList.setAttribute("aria-busy", "false");
-    const workspaceCountLabel = `${snapshot.workspaces.length} ${snapshot.workspaces.length === 1 ? "workspace" : "workspaces"}`;
+    const workspaceCountLabel = `${displayedWorkspaces.length} ${displayedWorkspaces.length === 1 ? "workspace" : "workspaces"}`;
     elements.workspaceCount.textContent = workspaceCountLabel;
     elements.workspaceCount.setAttribute(
       "aria-label",
       workspaceCountLabel,
     );
-    elements.emptyState.hidden = snapshot.workspaces.length !== 0;
+    elements.emptyState.hidden = displayedWorkspaces.length !== 0;
+    const visibilityFilterActive = EDITOR_VISIBILITY_KINDS.some(
+      (kind) => !state.editorVisibility[kind],
+    );
+    elements.emptyStateTitle.textContent = visibilityFilterActive
+      ? "No visible workspaces"
+      : "No workspaces detected";
+    elements.emptyStateDescription.textContent = visibilityFilterActive
+      ? "No workspaces from enabled editors are visible. Re-enable an editor under Settings › Visibility, or refresh after opening a workspace in an enabled editor."
+      : "Open a folder in VS Code, Cursor, or Antigravity IDE with its VSParallel integration enabled, or open one in Zed for automatic read-only monitoring. Start an agent turn to see activity and model information when available.";
     elements.connectionBar.dataset.state = snapshot.malformedRecords ? "warning" : "connected";
     elements.connectionText.textContent = snapshot.malformedRecords
       ? `Monitoring local state · ${snapshot.malformedRecords} malformed ${snapshot.malformedRecords === 1 ? "record" : "records"} ignored`
@@ -2388,6 +2503,103 @@
     }
   }
 
+  function storeVisibilityPreferences(): void {
+    try {
+      window.localStorage.setItem(
+        VISIBILITY_STORAGE_KEY,
+        JSON.stringify({ editors: state.editorVisibility, usage: state.usageVisible }),
+      );
+    } catch (_error) {
+      // The selected visibility still applies for this session when storage is unavailable.
+    }
+  }
+
+  function applyVisibilityPreferences(persist = true): void {
+    elements.editorVisibilityInputs.forEach((input) => {
+      const kind = input.dataset.editorVisibility as EditorVisibilityKind | undefined;
+      if (kind && EDITOR_VISIBILITY_KINDS.includes(kind)) {
+        input.checked = state.editorVisibility[kind];
+      }
+    });
+    elements.usageVisibilityInput.checked = state.usageVisible;
+    elements.usageOverview.hidden = !state.usageVisible;
+    if (persist) {
+      storeVisibilityPreferences();
+    }
+    if (state.lastGoodSnapshot) {
+      renderSnapshot(state.lastGoodSnapshot);
+    }
+  }
+
+  function commitDisplayPreferences(
+    preferences: DisplayPreferencesResponse,
+    persist = true,
+  ): void {
+    state.editorVisibility = { ...preferences.editors };
+    state.usageVisible = preferences.usageLimitPercentage;
+    applyVisibilityPreferences(persist);
+  }
+
+  function setVisibilityStatus(message: string, error = false): void {
+    elements.visibilityStatus.textContent = message;
+    elements.visibilityStatus.hidden = !message;
+    elements.visibilityStatus.classList.toggle("has-error", error);
+  }
+
+  async function refreshDisplayPreferences(): Promise<void> {
+    try {
+      const raw = await invoke("get_display_preferences", {});
+      commitDisplayPreferences(normalizeDisplayPreferences(raw));
+      setVisibilityStatus("");
+    } catch (_error) {
+      applyVisibilityPreferences(false);
+      setVisibilityStatus("Using visibility saved for this window; app-wide sync is unavailable.", true);
+    }
+  }
+
+  async function updateEditorVisibility(input: HTMLInputElement): Promise<void> {
+    const kind = input.dataset.editorVisibility as EditorVisibilityKind | undefined;
+    if (!kind || !EDITOR_VISIBILITY_KINDS.includes(kind)) {
+      return;
+    }
+    state.editorVisibility[kind] = input.checked;
+    applyVisibilityPreferences();
+    input.disabled = true;
+    setVisibilityStatus("Saving visibility…");
+    try {
+      const raw = await invoke("set_editor_visibility", {
+        editor: kind,
+        visible: input.checked,
+      });
+      commitDisplayPreferences(normalizeDisplayPreferences(raw));
+      setVisibilityStatus("");
+      await refreshSnapshot();
+    } catch (_error) {
+      setVisibilityStatus("Saved for this window; app-wide sync is unavailable.", true);
+    } finally {
+      input.disabled = false;
+    }
+  }
+
+  async function updateUsageVisibility(visible: boolean): Promise<void> {
+    state.usageVisible = visible;
+    applyVisibilityPreferences();
+    elements.usageVisibilityInput.disabled = true;
+    setVisibilityStatus("Saving visibility…");
+    try {
+      const raw = await invoke("set_usage_limit_percentage_visible", { visible });
+      commitDisplayPreferences(normalizeDisplayPreferences(raw));
+      setVisibilityStatus("");
+    } catch (_error) {
+      setVisibilityStatus("Saved for this window; app-wide sync is unavailable.", true);
+    } finally {
+      elements.usageVisibilityInput.disabled = false;
+    }
+    if (state.usageVisible) {
+      void refreshUsage();
+    }
+  }
+
   function applyThemePreference(
     preference: unknown,
     persist = true,
@@ -2447,7 +2659,7 @@
   }
 
   async function refreshUsage(): Promise<void> {
-    if (state.usagePending) {
+    if (state.usagePending || !state.usageVisible) {
       return;
     }
 
@@ -2575,28 +2787,8 @@
       };
     }
 
-    if (kind === "antigravity") {
-      return {
-        card: elements.antigravityCard,
-        status: elements.antigravityStatus,
-        detail: elements.antigravityDetail,
-        helpDetail: elements.antigravityHooksHelpStatus,
-        meta: elements.antigravityMeta,
-        installButton: elements.antigravityInstallButton,
-        uninstallButton: elements.antigravityUninstallButton,
-      };
-    }
-
-    if (kind === "cursor") {
-      return {
-        card: elements.cursorCard,
-        status: elements.cursorStatus,
-        detail: elements.cursorDetail,
-        helpDetail: elements.cursorHooksHelpStatus,
-        meta: elements.cursorMeta,
-        installButton: elements.cursorInstallButton,
-        uninstallButton: elements.cursorUninstallButton,
-      };
+    if (kind === "cursor" || kind === "antigravity") {
+      throw new Error(`${integrationComponentName(kind)} has no separate visible row.`);
     }
 
     if (kind === "claude") {
@@ -2630,12 +2822,13 @@
     componentElements.detail.textContent = integrationPurpose(component.kind);
     const installButtonLabel = integrationInstallButtonLabel(component);
     componentElements.installButton.textContent = installButtonLabel;
+    componentElements.installButton.hidden = component.visualState === "ready";
     const componentName = component.kind === "companion"
-      ? "VS Code companion"
+      ? "VS Code"
       : component.kind === "cursorCompanion"
-        ? "Cursor companion"
+        ? "Cursor"
         : component.kind === "antigravityIde"
-          ? "Antigravity IDE companion"
+          ? "Antigravity"
           : component.kind === "cursor"
             ? "Cursor hooks only"
             : component.kind === "antigravity"
@@ -2671,14 +2864,93 @@
       : "Current status details are unavailable.";
   }
 
+  function integrationComponentName(kind: IntegrationKind): string {
+    switch (kind) {
+      case "companion":
+        return "VS Code companion";
+      case "cursorCompanion":
+        return "Cursor companion";
+      case "antigravityIde":
+        return "Antigravity IDE companion";
+      case "cursor":
+        return "Cursor activity hooks";
+      case "antigravity":
+        return "Antigravity activity hooks";
+      case "codex":
+        return "Codex activity hooks";
+      case "claude":
+        return "Claude Code activity hooks";
+    }
+  }
+
+  function combineIntegrationComponents(
+    kind: "cursorCompanion" | "antigravityIde",
+    components: readonly IntegrationComponent[],
+  ): IntegrationComponent {
+    const allReady = components.every((component) => component.visualState === "ready");
+    const allMissing = components.every((component) => component.visualState === "missing");
+    const installed = components.some((component) => component.installed);
+    const anyUnavailable = components.some(
+      (component) => component.visualState === "error" || component.token === "unavailable",
+    );
+    const visualState: IntegrationVisualState = allReady
+      ? "ready"
+      : allMissing
+        ? "missing"
+        : anyUnavailable && !installed
+          ? "error"
+          : "warning";
+    const actionLabel = components.some((component) => component.actionLabel === "Update")
+      ? "Update"
+      : allMissing
+        ? "Install"
+        : "Repair";
+    const detail = components
+      .map((component) => `${integrationComponentName(component.kind)}: ${component.detail}`)
+      .join(" · ");
+
+    return {
+      ...components[0],
+      kind,
+      optional: false,
+      visualState,
+      installed,
+      actionLabel,
+      label: visualState === "ready"
+        ? "Installed"
+        : visualState === "missing"
+          ? "Not installed"
+          : visualState === "error"
+            ? "Unavailable"
+            : "Needs attention",
+      detail,
+      installedVersion: "",
+      targetVersion: "",
+      configPath: "",
+    };
+  }
+
+  function visibleIntegrationComponent(
+    status: IntegrationStatus,
+    kind: VisibleIntegrationKind,
+  ): IntegrationComponent {
+    if (kind === "cursorCompanion") {
+      return combineIntegrationComponents(kind, [status.cursorCompanion, status.cursor]);
+    }
+    if (kind === "antigravityIde") {
+      return combineIntegrationComponents(kind, [status.antigravityIde, status.antigravity]);
+    }
+    return status[kind];
+  }
+
   function integrationPurpose(kind: IntegrationKind): string {
     switch (kind) {
       case "companion":
-        return "Live VS Code workspaces";
+        return "Live workspace detection";
       case "cursorCompanion":
-        return "Live IDE workspaces · recent agent activity";
+        return "Live workspaces and agent activity";
       case "antigravityIde":
-        return "Live Antigravity IDE workspaces";
+        return "Live workspaces and agent activity";
       case "cursor":
         return "Recent workspace and agent activity";
       case "antigravity":
@@ -2690,11 +2962,6 @@
   }
 
   function integrationInstallButtonLabel(component: IntegrationComponent): string {
-    if (component.kind === "cursorCompanion") {
-      return component.actionLabel === "Install"
-        ? "Set up Cursor monitoring"
-        : "Repair Cursor monitoring";
-    }
     if (component.kind === "cursor") {
       return component.actionLabel === "Install"
         ? "Install hooks only"
@@ -2727,11 +2994,12 @@
     elements.diagnosticsRefreshButton.disabled = busy || state.setupRefreshPending;
     elements.setupAllButton.disabled = busy || !status;
     elements.setupAllButton.textContent = state.integrationAction?.kind === "all"
+      && state.integrationAction.operation === "install"
       ? "Setting up…"
       : "Set up monitoring";
 
-    INTEGRATION_KINDS.forEach((kind) => {
-      const component = status?.[kind];
+    VISIBLE_INTEGRATION_KINDS.forEach((kind) => {
+      const component = status ? visibleIntegrationComponent(status, kind) : null;
       const componentElements = getIntegrationElements(kind);
       const isCurrentAction = action?.kind === kind;
       componentElements.card.setAttribute("aria-busy", String(isCurrentAction));
@@ -2743,29 +3011,37 @@
           isCurrentAction && action?.operation === "install"
             ? integrationProgressLabel(component, "install")
             : integrationInstallButtonLabel(component);
-        const uninstallLabel = kind === "cursorCompanion"
-          ? "Uninstall companion"
-          : "Uninstall";
+        const uninstallLabel = "Uninstall";
         componentElements.uninstallButton.textContent =
           isCurrentAction && action?.operation === "uninstall"
-            ? kind === "cursorCompanion"
-              ? "Uninstalling companion…"
-              : "Uninstalling…"
+            ? "Uninstalling…"
             : uninstallLabel;
       }
     });
+    // Keep the global stop-tracking action available even when an editor CLI
+    // is unavailable or external status says "not installed". Those are the
+    // cases where lingering records from a still-running process most need the
+    // backend's source suppression and purge fallback.
+    elements.uninstallAllButton.disabled = busy || !status;
+    elements.uninstallAllButton.textContent = action?.kind === "all"
+      && action.operation === "uninstall"
+      ? "Uninstalling…"
+      : "Uninstall all";
   }
 
   function summarizeEditorCompanions(status: IntegrationStatus): {
     installed: boolean;
     warningCount: number;
   } {
-    const companions = [status.companion, status.cursorCompanion, status.antigravityIde];
+    const companions = [
+      visibleIntegrationComponent(status, "companion"),
+      visibleIntegrationComponent(status, "cursorCompanion"),
+      visibleIntegrationComponent(status, "antigravityIde"),
+    ];
     return {
       installed: companions.some((component) => component.installed),
       warningCount: companions.filter((component) =>
         ["warning", "error"].includes(component.visualState)
-        && component.token !== "unavailable"
       ).length,
     };
   }
@@ -2788,7 +3064,7 @@
     }
 
     const editorSummary = summarizeEditorCompanions(status);
-    const optionalComponents = [status.cursor, status.antigravity, status.codex, status.claude];
+    const optionalComponents = [status.codex, status.claude];
     const optionalMissing = optionalComponents.some(
       (component) => component.visualState === "missing",
     );
@@ -2797,7 +3073,8 @@
     ).length;
     const totalWarnings = editorSummary.warningCount
       + optionalWarnings
-      + diagnosticWarningCount;
+      + diagnosticWarningCount
+      + Number(diagnosticsUnavailable);
 
     if (!editorSummary.installed) {
       return { summary: "Editor setup needed", attention: true };
@@ -2826,6 +3103,65 @@
     );
 
     elements.diagnosticsSummary.textContent = summary;
+    elements.diagnosticsSummary.dataset.attention = String(attention);
+    elements.diagnosticsSummary.setAttribute("aria-label", `Setup status: ${summary}`);
+    const details: string[] = [];
+    if (state.integrationStatus) {
+      const integrationGroups: Array<{
+        name: string;
+        kind: VisibleIntegrationKind;
+        components: readonly IntegrationComponent[];
+      }> = [
+        {
+          name: "VS Code",
+          kind: "companion",
+          components: [state.integrationStatus.companion],
+        },
+        {
+          name: "Cursor",
+          kind: "cursorCompanion",
+          components: [state.integrationStatus.cursorCompanion, state.integrationStatus.cursor],
+        },
+        {
+          name: "Antigravity",
+          kind: "antigravityIde",
+          components: [state.integrationStatus.antigravityIde, state.integrationStatus.antigravity],
+        },
+        { name: "Codex", kind: "codex", components: [state.integrationStatus.codex] },
+        {
+          name: "Claude Code",
+          kind: "claude",
+          components: [state.integrationStatus.claude],
+        },
+      ];
+      integrationGroups.forEach(({ name, kind, components }) => {
+        const visibleComponent = visibleIntegrationComponent(state.integrationStatus!, kind);
+        if (["warning", "error"].includes(visibleComponent.visualState)) {
+          const warnings = components.filter(
+            (component) => component.visualState !== "ready",
+          );
+          details.push(
+            `${name}: ${warnings.map((component) =>
+              `${integrationComponentName(component.kind)} — ${component.detail}`
+            ).join("; ")}`,
+          );
+        }
+      });
+      if (!summarizeEditorCompanions(state.integrationStatus).installed) {
+        details.push("Install at least one editor integration to begin live monitoring.");
+      }
+    }
+    details.push(...state.diagnosticWarnings);
+    if (state.diagnosticsUnavailable) {
+      details.push("Advanced diagnostics could not be loaded.");
+    }
+    elements.diagnosticsSummaryDetail.textContent = details.length
+      ? details.join(" ")
+      : summary === "Local only"
+        ? "Setup status checks have not completed yet."
+        : summary === "Optional setup"
+          ? "Editor monitoring is ready. Codex or Claude activity hooks can be added if wanted."
+          : "Editor monitoring and local diagnostics are ready.";
     elements.settingsButton.dataset.attention = String(attention);
     elements.settingsButton.setAttribute(
       "aria-label",
@@ -2840,10 +3176,10 @@
     renderIntegrationComponent(status.companion);
     renderIntegrationComponent(status.cursorCompanion);
     renderIntegrationComponent(status.antigravityIde);
-    renderIntegrationComponent(status.cursor);
-    renderIntegrationComponent(status.antigravity);
     renderIntegrationComponent(status.codex);
     renderIntegrationComponent(status.claude);
+    renderIntegrationComponent(visibleIntegrationComponent(status, "cursorCompanion"));
+    renderIntegrationComponent(visibleIntegrationComponent(status, "antigravityIde"));
     elements.restartNotice.hidden = !status.requiresRestart;
     const codexReviewRequired = status.codex.reviewRequired === true;
     elements.codexTrustGuidance.dataset.active = String(codexReviewRequired);
@@ -2917,6 +3253,7 @@
       : "Current status details are unavailable.";
     elements.cursorAgentsMonitoringEnabled.checked = status.enabled;
     updateCursorAgentsBridgeControls();
+    updateIntegrationControls();
   }
 
   function setCursorAgentsBridgeMessage(message: string, error = false): void {
@@ -2997,6 +3334,7 @@
   ): void {
     elements.integrationMessage.textContent = message;
     elements.integrationMessage.hidden = !message;
+    elements.integrationMessage.classList.toggle("has-warning", kind === "warning");
     elements.integrationMessage.classList.toggle("has-error", kind === "error");
     elements.integrationMessage.classList.toggle("has-success", kind === "success");
   }
@@ -3045,13 +3383,13 @@
   ): string {
     if (operation === "uninstall") {
       if (kind === "companion") {
-        return "VS Code companion uninstalled. Existing records will age out.";
+        return "VS Code integration uninstalled.";
       }
       if (kind === "cursorCompanion") {
-        return "Cursor companion uninstalled. Existing records will age out.";
+        return "Cursor integration uninstalled.";
       }
       if (kind === "antigravityIde") {
-        return "Antigravity IDE companion uninstalled. Existing records will age out.";
+        return "Antigravity integration uninstalled.";
       }
       const provider = kind === "cursor"
         ? "Cursor"
@@ -3060,7 +3398,7 @@
           : kind === "codex"
             ? "Codex"
             : "Claude Code";
-      return `${provider} activity hooks uninstalled. Existing records will age out.`;
+      return `${provider} activity hooks uninstalled.`;
     }
     if (kind === "companion") {
       return "VS Code companion installed. Reload open VS Code windows.";
@@ -3069,7 +3407,7 @@
       return "Cursor monitoring installed. Reload open Cursor IDE windows.";
     }
     if (kind === "antigravityIde") {
-      return "Antigravity IDE companion installed. Reload open Antigravity IDE windows.";
+      return "Antigravity integration installed. Reload open Antigravity IDE windows and start a new agent turn.";
     }
     if (kind === "antigravity") {
       return "Antigravity hooks installed. Start a new agent turn.";
@@ -3101,13 +3439,13 @@
       },
       cursorCompanion: {
         install: "install_cursor_monitoring",
-        uninstall: "uninstall_cursor_companion",
+        uninstall: "uninstall_cursor_monitoring",
         name: "Cursor monitoring",
       },
       antigravityIde: {
-        install: "install_antigravity_ide_companion",
-        uninstall: "uninstall_antigravity_ide_companion",
-        name: "Antigravity IDE companion",
+        install: "install_antigravity_monitoring",
+        uninstall: "uninstall_antigravity_monitoring",
+        name: "Antigravity monitoring",
       },
       antigravity: {
         install: "install_antigravity_hooks",
@@ -3143,6 +3481,9 @@
       const raw = await invoke(command, {});
       renderIntegrationStatus(normalizeIntegrationStatus(raw));
       setIntegrationMessage(integrationActionSuccess(kind, operation), "success");
+      if (operation === "uninstall") {
+        await refreshSnapshot();
+      }
     } catch (error) {
       const message = readableError(error, `Could not ${operation} ${componentName}.`);
       try {
@@ -3216,34 +3557,17 @@
       }
       return {
         kind,
-        name: "Antigravity IDE companion",
+        name: "Antigravity monitoring",
         editorName: "Antigravity IDE",
-        command: "install_antigravity_ide_companion" as const,
+        command: "install_antigravity_monitoring" as const,
       };
     });
-    const cursorHookFallbackSteps: Array<{
-      kind: IntegrationKind;
-      name: string;
-      command: TauriCommand;
-    }> = editorKinds.includes("cursorCompanion")
-      ? []
-      : [{
-          kind: "cursor",
-          name: "Cursor hooks only",
-          command: "install_cursor_hooks",
-        }];
     const steps: Array<{
       kind: IntegrationKind;
       name: string;
       command: TauriCommand;
     }> = [
       ...editorSteps,
-      ...cursorHookFallbackSteps,
-      {
-        kind: "antigravity",
-        name: "Antigravity activity hooks",
-        command: "install_antigravity_hooks",
-      },
       {
         kind: "codex",
         name: "Codex activity hooks",
@@ -3311,6 +3635,57 @@
     updateIntegrationControls();
   }
 
+  async function uninstallAllIntegrations(): Promise<void> {
+    if (state.integrationAction || state.integrationPending) {
+      return;
+    }
+
+    state.integrationAction = { kind: "all", operation: "uninstall" };
+    updateIntegrationControls();
+    setIntegrationMessage("Uninstalling all VSParallel integrations…");
+
+    try {
+      const raw = await invoke("uninstall_all_integrations", {});
+      const status = normalizeIntegrationStatus(raw);
+      renderIntegrationStatus(status);
+      const unverifiedEditors = [
+        { name: "VS Code", component: status.companion },
+        { name: "Cursor", component: status.cursorCompanion },
+        { name: "Antigravity IDE", component: status.antigravityIde },
+      ]
+        .filter(({ component }) => component.token === "unavailable")
+        .map(({ name }) => name);
+      if (unverifiedEditors.length) {
+        setIntegrationMessage(
+          `Integration-backed editor monitoring was disabled and its saved observations were cleared. Physical companion removal could not be verified for ${formatNaturalList(unverifiedEditors)} because ${unverifiedEditors.length === 1 ? "its editor CLI was" : "their editor CLIs were"} unavailable. Make the affected CLI available and run Uninstall all again, or remove the VSParallel companion manually. Automatic Zed discovery and usage-limit checks were unchanged.`,
+          "warning",
+        );
+      } else {
+        setIntegrationMessage(
+          "Integration-backed editor monitoring was disabled and its saved observations were cleared. VSParallel removed or verified the absence of each companion and activity hook. Automatic Zed discovery and usage-limit checks were unchanged.",
+          "success",
+        );
+      }
+      await Promise.all([refreshSnapshot(), refreshCursorAgentsBridgeStatus()]);
+    } catch (error) {
+      const message = readableError(error, "Could not uninstall all integrations.");
+      try {
+        const raw = await invoke("get_integration_status", {});
+        renderIntegrationStatus(normalizeIntegrationStatus(raw));
+      } catch (_statusError) {
+        // Keep the original uninstall error when status refresh also fails.
+      }
+      setIntegrationMessage(message, "error");
+      // The backend still applies its integration-source suppression markers
+      // and purges retained observations when physical removal is only partial.
+      // Reflect that fail-safe immediately while preserving the actionable error.
+      await Promise.all([refreshSnapshot(), refreshCursorAgentsBridgeStatus()]);
+    } finally {
+      state.integrationAction = null;
+      updateIntegrationControls();
+    }
+  }
+
   function openSettingsDialog(): void {
     if (showAccessibleDialog(elements.settingsDialog, elements.settingsCloseButton)) {
       refreshSetup();
@@ -3322,29 +3697,34 @@
     closeAccessibleDialog(elements.settingsDialog);
   }
 
-  function requestUninstall(kind: IntegrationKind): void {
+  function requestUninstall(kind: IntegrationActionKind): void {
     if (state.integrationAction) {
       return;
     }
 
-    const componentNames: Record<IntegrationKind, string> = {
+    const componentNames: Record<IntegrationActionKind, string> = {
       companion: "VS Code companion",
-      cursorCompanion: "Cursor companion",
-      antigravityIde: "Antigravity IDE companion",
+      cursorCompanion: "Cursor integration",
+      antigravityIde: "Antigravity integration",
       cursor: "Cursor hooks only",
       antigravity: "Antigravity activity hooks",
       codex: "Codex activity hooks",
       claude: "Claude Code activity hooks",
+      all: "all integrations",
     };
     state.pendingUninstall = kind;
-    elements.uninstallTitle.textContent = `Uninstall ${componentNames[kind]}?`;
-    if (["companion", "cursorCompanion", "antigravityIde"].includes(kind)) {
+    elements.uninstallTitle.textContent = kind === "all"
+      ? "Uninstall all integrations?"
+      : `Uninstall ${componentNames[kind]}?`;
+    if (kind === "all") {
+      elements.uninstallDescription.textContent = "VSParallel will stop integration-backed editor monitoring, clear its saved observations, disable its experimental bridge preference, and attempt to remove its editor companions and activity hooks. Automatic Zed discovery and usage-limit checks are unchanged. Project files and unrelated hooks are not changed.";
+    } else if (["companion", "cursorCompanion", "antigravityIde"].includes(kind)) {
       const editorName = kind === "companion"
         ? "VS Code"
         : kind === "cursorCompanion"
           ? "Cursor"
           : "Antigravity IDE";
-      elements.uninstallDescription.textContent = `VSParallel will stop receiving workspace heartbeats after existing ${editorName} windows are reloaded. No project files are removed.`;
+      elements.uninstallDescription.textContent = `VSParallel will stop displaying and accepting ${editorName} monitoring immediately. Reload open ${editorName} windows to stop their old extension host. No project files are removed.`;
     } else {
       const provider = kind === "cursor"
         ? "Cursor"
@@ -3373,7 +3753,11 @@
     elements.uninstallConfirmButton.disabled = true;
     closeUninstallDialog();
     state.pendingUninstall = null;
-    await runIntegrationAction(kind, "uninstall");
+    if (kind === "all") {
+      await uninstallAllIntegrations();
+    } else {
+      await runIntegrationAction(kind, "uninstall");
+    }
   }
 
   function formatDuration(milliseconds: unknown): string {
@@ -3403,13 +3787,13 @@
     recentWorkspaceOpens: number,
   ): string {
     if (activeRecords > 0) {
-      return `${activeRecords} active · ${retainedRecords} retained · latest ${latestDescription}`;
+      return `Active · latest ${latestDescription}`;
     }
     if (retainedRecords > 0) {
-      return `No active Cursor IDE heartbeat · ${retainedRecords} retained · latest ${latestDescription} · unmatched Agents Window evidence is hook-only`;
+      return `Inactive · latest ${latestDescription} · unmatched Agents Window activity is hook-only`;
     }
     if (recentWorkspaceOpens > 0) {
-      return "No live Cursor IDE heartbeat · the hook source may be Agents Window; an exact experimental bridge match is required for live thread status";
+      return "Hook activity observed · no live Cursor IDE heartbeat; an exact experimental bridge match is required for live thread status";
     }
     return "Not observed · set up Cursor monitoring and reload Cursor IDE";
   }
@@ -3425,7 +3809,6 @@
       : normalizeStateToken(rawOutcome);
     const event = asString(raw[`${fieldPrefix}Event`]).replaceAll("-", " ");
     const observedAt = asTimestamp(raw[`${fieldPrefix}ObservedAtMs`]);
-    const workspaceCount = asNonNegativeInteger(raw[`${fieldPrefix}WorkspaceCount`]);
     const warning = !["not_observed", "recorded"].includes(outcome);
     let detail = `Not observed · start an ${surfaceName} agent turn`;
 
@@ -3434,7 +3817,7 @@
       detail = [
         event || "agent event",
         observed,
-        `${workspaceCount} workspace path${workspaceCount === 1 ? "" : "s"} recorded`,
+        "workspace activity recorded",
       ].join(" · ");
     } else if (outcome === "no_workspace") {
       detail = "Observed, but no usable local workspace path was reported";
@@ -3443,7 +3826,7 @@
     } else if (outcome === "persist_failed") {
       detail = "Observed, but VSParallel could not save workspace activity";
     } else if (outcome === "health_unreadable") {
-      detail = "The local hook execution-health record is unreadable";
+      detail = "Local hook execution health could not be read";
     } else if (outcome !== "not_observed") {
       detail = "Observed, but the event could not be used for workspace activity";
     }
@@ -3534,41 +3917,6 @@
       asString(raw.antigravityIdeCommand, "antigravity-ide"),
     );
     appendDiagnostic(
-      "Workspace records",
-      `${validInstances} valid · ${malformedInstances} malformed · ${omittedInstances} omitted`,
-      malformedInstances > 0 || omittedInstances > 0,
-    );
-    appendDiagnostic(
-      "Codex activity records",
-      `${validCodex} valid · ${malformedCodex} malformed · ${omittedCodex} omitted`,
-      malformedCodex > 0 || omittedCodex > 0,
-    );
-    appendDiagnostic(
-      "Claude Code activity records",
-      `${validClaude} valid · ${malformedClaude} malformed · ${omittedClaude} omitted`,
-      malformedClaude > 0 || omittedClaude > 0,
-    );
-    appendDiagnostic(
-      "Antigravity activity records",
-      `${validAntigravity} valid · ${malformedAntigravity} malformed · ${omittedAntigravity} omitted`,
-      malformedAntigravity > 0 || omittedAntigravity > 0,
-    );
-    appendDiagnostic(
-      "Cursor hook records",
-      `${validCursor} valid · ${malformedCursor} malformed · ${omittedCursor} omitted`,
-      malformedCursor > 0 || omittedCursor > 0,
-    );
-    appendDiagnostic(
-      "Zed local metadata",
-      `${validZedWorkspaces} workspace${validZedWorkspaces === 1 ? "" : "s"} · ${activeZedWorkspaces} open · ${validZedAgents} with agent metadata · ${zedModelsLoaded} with model`,
-      malformedZed > 0 || omittedZed > 0 || ambiguousZedChannels > 0,
-    );
-    appendDiagnostic(
-      "Zed adapter health",
-      `${zedChannelsLoaded} channel${zedChannelsLoaded === 1 ? "" : "s"} loaded · ${zedAgentMetadataChannels} with agent schema · ${zedModelRowsConsidered} model row${zedModelRowsConsidered === 1 ? "" : "s"} checked · ${malformedZed} malformed · ${omittedZed} omitted${ambiguousZedChannels ? ` · ${ambiguousZedChannels} ambiguous live` : ""}`,
-      malformedZed > 0 || omittedZed > 0 || ambiguousZedChannels > 0,
-    );
-    appendDiagnostic(
       "Cursor live heartbeat",
       describeCursorHeartbeatDiagnostic(
         activeCursorInstances,
@@ -3580,7 +3928,7 @@
     appendDiagnostic(
       "Cursor workspace hook",
       recentCursorWorkspaceOpens
-        ? `${recentCursorWorkspaceOpens} recent workspace${recentCursorWorkspaceOpens === 1 ? "" : "s"} · latest ${formatRelativeTime(latestCursorWorkspaceOpen).toLowerCase()}`
+        ? `Observed · latest ${formatRelativeTime(latestCursorWorkspaceOpen).toLowerCase()}`
         : "Not observed · open a local Cursor workspace after installing hooks",
     );
     appendDiagnostic(
@@ -3600,9 +3948,27 @@
       formatDuration(raw.activityStaleMs ?? raw.codexStaleMs),
     );
 
-    state.diagnosticWarningCount = totalMalformed
+    state.diagnosticWarningCount = Number(totalMalformed > 0)
       + Number(totalOmitted > 0)
-      + Number(antigravityHookWarning);
+      + Number(antigravityTwoHook.warning)
+      + Number(antigravityIdeHook.warning);
+    state.diagnosticWarnings = [];
+    if (totalMalformed) {
+      state.diagnosticWarnings.push(
+        `${totalMalformed} malformed local ${totalMalformed === 1 ? "record was" : "records were"} ignored.`,
+      );
+    }
+    if (totalOmitted) {
+      state.diagnosticWarnings.push(
+        `${totalOmitted} local ${totalOmitted === 1 ? "record was" : "records were"} omitted for safety.`,
+      );
+    }
+    if (antigravityTwoHook.warning) {
+      state.diagnosticWarnings.push(`Antigravity 2.0: ${antigravityTwoHook.detail}.`);
+    }
+    if (antigravityIdeHook.warning) {
+      state.diagnosticWarnings.push(`Antigravity IDE: ${antigravityIdeHook.detail}.`);
+    }
     state.diagnosticsLoaded = true;
     state.diagnosticsUnavailable = false;
     updateSetupSummary();
@@ -3635,6 +4001,9 @@
       renderDiagnostics(diagnostics);
     } catch (error) {
       state.diagnosticsUnavailable = true;
+      state.diagnosticsLoaded = false;
+      state.diagnosticWarningCount = 0;
+      state.diagnosticWarnings = [];
       elements.diagnosticsStatus.classList.add("has-error");
       elements.diagnosticsStatus.textContent = readableError(
         error,
@@ -3646,7 +4015,7 @@
     }
   }
 
-  async function refreshSetup(): Promise<[void, void, void] | undefined> {
+  async function refreshSetup(): Promise<[void, void, void, void] | undefined> {
     if (state.setupRefreshPromise) {
       return state.setupRefreshPromise;
     }
@@ -3664,6 +4033,7 @@
       refreshIntegrationStatus(),
       refreshCursorAgentsBridgeStatus(),
       refreshDiagnostics(),
+      refreshDisplayPreferences(),
     ]).finally(() => {
       state.setupRefreshPending = false;
       state.setupRefreshPromise = null;
@@ -3828,6 +4198,8 @@
     }
   }
 
+  elements.experimentalIntegrations.append(elements.cursorAgentsBridgeCard);
+  elements.cursorAgentsBridgeCard.hidden = false;
   initializeHelpPopovers();
 
   elements.refreshButton.addEventListener("click", refreshAll);
@@ -3850,11 +4222,20 @@
       }
     });
   });
+  elements.editorVisibilityInputs.forEach((input) => {
+    input.addEventListener("change", () => {
+      void updateEditorVisibility(input);
+    });
+  });
+  elements.usageVisibilityInput.addEventListener("change", () => {
+    void updateUsageVisibility(elements.usageVisibilityInput.checked);
+  });
   elements.cursorAgentsMonitoringEnabled.addEventListener("change", () => {
     void setCursorAgentsMonitoringEnabled(elements.cursorAgentsMonitoringEnabled.checked);
   });
   elements.diagnosticsRefreshButton.addEventListener("click", refreshSetup);
   elements.setupAllButton.addEventListener("click", setupAllIntegrations);
+  elements.uninstallAllButton.addEventListener("click", () => requestUninstall("all"));
   elements.companionInstallButton.addEventListener("click", () =>
     runIntegrationAction("companion", "install"),
   );
@@ -3863,12 +4244,6 @@
   );
   elements.antigravityIdeInstallButton.addEventListener("click", () =>
     runIntegrationAction("antigravityIde", "install"),
-  );
-  elements.cursorInstallButton.addEventListener("click", () =>
-    runIntegrationAction("cursor", "install"),
-  );
-  elements.antigravityInstallButton.addEventListener("click", () =>
-    runIntegrationAction("antigravity", "install"),
   );
   elements.codexInstallButton.addEventListener("click", () =>
     runIntegrationAction("codex", "install"),
@@ -3884,10 +4259,6 @@
   );
   elements.antigravityIdeUninstallButton.addEventListener("click", () =>
     requestUninstall("antigravityIde"),
-  );
-  elements.cursorUninstallButton.addEventListener("click", () => requestUninstall("cursor"));
-  elements.antigravityUninstallButton.addEventListener("click", () =>
-    requestUninstall("antigravity"),
   );
   elements.codexUninstallButton.addEventListener("click", () => requestUninstall("codex"));
   elements.claudeUninstallButton.addEventListener("click", () => requestUninstall("claude"));
@@ -3945,9 +4316,12 @@
   renderWindowChromeState(fallbackWindowChromeState());
   refreshWindowChromeState();
   applyThemePreference(state.themePreference, false);
+  applyVisibilityPreferences(false);
   renderUpdateState();
   refreshIntegrationStatus();
-  refreshAll();
+  void refreshDisplayPreferences().then(() => {
+    void refreshAll();
+  });
   window.setTimeout(() => {
     void checkForUpdates(false);
   }, UPDATE_CHECK_DELAY_MS);

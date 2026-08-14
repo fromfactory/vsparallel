@@ -288,7 +288,12 @@ fn run_claude_hook_with<R: Read, W: Write>(
         if let Some(record) = record_from_payload(&payload, changed_at_ms) {
             // Persistence failures are intentionally swallowed. VSParallel is
             // an observer and must never block or alter a Claude Code turn.
-            let _ = persist_record(root, &record);
+            if crate::state::integration_source_is_enabled_at(
+                root,
+                crate::state::IntegrationSource::ClaudeHooks,
+            ) {
+                let _ = persist_record(root, &record);
+            }
         }
     }
     0

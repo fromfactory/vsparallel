@@ -375,7 +375,12 @@ fn run_codex_hook_with<R: Read, W: Write>(
         {
             // Persistence errors are intentionally swallowed. Monitoring must
             // never interrupt the user's Codex workflow.
-            let _ = persist_record(root, &record);
+            if crate::state::integration_source_is_enabled_at(
+                root,
+                crate::state::IntegrationSource::CodexHooks,
+            ) {
+                let _ = persist_record(root, &record);
+            }
         }
     }
 

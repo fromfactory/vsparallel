@@ -302,6 +302,57 @@ pub fn bundled_vsix_bytes() -> Result<&'static [u8], String> {
     }
 }
 
+/// Returns whether an editor CLI command has a concrete local executable.
+/// This distinguishes an unavailable executable from an executable whose
+/// status command failed, so global removal can report the right verification
+/// outcome without attempting to launch a command that cannot exist.
+pub(crate) fn command_is_available(executable: &OsStr) -> bool {
+    if executable.is_empty() {
+        return false;
+    }
+    let path = Path::new(executable);
+    let explicit = path.is_absolute()
+        || path
+            .parent()
+            .is_some_and(|parent| !parent.as_os_str().is_empty());
+    if explicit {
+        return path.is_file();
+    }
+
+    let Some(search_path) = env::var_os("PATH") else {
+        return false;
+    };
+    env::split_paths(&search_path).any(|directory| command_candidates(&directory, executable))
+}
+
+fn command_candidates(directory: &Path, executable: &OsStr) -> bool {
+    let exact = directory.join(executable);
+    if exact.is_file() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        if Path::new(executable).extension().is_some() {
+            return false;
+        }
+        let extensions =
+            env::var_os("PATHEXT").unwrap_or_else(|| OsString::from(".COM;.EXE;.BAT;.CMD"));
+        return extensions
+            .to_string_lossy()
+            .split(';')
+            .filter(|extension| !extension.is_empty())
+            .any(|extension| {
+                let mut candidate = executable.to_os_string();
+                candidate.push(extension);
+                directory.join(candidate).is_file()
+            });
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 /// Queries VS Code with `--list-extensions --show-versions`.
 ///
 /// Operational failures are represented as `Unavailable`, rather than making a
@@ -1372,6 +1423,18 @@ mod tests {
         assert!(install_companion_with(&runner, OsStr::new(""), root.path(), None).is_err());
         assert!(uninstall_companion_with(&runner, OsStr::new(""), None).is_err());
         assert!(runner.calls().is_empty());
+    }
+
+    #[test]
+    fn explicit_command_availability_distinguishes_missing_optional_editors() {
+        let root = TempDir::new().unwrap();
+        let missing = root.path().join("missing-editor-cli");
+        let available = root.path().join("available-editor-cli");
+        fs::write(&available, b"test").unwrap();
+
+        assert!(!command_is_available(OsStr::new("")));
+        assert!(!command_is_available(missing.as_os_str()));
+        assert!(command_is_available(available.as_os_str()));
     }
 
     fn read_stored_entries(bytes: &[u8]) -> Vec<(String, Vec<u8>, u32)> {

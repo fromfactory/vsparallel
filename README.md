@@ -92,21 +92,21 @@ Translocation path, relaunch the installed app and choose **Repair** for each
 affected integration.
 
 1. Select the settings gear beside **Refresh**.
-2. Install the companion for **VS Code** or **Antigravity IDE** as needed. For
-   Cursor, choose **Set up Cursor monitoring**; this installs or repairs the
-   companion and Cursor activity hooks together. Zed is detected automatically
-   and needs no companion or hook installation.
-3. Optionally install **Antigravity activity hooks**, **Codex lifecycle hooks**,
-   **Claude Code lifecycle hooks**, or any combination of them. A separate
-   **Cursor hooks only** control is available when non-live fallback monitoring
-   is preferred without the companion.
+2. Install the editor integrations you use. Setup presents one row each for
+   **VS Code**, **Cursor**, and **Antigravity**. The Cursor and Antigravity
+   actions install or repair both that editor's companion and its activity
+   hooks as one integration. The VS Code row manages its companion. Zed is
+   detected automatically and needs no companion or hook installation.
+3. Optionally install **Codex lifecycle hooks**, **Claude Code lifecycle
+   hooks**, or both.
 4. Reload editor windows that were already open and restart affected provider
    sessions.
 5. Cursor IDE windows report live heartbeats after reload. Cursor exposes its
    experimental Desktop Bridge only to a limited server-controlled rollout. If
    Cursor shows **Settings > Beta > Desktop Bridge > Allow CLI to access desktop
    agents**, enable it, restart Cursor, and then enable **Cursor Agents Window
-   (experimental)** in VSParallel. If the Desktop Bridge section is absent,
+   (experimental)** in VSParallel's separate experimental section. This option
+   is not enabled by editor setup. If the Desktop Bridge section is absent,
    live Agents Window monitoring is unavailable in that Cursor installation;
    keep the hooks enabled for recent hook-only status. VSParallel cannot enable
    Cursor's rollout flag and does not modify Cursor's internal feature storage.
@@ -117,6 +117,13 @@ affected integration.
    add the VSParallel handlers there as well or remove the override.
 7. After installing Codex hooks, run `/hooks` in Codex, review the three
    VSParallel handlers, and trust them.
+
+All workspace and usage displays are enabled by default. In **Visibility**, each
+editor can be hidden independently; the preference filters both the main
+workspace list and native tray without uninstalling or disabling monitoring.
+Antigravity covers both Antigravity IDE and Antigravity 2.0 rows. The usage
+percentage preference similarly hides the global usage percentages without
+changing Codex or Claude integrations.
 
 The final Codex review is an intentional security boundary. VSParallel reads
 Codex's resulting user-level trust status but never attempts to approve user
@@ -330,17 +337,26 @@ Zed does not host this companion. Its automatic adapter reads Zed-owned local
 metadata in read-only/query-only mode and writes nothing to Zed's databases or
 configuration.
 
-The primary **Set up Cursor monitoring** action installs or repairs the Cursor
-companion first and then all five native activity hooks. A hooks-only action is
-also available for users who want the recent, non-live fallback without the
-companion. The experimental Cursor Agents Window bridge is configured
-separately and stays off until explicitly enabled.
+The **Cursor** integration installs or repairs the Cursor companion first and
+then all five native activity hooks. The **Antigravity** integration similarly
+manages the Antigravity IDE companion and the shared Antigravity activity hooks
+together. The experimental Cursor Agents Window bridge is configured
+separately, is excluded from normal editor setup, and stays off until explicitly
+enabled.
 
 The Cursor, Antigravity, Codex, and Claude Code integrations merge VSParallel-owned
 handlers into their user configuration. Existing unrelated settings and hooks
 are preserved, writes are atomic, and a one-time backup is created before the
 first change. Removing an integration removes only its recognized
-VSParallel-owned handlers. Cursor preserves
+VSParallel-owned handlers and purges its app-owned workspace or activity
+records after removal is verified. A local suppression marker prevents a still-running
+editor or provider process from making those records visible again; reinstalling
+the integration re-enables its source. **Uninstall all** applies that local
+suppression and purge to every installable integration source even if an
+unavailable editor CLI prevents physical removal, and reports physical removal
+as unverified whenever the required CLI cannot be used. That condition is a
+warning rather than a failure of the completed local cleanup.
+Configuration backups and unrelated settings remain untouched. Cursor preserves
 `~/.cursor/hooks.json.vsparallel.bak`, and Antigravity preserves
 `~/.gemini/config/hooks.json.vsparallel.bak`, for manual cleanup.
 
@@ -512,9 +528,11 @@ when overriding these defaults. Zed is read from its own data root; override
 that separately with `VSPARALLEL_ZED_DATA_DIR`.
 
 Stale heartbeats are hidden after 60 seconds, and lifecycle state older than 24
-hours is shown as **Unknown**. VSParallel bounds record parsing and reports
-omitted or malformed records in diagnostics, but it does not automatically
-delete old records.
+hours is shown as **Unknown**. During normal monitoring, VSParallel bounds
+record parsing and reports omitted or malformed records in diagnostics without
+automatically deleting old records. Verified integration removal is the
+exception: records owned by the removed source are purged and that source stays
+suppressed until it is installed again.
 
 Integration configuration backups are complete copies of the original files and
 may contain unrelated environment values or secrets that were already present.
@@ -687,10 +705,11 @@ the Rust backend.
 ## Uninstall and remove local data
 
 1. Open **Setup & diagnostics** in VSParallel.
-2. Uninstall each enabled lifecycle, Cursor activity, or Antigravity activity integration.
-3. Uninstall each installed VS Code, Cursor, or Antigravity IDE companion.
-4. Reload open editor windows and provider sessions.
-5. Uninstall the desktop package with the operating system's package manager.
+2. Use **Uninstall** on the VS Code, Cursor, Antigravity, Codex, and Claude Code
+   rows you want to remove, or choose **Uninstall all**. Cursor and Antigravity
+   each remove their companion and hooks together.
+3. Reload open editor windows and provider sessions.
+4. Uninstall the desktop package with the operating system's package manager.
 
 For a local Linux developer installation:
 
@@ -698,8 +717,17 @@ For a local Linux developer installation:
 ./scripts/uninstall-desktop.sh
 ```
 
-Integration removal intentionally preserves the state directory and one-time
-configuration backups. To erase those files, quit VSParallel and the supported
+After each per-integration removal is verified, VSParallel purges and suppresses
+that integration's app-owned records. **Uninstall all** additionally suppresses
+and purges every installable integration source as a fail-safe even when an
+external component cannot be removed or its absence cannot be verified; that
+physical-removal problem is reported.
+Per-editor uninstall does not change the separate experimental Cursor Agents
+Window preference; **Uninstall all** turns that option off. Integration removal
+does not disable automatic read-only Zed discovery or live provider usage
+checks. It intentionally preserves unrelated provider configuration, one-time
+configuration backups, display preferences, and the state-directory container.
+To erase every remaining VSParallel file, quit VSParallel and the supported
 editors, then follow the cleanup instructions in [PRIVACY.md](PRIVACY.md).
 
 ## License

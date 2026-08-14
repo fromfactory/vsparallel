@@ -92,6 +92,15 @@ persisted only where stated:
   fixed state `workspace_opened`, and a timestamp, but no conversation/session
   identity or agent/model label;
 - the local on/off preference for experimental Cursor Agents Window monitoring;
+- local display preferences for VS Code, Cursor, Antigravity, and Zed workspace
+  rows and for usage-limit percentages, stored in the state root with an
+  equivalent webview-local fallback cache; every display is enabled by default,
+  and these preferences contain no workspace or provider-account data;
+- app-owned integration suppression markers written after verified per-source
+  uninstall, and for every installable integration source requested by
+  **Uninstall all**, so a
+  still-running editor or provider process cannot make removed-source records
+  visible before it is reloaded; reinstalling that source removes its marker;
 - for IDE hook activity only, metadata for the latest `USER_INPUT` row in the
   local Antigravity IDE conversation database selected directly from the
   validated hook `conversationId`, or hash-matched in memory during a desktop
@@ -138,6 +147,12 @@ does not provide focus or an open target. Antigravity 2.0 does not host this
 companion. Zed also does not host this companion and is never added to the
 heartbeat protocol's closed `vscode`, `cursor`, and `antigravity_ide` editor
 list.
+
+Display preferences affect presentation, not collection or provider
+configuration. Disabling an editor hides that editor's rows in both the main
+workspace list and native tray; disabling usage percentages hides the global
+usage display. All are enabled by default, and changing them does not install,
+uninstall, or disable an integration.
 
 Zed data is discovered under `$XDG_DATA_HOME/zed` (or
 `~/.local/share/zed`) and the community Flatpak root
@@ -214,9 +229,9 @@ with the same non-live limitations. Exactly one matching Cursor IDE companion
 heartbeat owns either observation instead; multiple matching windows leave it
 generic rather than guessing an owner.
 
-The primary **Set up Cursor monitoring** action installs or repairs both the
-Cursor IDE companion and these native hooks. The separate hooks-only action
-changes only `~/.cursor/hooks.json` and provides no live-window monitoring.
+The single **Cursor** integration action installs or repairs both the Cursor
+IDE companion and these native hooks. Its per-editor uninstall removes both
+components together after verifying their removal.
 
 Experimental Cursor Agents Window monitoring is off by default and depends on
 Cursor's limited, server-controlled `desktop_bridge` rollout. Only when Cursor
@@ -228,6 +243,10 @@ VSParallel does not edit Cursor's internal feature-gate storage. When available,
 VSParallel reads Cursor's private local Desktop
 Bridge discovery files and sends only `listThreads` over local inter-process
 communication. It never invokes a send-message operation.
+
+This experimental preference is separate from the core Cursor integration: it
+is excluded from setup and per-editor Cursor uninstall. **Uninstall all** turns
+it off in addition to attempting to remove the normal integrations.
 
 The discovery response includes more than VSParallel keeps. Each raw thread ID
 is immediately SHA-256 hashed and discarded. Thread titles, bridge tokens,
@@ -271,6 +290,10 @@ product label and immediately discards it. CLI, conflicting, and unrecognized
 surfaces are ignored; supported hook-only paths remain recent and non-openable
 rather than claiming a live window. A workspace-level `.agents/hooks.json` can
 take precedence over the global hook.
+
+The single **Antigravity** integration action manages the Antigravity IDE
+companion and these shared activity hooks together. Its per-editor uninstall
+removes both components after verifying their removal.
 
 The Antigravity adapter admits documented `conversationId`, `workspacePaths`,
 `transcriptPath`, and `artifactDirectoryPath` values, optional `modelName` when
@@ -336,9 +359,13 @@ in process memory but is not persisted. Explicit executables selected with
 The location of this state directory is shown in Setup diagnostics. Heartbeats
 older than 60 seconds are hidden and lifecycle state older than 24 hours is
 shown as unknown. VSParallel parses at most the newest 4,096 eligible record
-bodies in each record directory and reports omissions in diagnostics. Directory
-enumeration still considers every entry when selecting those records, and old
-records are not deleted automatically.
+bodies in each record directory and reports omissions in diagnostics. During
+normal retention, directory enumeration still considers every entry when
+selecting those records and old records are not deleted automatically. An
+integration uninstall is different: VSParallel purges that source's app-owned
+records and suppresses it until reinstall. **Uninstall all** applies this local
+cleanup to every installable integration source even when an unavailable
+external editor CLI prevents physical removal.
 
 Before VSParallel changes Cursor, Antigravity, Codex, or Claude Code hook
 configuration, or installs its owned Claude Code status line, it creates a private, one-time
@@ -355,11 +382,19 @@ VSParallel handlers, including the prior four-handler set, leaving modified
 lookalikes untouched. Setup reports that prior set as needing an update or
 repair so reinstalling can add `workspaceOpen`. A Cursor configuration that is
 not strict UTF-8 JSON is left unchanged. Integration removal preserves every
-backup so that it cannot destroy user data.
+unrelated setting and backup so that it cannot destroy user data. A normal
+per-integration uninstall purges and suppresses its source after external
+removal is verified. **Uninstall all** is also a global stop-tracking control
+for installable integration sources: it suppresses and purges each one even if
+external removal cannot be verified. An unavailable CLI or failed removal is
+reported instead of being presented as complete physical removal; an unavailable
+optional editor is a warning, while an attempted removal failure remains an
+error. This action does not disable automatic read-only Zed discovery or live
+provider usage checks.
 
-To erase VSParallel data, first uninstall its integrations in the application,
-quit VSParallel and the supported editors, then delete the state directory
-shown in Setup diagnostics and, if no longer needed, these backup files:
+To erase VSParallel data, first use **Uninstall all** in the application, quit
+VSParallel and the supported editors, then delete the state directory shown in
+Setup diagnostics and, if no longer needed, these backup files:
 
 - `$CODEX_HOME/hooks.json.vsparallel.bak` (normally
   `~/.codex/hooks.json.vsparallel.bak`)
