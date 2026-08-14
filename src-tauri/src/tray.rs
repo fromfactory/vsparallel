@@ -84,6 +84,7 @@ enum TrayActivityStatus {
     Activity,
     Failure,
     Finished,
+    Recent,
     Unknown,
 }
 
@@ -93,7 +94,8 @@ impl TrayActivityStatus {
             Self::Activity => 4,
             Self::Failure => 3,
             Self::Finished => 2,
-            Self::Unknown => 1,
+            Self::Recent => 1,
+            Self::Unknown => 0,
         }
     }
 
@@ -102,6 +104,7 @@ impl TrayActivityStatus {
             Self::Activity => "●",
             Self::Failure => "!",
             Self::Finished => "✓",
+            Self::Recent => "◷",
             Self::Unknown => "○",
         }
     }
@@ -111,6 +114,7 @@ impl TrayActivityStatus {
             Self::Activity => "Activity detected",
             Self::Failure => "Failed/interrupted",
             Self::Finished => "Turn finished",
+            Self::Recent => "Recent agent activity",
             Self::Unknown => "Unknown",
         }
     }
@@ -453,6 +457,7 @@ fn tray_workspace_entries(snapshot: &Snapshot) -> Vec<TrayWorkspaceEntry> {
                 &workspace.claude,
                 workspace.antigravity.as_ref(),
                 workspace.cursor.as_ref(),
+                workspace.zed.as_ref(),
             ),
             openable: workspace.openable,
         })
@@ -482,8 +487,9 @@ fn aggregate_status(
     claude: &ActivityView,
     antigravity: Option<&ActivityView>,
     cursor: Option<&ActivityView>,
+    zed: Option<&ActivityView>,
 ) -> TrayActivityStatus {
-    [Some(codex), Some(claude), antigravity, cursor]
+    [Some(codex), Some(claude), antigravity, cursor, zed]
         .into_iter()
         .flatten()
         .map(activity_status)
@@ -496,6 +502,7 @@ fn activity_status(activity: &ActivityView) -> TrayActivityStatus {
         "activity_detected" => TrayActivityStatus::Activity,
         "failed_or_interrupted" => TrayActivityStatus::Failure,
         "turn_finished" => TrayActivityStatus::Finished,
+        "recent_activity" => TrayActivityStatus::Recent,
         _ => TrayActivityStatus::Unknown,
     }
 }
@@ -585,6 +592,7 @@ mod tests {
             started_at_ms: 0,
             antigravity: None,
             cursor: None,
+            zed: None,
             codex: activity(codex, "PRIVATE CODEX DETAIL"),
             claude: activity(claude, "PRIVATE CLAUDE DETAIL"),
         }
@@ -747,7 +755,13 @@ mod tests {
         ];
         for (codex, claude, expected) in cases {
             assert_eq!(
-                aggregate_status(&activity(codex, ""), &activity(claude, ""), None, None,),
+                aggregate_status(
+                    &activity(codex, ""),
+                    &activity(claude, ""),
+                    None,
+                    None,
+                    None,
+                ),
                 expected
             );
         }
@@ -758,8 +772,20 @@ mod tests {
                 &activity("unknown", ""),
                 None,
                 Some(&activity("activity_detected", "")),
+                None,
             ),
             TrayActivityStatus::Activity,
+        );
+
+        assert_eq!(
+            aggregate_status(
+                &activity("unknown", ""),
+                &activity("unknown", ""),
+                None,
+                None,
+                Some(&activity("recent_activity", "")),
+            ),
+            TrayActivityStatus::Recent,
         );
     }
 

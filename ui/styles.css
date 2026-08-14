@@ -929,6 +929,12 @@ main {
   color: var(--green-text);
 }
 
+.workspace-application[data-editor="zed"] {
+  border-color: var(--amber-border);
+  background: var(--amber-soft);
+  color: var(--amber-text);
+}
+
 .workspace-application[data-editor="antigravity_2"],
 .workspace-application[data-editor="antigravity_ide"] {
   border-color: transparent;
@@ -1069,6 +1075,10 @@ main {
 
 .provider-label[data-state="failure"] {
   color: var(--red-text);
+}
+
+.provider-label[data-state="recent"] {
+  color: var(--amber);
 }
 
 .provider-label[data-state="unknown"] {
@@ -2510,6 +2520,10 @@ html[data-workspace-opening="true"] .app-shell {
 
 :root[data-window-mode="floating"] .workspace-compact-status[data-state="finished"] {
   color: var(--green-text);
+}
+
+:root[data-window-mode="floating"] .workspace-compact-status[data-state="recent"] {
+  color: var(--amber);
 }
 
 :root[data-window-mode="floating"] .workspace-compact-status[data-state="failure"] {

@@ -100,7 +100,7 @@ test("the main chrome omits redundant labels while retaining an accessible works
   );
 });
 
-test("the workspace empty state links directly to setup and explains Cursor source limits", () => {
+test("the workspace empty state explains Cursor limits and automatic Zed monitoring", () => {
   const html = read("ui/index.html");
   const css = read("ui/styles.css");
   const javascript = read("ui/generated/app.js");
@@ -111,6 +111,8 @@ test("the workspace empty state links directly to setup and explains Cursor sour
   assert.match(emptyState, /id="emptySetupButton"[^>]*>[\s\S]*?Open setup/i);
   assert.match(emptyState, /experimental Cursor desktop bridge can correlate a live agent thread/i);
   assert.match(emptyState, /does not\s+provide focus or a safe open target/i);
+  assert.match(emptyState, /Zed for automatic read-only monitoring from local metadata/i);
+  assert.match(emptyState, /Antigravity or Zed workspace/i);
   assert.match(css, /\.empty-state__actions\s*\{[^}]*display:\s*flex[^}]*justify-content:\s*center/s);
   assert.match(
     javascript,
@@ -357,6 +359,116 @@ test("workspace normalization preserves Cursor IDE and agent metadata", () => {
   assert.equal(workspace.cursor?.agentKind, "Background agent");
 });
 
+test("workspace normalization preserves Zed metadata and keeps unknown editors on VS Code", () => {
+  const javascript = read("ui/generated/app.js");
+  const functions = [
+    "isObject",
+    "asString",
+    "asFiniteNumber",
+    "asTimestamp",
+    "asNullableBoolean",
+    "normalizeStateToken",
+    "describeActivityState",
+    "normalizeAntigravityModelKind",
+    "normalizeActivityView",
+    "deriveName",
+    "normalizeWorkspace",
+  ].map((name) => appFunction(javascript, name)).join("\n");
+  const context = {} as {
+    normalizeWorkspace(value: unknown, index: number): {
+      editor: string;
+      editorName: string;
+      active: boolean;
+      recentlyActive: boolean;
+      openable: boolean;
+      zed: {
+        kind: string;
+        label: string;
+        changedAtMs: number | null;
+        modelName: string;
+        agentKind: string;
+      } | null;
+    };
+  };
+  vm.runInNewContext(
+    `const MAX_JAVASCRIPT_TIMESTAMP_MS = 8_640_000_000_000_000; ${functions}`,
+    context,
+  );
+
+  const workspace = context.normalizeWorkspace({
+    instanceId: "zed-window",
+    editor: "zed",
+    name: "project",
+    path: "/work/project",
+    openable: true,
+    active: false,
+    recentlyActive: true,
+    zed: {
+      state: "recent_activity",
+      label: "Recent agent activity",
+      changedAtMs: 123,
+      modelName: "claude-sonnet-4",
+      agentKind: "Agent panel",
+    },
+  }, 0);
+
+  assert.equal(workspace.editor, "zed");
+  assert.equal(workspace.editorName, "Zed");
+  assert.equal(workspace.active, false);
+  assert.equal(workspace.recentlyActive, true);
+  assert.equal(workspace.openable, true);
+  assert.equal(workspace.zed?.kind, "recent");
+  assert.equal(workspace.zed?.label, "Recent agent activity");
+  assert.equal(workspace.zed?.changedAtMs, 123);
+  assert.equal(workspace.zed?.modelName, "claude-sonnet-4");
+  assert.equal(workspace.zed?.agentKind, "Agent panel");
+
+  const active = context.normalizeWorkspace({
+    instanceId: "zed-active",
+    editor: "zed",
+    zed: {
+      state: "activity_detected",
+      changedAtMs: 456,
+    },
+  }, 1);
+  assert.equal(active.zed?.kind, "activity");
+  assert.equal(active.zed?.label, "Activity detected");
+
+  const finished = context.normalizeWorkspace({
+    instanceId: "zed-finished",
+    editor: "zed",
+    zed: {
+      state: "turn_finished",
+      changedAtMs: 789,
+    },
+  }, 2);
+  assert.equal(finished.zed?.kind, "finished");
+  assert.equal(finished.zed?.label, "Turn finished");
+
+  const fallback = context.normalizeWorkspace({
+    instanceId: "unknown-window",
+    editor: "future_editor",
+    path: "/work/fallback",
+  }, 3);
+  assert.equal(fallback.editor, "vscode");
+  assert.equal(fallback.editorName, "VS Code");
+  assert.equal(fallback.zed, null);
+});
+
+test("Zed monitoring is described as automatic and has no installable integration card", () => {
+  const html = read("ui/index.html");
+  const typescript = read("ui/app.ts");
+  const integrationKind = typescript.match(
+    /type IntegrationKind\s*=([\s\S]*?);/,
+  )?.[1];
+  assert.ok(integrationKind, "the integration kind union should exist");
+
+  assert.match(html, /Zed monitoring is\s+automatic and read-only/i);
+  assert.match(html, /uses local workspace and agent metadata/i);
+  assert.doesNotMatch(html, /id="zed(?:Card|InstallButton|UninstallButton)"/i);
+  assert.doesNotMatch(integrationKind, /["']zed["']/i);
+});
+
 test("workspace normalization preserves Antigravity source and recent hook activity", () => {
   const javascript = read("ui/generated/app.js");
   const functions = [
@@ -467,10 +579,11 @@ test("workspace activity aggregation keeps the highest-priority lifecycle state"
       claude: Activity;
       antigravity: Activity | null;
       cursor: Activity | null;
+      zed: Activity | null;
     }): Activity;
   };
   interface Activity {
-    kind: "activity" | "finished" | "failure" | "unknown";
+    kind: "activity" | "finished" | "failure" | "recent" | "unknown";
     label: string;
     modelKind?: string | null;
   }
@@ -486,6 +599,7 @@ test("workspace activity aggregation keeps the highest-priority lifecycle state"
     claude: activity("activity", "Activity detected"),
     antigravity: activity("failure", "Failed/interrupted"),
     cursor: null,
+    zed: null,
   });
   assert.equal(active.kind, "activity");
   assert.equal(active.label, "Activity detected");
@@ -495,6 +609,7 @@ test("workspace activity aggregation keeps the highest-priority lifecycle state"
     claude: activity("finished", "Turn finished"),
     antigravity: null,
     cursor: null,
+    zed: null,
   });
   assert.equal(finished.kind, "finished");
   assert.equal(finished.label, "Turn finished");
@@ -510,6 +625,7 @@ test("workspace activity aggregation keeps the highest-priority lifecycle state"
       claude: activity("unknown", "No activity yet"),
       antigravity,
       cursor: null,
+      zed: null,
     }),
     antigravity,
     "Antigravity lifecycle activity should participate without synthesizing a model label",
@@ -520,6 +636,7 @@ test("workspace activity aggregation keeps the highest-priority lifecycle state"
     claude: activity("failure", "Failed/interrupted"),
     antigravity: activity("unknown", "Unknown"),
     cursor: null,
+    zed: null,
   });
   assert.equal(failure.kind, "failure");
   assert.equal(failure.label, "Failed/interrupted");
@@ -530,7 +647,17 @@ test("workspace activity aggregation keeps the highest-priority lifecycle state"
     claude: activity("unknown", "No activity yet"),
     antigravity: null,
     cursor,
+    zed: null,
   }), cursor);
+
+  const zed = activity("recent", "Recent agent activity");
+  assert.equal(context.aggregateActivity({
+    codex: activity("unknown", "No activity yet"),
+    claude: activity("unknown", "No activity yet"),
+    antigravity: null,
+    cursor: null,
+    zed,
+  }), zed);
 });
 
 test("workspaces render as cards in single Open and Recent sections", () => {
@@ -689,6 +816,7 @@ test("workspace names lead the application label hierarchy without theming the e
   const applicationThemes = cssBlocksMatching(css, /\.workspace-application\[data-editor=/);
   assert.match(applicationThemes, /data-editor=["']vscode["'][^{}]*\{[^}]*var\(--accent/i);
   assert.match(applicationThemes, /data-editor=["']cursor["'][^{}]*\{[^}]*var\(--green/i);
+  assert.match(applicationThemes, /data-editor=["']zed["'][^{}]*\{[^}]*var\(--amber/i);
 });
 
 test("Antigravity model labels accept only the public closed model set", () => {
@@ -1392,7 +1520,7 @@ test("workspace rows omit redundant leading lifecycle icons while keeping provid
   );
   assert.match(
     javascript,
-    /createProviderState\(\s*"Claude"\s*,\s*workspace\.claude\s*,\s*"Claude Code"\s*,\s*workspace\.editorName\s*,\s*workspace\.remoteWindow\s*\)/,
+    /createProviderState\(\s*"Claude"\s*,\s*workspace\.claude\s*,\s*"Claude Code"\s*,\s*workspace\.editorName\s*,\s*workspace\.remoteWindow\s*,/,
   );
   assert.match(javascript, /antigravityModelLabel\(workspace\.antigravity\.modelKind\)/);
   assert.match(javascript, /antigravityModelFamilyLabel\(workspace\.antigravity\.modelKind\)/);
@@ -1400,6 +1528,24 @@ test("workspace rows omit redundant leading lifecycle icons while keeping provid
   assert.match(javascript, /createProviderState\(\s*"Cursor Agent",\s*workspace\.cursor,/);
   assert.match(javascript, /workspace\.cursor\.agentKind/);
   assert.match(javascript, /workspace\.cursor\.modelName/);
+  assert.match(javascript, /createProviderState\(\s*"Zed Agent",\s*workspace\.zed,/);
+  assert.match(
+    createRow,
+    /workspace\.zed\.agentKind === "Agent panel"\s*\? ""\s*:\s*workspace\.zed\.agentKind/,
+  );
+  assert.match(javascript, /workspace\.zed\.modelName/);
+  assert.match(javascript, /"Zed local metadata",\s*zedDetails/);
+  assert.match(
+    createRow,
+    /workspace\.editorName,\s*false,\s*false,\s*"Zed local metadata"/,
+  );
+  assert.match(createRow, /workspace\.editor === "zed"\s*\? "Agent lifecycle and local metadata"/);
+  assert.match(javascript, /Coarse persisted Zed Agent turn boundaries and model information reported by Zed's read-only local metadata/);
+  assert.match(createRow, /nativeReadOnlyEditor\s*=\s*workspace\.editor\s*===\s*"zed"/);
+  assert.match(
+    createRow,
+    /nativeReadOnlyEditor\s*\?\s*"Workspace-matched lifecycle records"/,
+  );
   assert.match(javascript, /`Antigravity \(\$\{modelLabel\}\), latest model reported by Antigravity`/);
   assert.match(javascript, /"Antigravity built-in model",\s*modelFamily,\s*modelLabel/);
   assert.match(javascript, /latest model reported by Antigravity/);
@@ -1647,6 +1793,9 @@ test("setup and diagnostics uses the compact neutral visual language of the main
     /\.monitor-diagnostics\s*\{[^}]*border-top:\s*1px solid var\(--border\)[^}]*background:\s*transparent[^}]*box-shadow:\s*none/s,
   );
   assert.match(javascript, /status\.codex\.reviewRequired === true/);
+  assert.match(javascript, /"Zed local metadata"/);
+  assert.match(javascript, /raw\.validZedWorkspaceRecords/);
+  assert.match(javascript, /raw\.ambiguousZedLiveChannels/);
   assert.doesNotMatch(javascript, /codexTrustGuidance\.hidden = !status\.codex\.installed/);
   assert.match(
     javascript,
@@ -1811,9 +1960,9 @@ test("workspace switches compact VSParallel without minimizing it", () => {
 
   assert.ok(trayWorkspaceStart >= 0 && trayWorkspaceEnd > trayWorkspaceStart);
   const trayWorkspace = menuHandler.slice(trayWorkspaceStart, trayWorkspaceEnd);
-  assert.match(openWorkspace, /open_editor_with\s*\(/);
+  assert.match(openWorkspace, /open_editor_targets_with\s*\(/);
   assert.match(openWorkspace, /enter_floating_panel\s*\(/);
-  assert.match(openWorkspace, /find_active_workspace_open_target\s*\(/);
+  assert.match(openWorkspace, /find_active_workspace_open_target(?:_with_zed)?\s*\(/);
   assert.match(openWorkspace, /WorkspaceLaunchMode::PreferExisting/);
   assert.match(openWorkspace, /WorkspaceLaunchMode::NewWindow/);
   assert.match(library, /wait_for_restored_window_state\s*\(/);
@@ -1821,7 +1970,8 @@ test("workspace switches compact VSParallel without minimizing it", () => {
   assert.match(library, /set_visible_on_all_workspaces\(true\)/);
   assert.match(openWorkspace, /schedule_floating_panel_watchdog\s*\(/);
   assert.ok(
-    openWorkspace.indexOf("enter_floating_panel") < openWorkspace.indexOf("open_editor_with"),
+    openWorkspace.indexOf("enter_floating_panel")
+      < openWorkspace.indexOf("open_editor_targets_with"),
     "the native panel must be ready before the selected editor can switch desktops",
   );
   assert.doesNotMatch(openWorkspace, /\.minimize\s*\(/);

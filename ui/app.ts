@@ -19,7 +19,7 @@
   type IntegrationActionKind = IntegrationKind | "all";
   type IntegrationOperation = "install" | "uninstall";
   type IntegrationVisualState = "missing" | "ready" | "warning" | "error";
-  type ActivityKind = "activity" | "finished" | "failure" | "unknown";
+  type ActivityKind = "activity" | "finished" | "failure" | "recent" | "unknown";
   type WorkspaceSurface = "editor_workspace" | "hook_only" | "cursor_agent_thread";
   type CursorAgentsBridgeAvailability =
     | "disabled"
@@ -102,7 +102,7 @@
 
   interface Workspace {
     instanceId: string;
-    editor: "vscode" | "cursor" | "antigravity_ide" | "antigravity_2";
+    editor: "vscode" | "cursor" | "antigravity_ide" | "antigravity_2" | "zed";
     editorName: string;
     surface: WorkspaceSurface;
     name: string;
@@ -117,6 +117,7 @@
     claude: ActivityView;
     antigravity: ActivityView | null;
     cursor: ActivityView | null;
+    zed: ActivityView | null;
   }
 
   interface WorkspaceGroup {
@@ -890,6 +891,13 @@
       };
     }
 
+    if (token === "recent_activity") {
+      return {
+        kind: "recent",
+        label: "Recent agent activity",
+      };
+    }
+
     if (["failed_or_interrupted", "failed/interrupted", "failed", "interrupted"].includes(token)) {
       return {
         kind: "failure",
@@ -1019,6 +1027,8 @@
         ? "antigravity_ide"
         : editorToken === "antigravity_2"
           ? "antigravity_2"
+          : editorToken === "zed"
+            ? "zed"
           : "vscode";
     const surfaceToken = normalizeStateToken(raw.surface);
     const surface: WorkspaceSurface = surfaceToken === "hook_only"
@@ -1034,6 +1044,8 @@
         ? "Antigravity IDE"
         : editor === "antigravity_2"
           ? "Antigravity 2.0"
+          : editor === "zed"
+            ? "Zed"
           : "VS Code";
 
     return {
@@ -1058,6 +1070,9 @@
         : null,
       cursor: isObject(raw.cursor)
         ? normalizeActivityView(raw.cursor)
+        : null,
+      zed: isObject(raw.zed)
+        ? normalizeActivityView(raw.zed)
         : null,
     };
   }
@@ -1362,12 +1377,13 @@
 
   function aggregateActivity(workspace: Workspace): ActivityView {
     const priority: Record<ActivityKind, number> = {
-      activity: 4,
-      failure: 3,
-      finished: 2,
+      activity: 5,
+      failure: 4,
+      finished: 3,
+      recent: 2,
       unknown: 1,
     };
-    return [workspace.codex, workspace.claude, workspace.antigravity, workspace.cursor]
+    return [workspace.codex, workspace.claude, workspace.antigravity, workspace.cursor, workspace.zed]
       .filter((activity): activity is ActivityView => activity !== null)
       .reduce((current, candidate) =>
         priority[candidate.kind] > priority[current.kind] ? candidate : current,
@@ -1489,7 +1505,7 @@
     const changedAt = createElement("time", "provider-time", relativeTime);
     if (activity.changedAtMs !== null && Number.isFinite(activity.changedAtMs)) {
       changedAt.dateTime = new Date(activity.changedAtMs).toISOString();
-      changedAt.title = `Lifecycle marker: ${formatAbsoluteTime(activity.changedAtMs)}`;
+      changedAt.title = `Activity timestamp: ${formatAbsoluteTime(activity.changedAtMs)}`;
     }
 
     stateLine.append(label, changedAt);
@@ -1509,6 +1525,10 @@
         ? "Live thread state reported by Cursor's experimental read-only Desktop Bridge and correlated with bounded Cursor hook metadata."
         : lifecycleSource === "Cursor hooks"
           ? "Lifecycle activity reported by Cursor's documented agent hooks."
+          : lifecycleSource === "Zed local metadata"
+            ? "Coarse persisted Zed Agent turn boundaries and model information reported by Zed's read-only local metadata; this can lag live generation."
+          : lifecycleSource === "Workspace-matched lifecycle records"
+            ? "Lifecycle state from local provider records matched to this workspace path when observed."
           : "Lifecycle activity reported by Antigravity's built-in model hook.";
       body.append(source);
       presenceLabel = lifecycleSource;
@@ -1570,7 +1590,12 @@
     row.append(compactStatus);
 
     const providers = createElement("div", "activity-providers");
-    providers.setAttribute("aria-label", "Agent lifecycle and IDE extension status");
+    providers.setAttribute(
+      "aria-label",
+      workspace.editor === "zed"
+        ? "Agent lifecycle and local metadata"
+        : "Agent lifecycle and IDE extension status",
+    );
     if (workspace.antigravity) {
       const modelLabel = antigravityModelLabel(workspace.antigravity.modelKind);
       const modelFamily = antigravityModelFamilyLabel(workspace.antigravity.modelKind);
@@ -1613,10 +1638,34 @@
         ),
       );
     }
+    if (workspace.zed) {
+      const zedAgentKind = workspace.zed.agentKind === "Agent panel"
+        ? ""
+        : workspace.zed.agentKind;
+      const zedDetails = [zedAgentKind, workspace.zed.modelName]
+        .filter(Boolean)
+        .join(" · ");
+      providers.append(
+        createProviderState(
+          "Zed Agent",
+          workspace.zed,
+          zedDetails
+            ? `Zed Agent (${zedDetails}), latest model or external agent metadata reported by Zed`
+            : "Zed Agent",
+          workspace.editorName,
+          false,
+          false,
+          "Zed local metadata",
+          zedDetails,
+          zedDetails ? `Latest Zed model or external agent: ${zedDetails}` : "",
+        ),
+      );
+    }
     if (
       workspace.editor !== "antigravity_2"
       && workspace.surface !== "cursor_agent_thread"
     ) {
+      const nativeReadOnlyEditor = workspace.editor === "zed";
       providers.append(
         createProviderState(
           "Codex",
@@ -1624,6 +1673,8 @@
           "Codex",
           workspace.editorName,
           workspace.remoteWindow,
+          !nativeReadOnlyEditor,
+          nativeReadOnlyEditor ? "Workspace-matched lifecycle records" : "",
         ),
         createProviderState(
           "Claude",
@@ -1631,6 +1682,8 @@
           "Claude Code",
           workspace.editorName,
           workspace.remoteWindow,
+          !nativeReadOnlyEditor,
+          nativeReadOnlyEditor ? "Workspace-matched lifecycle records" : "",
         ),
       );
     }
@@ -1650,6 +1703,8 @@
     if (!workspace.openable) {
       openButton.title = workspace.surface === "cursor_agent_thread"
         ? "Cursor's experimental desktop bridge reports agent-thread status but does not provide a safe window activation target"
+        : workspace.editor === "zed"
+          ? "This saved Zed workspace has no safely reconstructed local target, or belongs to a non-Stable release channel"
         : workspace.recentlyActive
         ? `${workspace.editorName} hook activity does not identify a live window or exact open target`
         : "This workspace cannot currently be opened";
@@ -3414,16 +3469,26 @@
     const malformedClaude = asNonNegativeInteger(raw.malformedClaudeRecords);
     const malformedAntigravity = asNonNegativeInteger(raw.malformedAntigravityRecords);
     const malformedCursor = asNonNegativeInteger(raw.malformedCursorRecords);
+    const malformedZed = asNonNegativeInteger(raw.malformedZedRecords);
     const omittedInstances = asNonNegativeInteger(raw.omittedInstanceRecords);
     const omittedCodex = asNonNegativeInteger(raw.omittedCodexRecords);
     const omittedClaude = asNonNegativeInteger(raw.omittedClaudeRecords);
     const omittedAntigravity = asNonNegativeInteger(raw.omittedAntigravityRecords);
     const omittedCursor = asNonNegativeInteger(raw.omittedCursorRecords);
+    const omittedZed = asNonNegativeInteger(raw.omittedZedRecords);
     const validInstances = asNonNegativeInteger(raw.validInstanceRecords);
     const validCodex = asNonNegativeInteger(raw.validCodexRecords);
     const validClaude = asNonNegativeInteger(raw.validClaudeRecords);
     const validAntigravity = asNonNegativeInteger(raw.validAntigravityRecords);
     const validCursor = asNonNegativeInteger(raw.validCursorRecords);
+    const validZedWorkspaces = asNonNegativeInteger(raw.validZedWorkspaceRecords);
+    const activeZedWorkspaces = asNonNegativeInteger(raw.activeZedWorkspaceRecords);
+    const validZedAgents = asNonNegativeInteger(raw.validZedAgentRecords);
+    const zedChannelsLoaded = asNonNegativeInteger(raw.zedChannelsLoaded);
+    const zedModelsLoaded = asNonNegativeInteger(raw.zedModelsLoaded);
+    const zedAgentMetadataChannels = asNonNegativeInteger(raw.zedAgentMetadataChannels);
+    const zedModelRowsConsidered = asNonNegativeInteger(raw.zedModelRowsConsidered);
+    const ambiguousZedChannels = asNonNegativeInteger(raw.ambiguousZedLiveChannels);
     const activeCursorInstances = asNonNegativeInteger(raw.activeCursorInstanceRecords);
     const retainedCursorInstances = asNonNegativeInteger(raw.retainedCursorInstanceRecords);
     const latestCursorInstance = asTimestamp(raw.latestCursorInstanceAtMs);
@@ -3450,17 +3515,20 @@
       + malformedCodex
       + malformedClaude
       + malformedAntigravity
-      + malformedCursor;
+      + malformedCursor
+      + malformedZed;
     const totalOmitted = omittedInstances
       + omittedCodex
       + omittedClaude
       + omittedAntigravity
-      + omittedCursor;
+      + omittedCursor
+      + omittedZed;
 
     elements.diagnosticsList.replaceChildren();
     appendDiagnostic("State directory", asString(raw.stateDirectory, "Unavailable"));
     appendDiagnostic("VS Code command", asString(raw.codeCommand, "code"));
     appendDiagnostic("Cursor command", asString(raw.cursorCommand, "cursor"));
+    appendDiagnostic("Zed command", asString(raw.zedCommand, "zed"));
     appendDiagnostic(
       "Antigravity IDE command",
       asString(raw.antigravityIdeCommand, "antigravity-ide"),
@@ -3489,6 +3557,16 @@
       "Cursor hook records",
       `${validCursor} valid · ${malformedCursor} malformed · ${omittedCursor} omitted`,
       malformedCursor > 0 || omittedCursor > 0,
+    );
+    appendDiagnostic(
+      "Zed local metadata",
+      `${validZedWorkspaces} workspace${validZedWorkspaces === 1 ? "" : "s"} · ${activeZedWorkspaces} open · ${validZedAgents} with agent metadata · ${zedModelsLoaded} with model`,
+      malformedZed > 0 || omittedZed > 0 || ambiguousZedChannels > 0,
+    );
+    appendDiagnostic(
+      "Zed adapter health",
+      `${zedChannelsLoaded} channel${zedChannelsLoaded === 1 ? "" : "s"} loaded · ${zedAgentMetadataChannels} with agent schema · ${zedModelRowsConsidered} model row${zedModelRowsConsidered === 1 ? "" : "s"} checked · ${malformedZed} malformed · ${omittedZed} omitted${ambiguousZedChannels ? ` · ${ambiguousZedChannels} ambiguous live` : ""}`,
+      malformedZed > 0 || omittedZed > 0 || ambiguousZedChannels > 0,
     );
     appendDiagnostic(
       "Cursor live heartbeat",
@@ -3529,7 +3607,10 @@
     state.diagnosticsUnavailable = false;
     updateSetupSummary();
     elements.diagnosticsStatus.classList.remove("has-error");
-    elements.diagnosticsStatus.textContent = validInstances || validAntigravity || validCursor
+    elements.diagnosticsStatus.textContent = validInstances
+      || validAntigravity
+      || validCursor
+      || validZedWorkspaces
       ? "Local monitoring data is available."
       : antigravityHookHealthUnreadable
         ? "Some Antigravity hook health records are unreadable."

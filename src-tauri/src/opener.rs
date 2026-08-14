@@ -2,13 +2,17 @@ use serde::Serialize;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::io;
+#[cfg(any(test, target_os = "windows"))]
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
 use std::thread;
 
 pub const CODE_COMMAND_ENV: &str = "VSPARALLEL_CODE_COMMAND";
 pub const CURSOR_COMMAND_ENV: &str = "VSPARALLEL_CURSOR_COMMAND";
 pub const ANTIGRAVITY_IDE_COMMAND_ENV: &str = "VSPARALLEL_ANTIGRAVITY_IDE_COMMAND";
+pub const ZED_COMMAND_ENV: &str = "VSPARALLEL_ZED_COMMAND";
+const MAX_WORKSPACE_TARGETS: usize = 64;
 
 /// A trusted editor identity reported by a bundled workspace companion.
 ///
@@ -24,6 +28,8 @@ pub enum EditorKind {
     AntigravityIde,
     #[serde(rename = "antigravity_2")]
     Antigravity2,
+    #[serde(rename = "zed")]
+    Zed,
 }
 
 impl EditorKind {
@@ -33,16 +39,17 @@ impl EditorKind {
             Self::Cursor => "Cursor",
             Self::AntigravityIde => "Antigravity IDE",
             Self::Antigravity2 => "Antigravity 2.0",
+            Self::Zed => "Zed",
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceLaunchMode {
-    /// Pass only the exact workspace target. VS Code can then focus an existing
-    /// matching window, subject to its settings and the platform's focus rules.
+    /// Ask the selected editor to prefer an existing exact-target window,
+    /// subject to its settings and the platform's focus rules.
     PreferExisting,
-    /// Force the exact workspace target to open in a separate VS Code window.
+    /// Force the exact workspace target to open in a separate editor window.
     NewWindow,
 }
 
@@ -50,8 +57,9 @@ pub trait WorkspaceLauncher {
     fn launch(
         &self,
         executable: &OsStr,
-        target: &Path,
+        targets: &[PathBuf],
         mode: WorkspaceLaunchMode,
+        editor: Option<EditorKind>,
     ) -> io::Result<()>;
 }
 
@@ -62,11 +70,12 @@ impl WorkspaceLauncher for ProcessWorkspaceLauncher {
     fn launch(
         &self,
         executable: &OsStr,
-        target: &Path,
+        targets: &[PathBuf],
         mode: WorkspaceLaunchMode,
+        editor: Option<EditorKind>,
     ) -> io::Result<()> {
         let mut child = Command::new(executable)
-            .args(launch_arguments(mode, target))
+            .args(launch_arguments(editor, mode, targets))
             .spawn()?;
         thread::spawn(move || {
             let _ = child.wait();
@@ -75,12 +84,25 @@ impl WorkspaceLauncher for ProcessWorkspaceLauncher {
     }
 }
 
-fn launch_arguments(mode: WorkspaceLaunchMode, target: &Path) -> Vec<OsString> {
-    let mut arguments = Vec::with_capacity(2);
-    if mode == WorkspaceLaunchMode::NewWindow {
-        arguments.push(OsString::from("--new-window"));
+fn launch_arguments(
+    editor: Option<EditorKind>,
+    mode: WorkspaceLaunchMode,
+    targets: &[PathBuf],
+) -> Vec<OsString> {
+    let mut arguments = Vec::with_capacity(targets.len().saturating_add(1));
+    match (editor, mode) {
+        (Some(EditorKind::Zed), WorkspaceLaunchMode::PreferExisting) => {
+            arguments.push(OsString::from("--existing"));
+        }
+        (Some(EditorKind::Zed), WorkspaceLaunchMode::NewWindow) => {
+            arguments.push(OsString::from("--new"));
+        }
+        (_, WorkspaceLaunchMode::NewWindow) => {
+            arguments.push(OsString::from("--new-window"));
+        }
+        (_, WorkspaceLaunchMode::PreferExisting) => {}
     }
-    arguments.push(target.as_os_str().to_owned());
+    arguments.extend(targets.iter().map(|target| target.as_os_str().to_owned()));
     arguments
 }
 
@@ -96,6 +118,10 @@ pub fn antigravity_ide_command() -> String {
     configured_command(ANTIGRAVITY_IDE_COMMAND_ENV).unwrap_or_else(default_antigravity_ide_command)
 }
 
+pub fn zed_command() -> String {
+    configured_command(ZED_COMMAND_ENV).unwrap_or_else(default_zed_command)
+}
+
 /// Resolve a trusted editor to its locally configured command. A missing
 /// editor is a legacy companion heartbeat and retains the historical
 /// `VSPARALLEL_CODE_COMMAND` behavior.
@@ -103,6 +129,7 @@ pub fn command_for_editor(editor: Option<EditorKind>) -> Option<String> {
     match editor {
         Some(EditorKind::Cursor) => Some(cursor_command()),
         Some(EditorKind::AntigravityIde) => Some(antigravity_ide_command()),
+        Some(EditorKind::Zed) => Some(zed_command()),
         Some(EditorKind::VsCode) | None => Some(code_command()),
         Some(EditorKind::Antigravity2) => None,
     }
@@ -169,6 +196,30 @@ fn default_antigravity_ide_command() -> String {
     }
 
     "antigravity-ide".to_string()
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
+fn default_zed_command() -> String {
+    if let Some(home) = env::var_os("HOME") {
+        for name in ["zed", "zeditor", "zedit", "zed-editor"] {
+            let candidate = std::path::PathBuf::from(&home)
+                .join(".local")
+                .join("bin")
+                .join(name);
+            if candidate.is_file() {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+    }
+    for root in ["/usr/local/bin", "/usr/bin"] {
+        for name in ["zed", "zeditor", "zedit", "zed-editor"] {
+            let candidate = std::path::PathBuf::from(root).join(name);
+            if candidate.is_file() {
+                return candidate.to_string_lossy().into_owned();
+            }
+        }
+    }
+    "zed".to_string()
 }
 
 #[cfg(target_os = "macos")]
@@ -246,6 +297,32 @@ fn default_antigravity_ide_command() -> String {
     }
 
     "antigravity-ide".to_string()
+}
+
+#[cfg(target_os = "macos")]
+fn default_zed_command() -> String {
+    for root in ["/Applications", "/System/Applications"] {
+        let candidate = std::path::PathBuf::from(root)
+            .join("Zed.app")
+            .join("Contents")
+            .join("MacOS")
+            .join("cli");
+        if candidate.is_file() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+    if let Some(home) = env::var_os("HOME") {
+        let candidate = std::path::PathBuf::from(home)
+            .join("Applications")
+            .join("Zed.app")
+            .join("Contents")
+            .join("MacOS")
+            .join("cli");
+        if candidate.is_file() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+    "zed".to_string()
 }
 
 #[cfg(target_os = "windows")]
@@ -341,6 +418,30 @@ fn default_antigravity_ide_command() -> String {
     )
     .map(|path| path.to_string_lossy().into_owned())
     .unwrap_or_else(|| "Antigravity IDE.exe".to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn default_zed_command() -> String {
+    let path_directories = env::var_os("PATH")
+        .map(|value| env::split_paths(&value).collect::<Vec<_>>())
+        .unwrap_or_default();
+    let install_roots = [
+        env::var_os("LOCALAPPDATA")
+            .map(std::path::PathBuf::from)
+            .map(|root| root.join("Programs").join("Zed")),
+        env::var_os("ProgramFiles")
+            .map(std::path::PathBuf::from)
+            .map(|root| root.join("Zed")),
+    ];
+    find_windows_zed_executable(
+        path_directories.iter().map(std::path::PathBuf::as_path),
+        install_roots
+            .iter()
+            .flatten()
+            .map(std::path::PathBuf::as_path),
+    )
+    .map(|path| path.to_string_lossy().into_owned())
+    .unwrap_or_else(|| "zed.exe".to_string())
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -449,7 +550,33 @@ fn find_windows_antigravity_ide_executable<'a>(
     None
 }
 
-pub fn open_with<L: WorkspaceLauncher>(
+#[cfg(any(target_os = "windows", test))]
+fn find_windows_zed_executable<'a>(
+    path_directories: impl IntoIterator<Item = &'a Path>,
+    install_roots: impl IntoIterator<Item = &'a Path>,
+) -> Option<std::path::PathBuf> {
+    const EXECUTABLE_NAMES: [&str; 3] = ["zed.exe", "Zed.exe", "zed-editor.exe"];
+    for directory in path_directories {
+        for name in EXECUTABLE_NAMES {
+            let candidate = directory.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    for root in install_roots {
+        for name in EXECUTABLE_NAMES {
+            let candidate = root.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+fn open_with<L: WorkspaceLauncher>(
     launcher: &L,
     executable: &str,
     target: &Path,
@@ -469,7 +596,12 @@ pub fn open_with<L: WorkspaceLauncher>(
     }
 
     launcher
-        .launch(OsStr::new(executable), target, mode)
+        .launch(
+            OsStr::new(executable),
+            std::slice::from_ref(&target.to_path_buf()),
+            mode,
+            None,
+        )
         .map_err(|error| {
             let option = match mode {
                 WorkspaceLaunchMode::PreferExisting => "",
@@ -485,17 +617,74 @@ pub fn open_with<L: WorkspaceLauncher>(
 /// Open a target with the locally configured command for a trusted editor.
 /// Returns the resolved command so callers can use the same process identity
 /// for platform-specific post-launch handling.
+#[cfg(test)]
 pub fn open_editor_with<L: WorkspaceLauncher>(
     launcher: &L,
     editor: Option<EditorKind>,
     target: &Path,
     mode: WorkspaceLaunchMode,
 ) -> Result<String, String> {
+    open_editor_targets_with(
+        launcher,
+        editor,
+        std::slice::from_ref(&target.to_path_buf()),
+        mode,
+    )
+}
+
+/// Open one exact editor workspace. Zed multi-root workspaces are passed as
+/// one ordered argument vector so reopening does not silently drop roots.
+pub fn open_editor_targets_with<L: WorkspaceLauncher>(
+    launcher: &L,
+    editor: Option<EditorKind>,
+    targets: &[PathBuf],
+    mode: WorkspaceLaunchMode,
+) -> Result<String, String> {
     let executable = command_for_editor(editor).ok_or_else(|| {
         let name = editor.map_or("This editor", EditorKind::display_name);
         format!("{name} does not expose a supported workspace launcher")
     })?;
-    open_with(launcher, &executable, target, mode)?;
+    if executable.trim().is_empty() {
+        return Err("the editor command is empty".to_string());
+    }
+    if targets.is_empty() || targets.len() > MAX_WORKSPACE_TARGETS {
+        return Err("the workspace target list is empty or exceeds its safety bound".to_string());
+    }
+    if editor != Some(EditorKind::Zed) && targets.len() != 1 {
+        return Err("this editor does not support a multi-root launch target".to_string());
+    }
+    for target in targets {
+        if !target.is_absolute() {
+            return Err("the workspace target is not an absolute local path".to_string());
+        }
+        if !target.exists() {
+            return Err(format!(
+                "the workspace target no longer exists: {}",
+                target.display()
+            ));
+        }
+    }
+    launcher
+        .launch(OsStr::new(&executable), targets, mode, editor)
+        .map_err(|error| {
+            let option = match (editor, mode) {
+                (Some(EditorKind::Zed), WorkspaceLaunchMode::PreferExisting) => " --existing",
+                (_, WorkspaceLaunchMode::PreferExisting) => "",
+                (Some(EditorKind::Zed), WorkspaceLaunchMode::NewWindow) => " --new",
+                (_, WorkspaceLaunchMode::NewWindow) => " --new-window",
+            };
+            let target = targets
+                .first()
+                .map(|target| target.display().to_string())
+                .unwrap_or_else(|| "<missing>".to_string());
+            let additional = targets.len().saturating_sub(1);
+            let suffix = if additional == 0 {
+                String::new()
+            } else {
+                format!(" (+{additional} roots)")
+            };
+            format!("could not start `{executable}{option} {target}{suffix}`: {error}")
+        })?;
     Ok(executable)
 }
 
@@ -508,7 +697,7 @@ mod tests {
 
     #[derive(Default)]
     struct RecordingLauncher {
-        call: Mutex<Option<(OsString, std::path::PathBuf, WorkspaceLaunchMode)>>,
+        call: Mutex<Option<(OsString, Vec<PathBuf>, WorkspaceLaunchMode)>>,
         failure: Mutex<Option<io::ErrorKind>>,
     }
 
@@ -516,13 +705,15 @@ mod tests {
         fn launch(
             &self,
             executable: &OsStr,
-            target: &Path,
+            targets: &[PathBuf],
             mode: WorkspaceLaunchMode,
+            editor: Option<EditorKind>,
         ) -> io::Result<()> {
             if let Some(kind) = *self.failure.lock().unwrap() {
                 return Err(io::Error::new(kind, "injected failure"));
             }
-            *self.call.lock().unwrap() = Some((executable.to_owned(), target.to_path_buf(), mode));
+            let _ = editor;
+            *self.call.lock().unwrap() = Some((executable.to_owned(), targets.to_vec(), mode));
             Ok(())
         }
     }
@@ -544,7 +735,7 @@ mod tests {
 
         let call = launcher.call.lock().unwrap().clone().unwrap();
         assert_eq!(call.0, OsString::from("/opt/Visual Studio Code/code"));
-        assert_eq!(call.1, target);
+        assert_eq!(call.1, vec![target]);
         assert_eq!(call.2, WorkspaceLaunchMode::PreferExisting);
     }
 
@@ -559,6 +750,7 @@ mod tests {
                 "Antigravity IDE",
             ),
             (EditorKind::Antigravity2, "antigravity_2", "Antigravity 2.0"),
+            (EditorKind::Zed, "zed", "Zed"),
         ];
         for (editor, serialized, label) in cases {
             assert_eq!(serde_json::to_value(editor).unwrap(), serialized);
@@ -579,6 +771,10 @@ mod tests {
         assert_eq!(
             command_for_editor(Some(EditorKind::AntigravityIde)),
             Some(antigravity_ide_command())
+        );
+        assert_eq!(
+            command_for_editor(Some(EditorKind::Zed)),
+            Some(zed_command())
         );
         assert_eq!(command_for_editor(None), Some(code_command()));
         assert_eq!(command_for_editor(Some(EditorKind::Antigravity2)), None);
@@ -644,7 +840,11 @@ mod tests {
     fn prefer_existing_passes_only_the_exact_target() {
         let target = Path::new("/work/project with spaces");
         assert_eq!(
-            launch_arguments(WorkspaceLaunchMode::PreferExisting, target),
+            launch_arguments(
+                Some(EditorKind::VsCode),
+                WorkspaceLaunchMode::PreferExisting,
+                &[target.to_path_buf()]
+            ),
             vec![target.as_os_str().to_owned()]
         );
     }
@@ -653,10 +853,58 @@ mod tests {
     fn new_window_passes_the_force_flag_before_the_exact_target() {
         let target = Path::new("/work/project with spaces");
         assert_eq!(
-            launch_arguments(WorkspaceLaunchMode::NewWindow, target),
+            launch_arguments(
+                Some(EditorKind::VsCode),
+                WorkspaceLaunchMode::NewWindow,
+                &[target.to_path_buf()]
+            ),
             vec![
                 OsString::from("--new-window"),
                 target.as_os_str().to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn zed_new_window_uses_its_documented_cli_flag() {
+        let target = Path::new("/work/project with spaces");
+        assert_eq!(
+            launch_arguments(
+                Some(EditorKind::Zed),
+                WorkspaceLaunchMode::NewWindow,
+                &[target.to_path_buf()]
+            ),
+            vec![OsString::from("--new"), target.as_os_str().to_owned()]
+        );
+    }
+
+    #[test]
+    fn zed_prefer_existing_uses_its_documented_cli_flag() {
+        let target = Path::new("/work/project with spaces");
+        assert_eq!(
+            launch_arguments(
+                Some(EditorKind::Zed),
+                WorkspaceLaunchMode::PreferExisting,
+                &[target.to_path_buf()]
+            ),
+            vec![OsString::from("--existing"), target.as_os_str().to_owned()]
+        );
+    }
+
+    #[test]
+    fn zed_multi_root_launch_preserves_saved_order() {
+        let first = PathBuf::from("/work/first");
+        let second = PathBuf::from("/work/second");
+        assert_eq!(
+            launch_arguments(
+                Some(EditorKind::Zed),
+                WorkspaceLaunchMode::NewWindow,
+                &[first.clone(), second.clone()],
+            ),
+            vec![
+                OsString::from("--new"),
+                first.into_os_string(),
+                second.into_os_string(),
             ]
         );
     }
@@ -757,6 +1005,20 @@ mod tests {
 
         assert_eq!(
             find_windows_antigravity_ide_executable([bin.as_path()], std::iter::empty()),
+            Some(executable)
+        );
+    }
+
+    #[test]
+    fn resolves_native_windows_zed_without_invoking_a_batch_shell() {
+        let temp = TempDir::new().unwrap();
+        let install_root = temp.path().join("Zed");
+        std::fs::create_dir_all(&install_root).unwrap();
+        let executable = install_root.join("zed.exe");
+        std::fs::write(&executable, b"native executable").unwrap();
+
+        assert_eq!(
+            find_windows_zed_executable(std::iter::empty(), [install_root.as_path()]),
             Some(executable)
         );
     }

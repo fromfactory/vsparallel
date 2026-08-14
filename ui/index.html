@@ -6,7 +6,7 @@
     <meta name="color-scheme" content="dark light" />
     <meta
       name="description"
-      content="A compact local overview of VS Code, Cursor, and Antigravity workspaces with coarse agent activity."
+      content="A compact local overview of VS Code, Cursor, Antigravity, and Zed workspaces with coarse agent activity."
     />
     <title>VSParallel</title>
     <link rel="icon" type="image/png" href="vsparallel-icon.png" />
@@ -278,10 +278,11 @@
             <h3>No workspaces detected</h3>
             <p>
               Open a folder in VS Code, Cursor, or Antigravity IDE with its VSParallel companion
-              enabled. Cursor hooks can also record a recent workspace open; the optional
+              enabled, or open one in Zed for automatic read-only monitoring from local metadata.
+              Cursor hooks can also record a recent workspace open; the optional
               experimental Cursor desktop bridge can correlate a live agent thread, but it does not
               provide focus or a safe open target. Start a turn in Cursor's Agents Window or an
-              Antigravity workspace to see agent activity.
+              Antigravity or Zed workspace to see agent activity and model information when available.
             </p>
             <div class="empty-state__actions">
               <button
@@ -409,7 +410,8 @@
                 <div>
                   <h3 id="integrationHeading">Integrations</h3>
                   <p id="integrationDescription">
-                    Companions track live workspaces. Hooks add lifecycle status.
+                    Companions track live workspaces. Hooks add lifecycle status. Zed monitoring is
+                    automatic and read-only; it uses local workspace and agent metadata.
                   </p>
                 </div>
                 <button

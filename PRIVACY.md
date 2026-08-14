@@ -49,8 +49,21 @@ Provider stderr and raw failure messages are also discarded. When usage is
 unavailable, the UI receives only a fixed source/category explanation such as
 could not start, timed out, rejected, or incompatible response.
 
-To show its workspace overview, VSParallel stores the following metadata on the
-current device:
+Zed monitoring is automatic and separate from those companions and hooks.
+VSParallel opens Zed-owned SQLite databases in logical read-only/query-only
+mode and correlates their persisted workspace metadata with a live Zed GUI
+process and the current session/window stack. Within a small aggregate refresh
+budget, it may parse size-bounded native thread blobs attached to displayed
+workspaces. Only the last message's structural variant, whether that assistant
+boundary contains a tool use, and safely joinable model provider/name may
+survive into the snapshot. The blob and all other parsed data are then
+discarded. Thread titles are not selected, and prompts, responses, tool
+payloads, source code, and other thread data are not retained, logged, returned
+to the UI, or copied into VSParallel's state directory.
+
+To show its workspace overview, VSParallel uses the following metadata on the
+current device. Zed-derived values remain snapshot-only; other items are
+persisted only where stated:
 
 - local workspace or `.code-workspace` paths, display names, the closed
   `vscode`, `cursor`, or `antigravity_ide` editor value, focus state, and
@@ -59,6 +72,10 @@ current device:
   active in each VS Code, Cursor, or Antigravity IDE window, whether the window
   is remote, and, when known, whether an installed extension runs in the local
   or remote extension host;
+- Zed's validated local workspace paths and timestamps, channel, current
+  session/window-stack correlation, and the latest safely associated persisted
+  agent identifier, activity timestamp, and native model provider/name when
+  available; VSParallel does not persist these Zed-derived values;
 - Codex and Claude coarse lifecycle state, a one-way hash of the provider
   session identifier, working directory, and timestamp when optional lifecycle
   hooks are installed;
@@ -118,7 +135,61 @@ an executable path; opening uses the corresponding command configured locally
 in VSParallel. Cursor's separate Agents Window does not activate the third-party
 companion. Its experimental Desktop Bridge integration is a separate opt-in and
 does not provide focus or an open target. Antigravity 2.0 does not host this
-companion.
+companion. Zed also does not host this companion and is never added to the
+heartbeat protocol's closed `vscode`, `cursor`, and `antigravity_ide` editor
+list.
+
+Zed data is discovered under `$XDG_DATA_HOME/zed` (or
+`~/.local/share/zed`) and the community Flatpak root
+`~/.var/app/dev.zed.Zed/data/zed` on Linux,
+`~/Library/Application Support/Zed` on macOS, and `%LOCALAPPDATA%\Zed` on
+Windows. `VSPARALLEL_ZED_DATA_DIR` can select a
+different absolute data root. The adapter considers the stable, preview,
+nightly, and development channel databases at
+`db/0-{stable,preview,nightly,dev}/db.sqlite` when present. It never creates,
+updates, checkpoints, repairs, or deletes these databases or Zed configuration.
+
+For workspace discovery, the adapter selects only `paths`, `paths_order`,
+`timestamp`, `session_id`, and `window_id` from Zed's `workspaces` table and
+the `session_id` and `session_window_stack` values from `kv_store`. Every path
+must pass the same bounded local-path validation used before display or
+opening. A Stable workspace is classified **Open** only when a live Zed GUI
+process exists, its stored session matches Zed's current session, and its window ID is
+present in the current session's window stack. All other usable observations
+are **Recent**. Preview, Nightly, and Dev observations always fail closed to
+**Recent** because the portable process probe cannot safely identify their
+release channel. This is a conservative liveness correlation, not foreground or
+keyboard focus: Zed rows are always non-focused, and **Open** does not mean an
+agent is running.
+Zed rows with a remote connection are omitted rather than exposing or guessing
+their connection context.
+
+For native agent metadata, the adapter selects the bounded association fields
+`session_id`, `agent_id`, `updated_at`, folder/main workspace paths, `archived`,
+and `interacted_at` from `sidebar_threads`; it never selects the thread title.
+When the newest eligible persisted native thread can be associated with one
+discovered workspace by its exact local paths, VSParallel may join its session
+to Zed's separate `threads/threads.db` and inspect bounded `updated_at`,
+`data_type`, and `data` values.
+The selective thread-data parser keeps only the last message variant, the
+presence of a tool-use boundary, and the native model provider/name when safely
+joinable and parsable. It ignores message and tool contents. A saved user
+boundary (or a newer `interacted_at` racing the blob write) can produce coarse
+**Activity detected** while that workspace is open; a later saved assistant
+boundary without a tool use can produce **Turn finished**. These signals can
+lag live generation, and Zed does not persist enough information here to
+distinguish success, cancellation, interruption, or failure. Unknown,
+malformed, or unsupported structures remain **Recent agent activity**. The
+bounded input buffer and all other parsed values are discarded after snapshot
+construction.
+
+A validated Zed target is opened only through the locally configured `zed`
+launcher (or `VSPARALLEL_ZED_COMMAND`). Current **Open** workspaces use
+`--existing`; **Recent** workspaces use `--new`, and multi-root workspaces pass
+the complete validated, ordered path vector. VSParallel does not
+derive an executable path or command from either database. Zed monitoring
+creates no companion heartbeat, hook record, configuration backup, or other
+Zed-specific file in the VSParallel state directory.
 
 Cursor's native `workspaceOpen`, `sessionStart`, `beforeSubmitPrompt`, `stop`,
 and `sessionEnd` user hooks in `~/.cursor/hooks.json` can execute for local
@@ -298,4 +369,6 @@ shown in Setup diagnostics and, if no longer needed, these backup files:
 - `~/.gemini/config/hooks.json.vsparallel.bak`
 
 Deleting those files is optional and should be done only after confirming the
-original provider configuration is working as expected.
+original provider configuration is working as expected. VSParallel never
+deletes or modifies Zed's own data during integration removal or VSParallel
+cleanup; manage that data through Zed if it must also be erased.

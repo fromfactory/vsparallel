@@ -65,8 +65,8 @@
       "../LICENSE": "LICENSE",
       "../PRIVACY.md": "PRIVACY.md"
     },
-    "shortDescription": "VS Code, Cursor, and Antigravity workspace activity overview",
-    "longDescription": "A privacy-preserving local workspace and agent-activity monitor for VS Code, Cursor, and Antigravity IDE."
+    "shortDescription": "VS Code, Cursor, Antigravity, and Zed workspace activity overview",
+    "longDescription": "A privacy-preserving local workspace and agent-activity monitor for VS Code, Cursor, Antigravity IDE, and Zed."
   },
   "plugins": {
     "updater": {

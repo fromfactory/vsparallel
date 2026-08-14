@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Name=VSParallel
-Comment=Monitor VS Code, Cursor, and Antigravity workspaces and agent activity
+Comment=Monitor VS Code, Cursor, Antigravity, and Zed workspaces and agent activity
 Exec=@BINDIR@/vsparallel
 Icon=app.vsparallel
 StartupWMClass=Vsparallel

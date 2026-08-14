@@ -60,9 +60,10 @@ Stored as `instances/<safe-instance-id>.json`:
 0.4.1, is the closed value `vscode`, `cursor`, or `antigravity_ide`. It selects
 a locally configured launcher but never contains an executable or command
 path. Older heartbeats without `editor` remain valid and use the historical VS
-Code behavior. `antigravity_2` and a separate Cursor Agents Window value are
-not accepted from a companion heartbeat. Cursor's separate Agents Window does
-not activate the third-party companion. It is represented through the
+Code behavior. `antigravity_2`, `zed`, and a separate Cursor Agents Window
+value are not accepted from a companion heartbeat. Neither Zed nor Cursor's
+separate Agents Window activates the third-party companion. Zed uses the native
+read-only adapter below. Cursor Agents Window is represented through the
 hook-record protocol below, optionally refined in memory by the experimental
 Cursor Desktop Bridge observation described below.
 
@@ -106,6 +107,101 @@ prefer an existing exact-target window. A retained but inactive heartbeat uses
 absolute path. Hook-only Cursor workspace, Cursor Agent, Antigravity 2.0, and
 Antigravity IDE rows never produce an open target. Experimental bridge-refined
 Cursor Agent rows are also non-openable.
+
+Zed targets never come from this heartbeat protocol. The native adapter
+validates a local path directly from Zed's read-only workspace database, and
+the opener selects `VSPARALLEL_ZED_COMMAND` or the local `zed` launcher. An
+**Open** Zed target adds `--existing`; a **Recent** Zed target adds `--new`.
+For a multi-root workspace, every validated path is passed in Zed's saved
+order. Only Stable-channel observations are openable because the portable
+process probe cannot safely select a Preview, Nightly, or Dev launcher.
+No executable or command value is accepted from Zed's databases or from the
+UI.
+
+## Zed native observation (read-only; memory only)
+
+Zed does not host the VSParallel companion and does not expose a VSParallel
+hook-record protocol. Instead, each workspace refresh invokes a native adapter
+that reads bounded metadata from Zed-owned SQLite databases and correlates it
+with local process state. The adapter writes no Zed heartbeat or activity
+record and does not copy its observations into the shared VSParallel state
+root.
+
+Unless `VSPARALLEL_ZED_DATA_DIR` selects another absolute directory, the Zed
+data root is:
+
+| Platform | Zed data root |
+| --- | --- |
+| Linux/Unix | `$XDG_DATA_HOME/zed`, otherwise `~/.local/share/zed`; the community Flatpak root at `~/.var/app/dev.zed.Zed/data/zed` is also considered |
+| macOS | `~/Library/Application Support/Zed` |
+| Windows | `%LOCALAPPDATA%\Zed` |
+
+Within that root, the adapter independently considers the stable, preview,
+nightly, and development channel databases at
+`db/0-{stable,preview,nightly,dev}/db.sqlite`. Missing channels are normal. A
+candidate database is opened in logical read-only/query-only mode; schema
+mismatches, missing tables or columns, invalid values, links, excessive input,
+and query failures omit that candidate without changing it.
+
+Workspace discovery admits only these Zed-owned fields:
+
+- `workspaces.paths`, `paths_order`, `timestamp`, `session_id`, and `window_id`;
+- `kv_store` values for the exact keys `session_id` and
+  `session_window_stack`.
+
+Rows with `remote_connection_id` are omitted; the adapter does not reconstruct
+or activate Zed remote-connection context.
+
+Rows, serialized path collections, strings, and path counts are bounded. Only
+validated local absolute paths can reach the snapshot or opener; other values
+are discarded. VSParallel classifies a Zed workspace as **Open** only when all
+three independent conditions hold:
+
+1. a live local Zed GUI process is present;
+2. the workspace's persisted `session_id` equals the current Zed session; and
+3. its `window_id` appears in that current session's window stack.
+
+A usable workspace observation that does not satisfy every condition remains
+**Recent**. Process presence or a database row alone is insufficient for
+**Open**. The generic process signal is used only for Stable; Preview, Nightly,
+and Dev observations fail closed to **Recent**. The adapter has no
+foreground-window or interaction signal, so every Zed row has `focused: false`;
+the **Open** classification must not be
+interpreted as focus.
+
+For optional native agent metadata, the adapter selects only bounded
+`session_id`, `agent_id`, `updated_at`, folder/main workspace paths, `archived`,
+and `interacted_at` values from `sidebar_threads`. It does not select the title
+column. The newest eligible persisted thread is associated only when its
+validated local paths exactly identify a discovered workspace.
+Its timestamp remains latest saved activity evidence rather than an exact live
+generation signal.
+
+When a safely associated thread has a usable ID/session pair, the adapter may
+join it to Zed's `threads/threads.db` and read bounded `updated_at`, `data_type`,
+and `data` values. Only a supported, size-capped thread blob is parsed. The
+selective parser retains the last message's structural variant, whether a final
+assistant boundary contains a tool use, and the safely joinable native model
+provider/name; it ignores message and tool contents.
+
+For the native Zed Agent (`agent_id IS NULL`), a saved User or Resume boundary
+can produce coarse `activity_detected` while the workspace is Open. A newer
+`interacted_at` than the joined thread save is treated the same way to cover
+asynchronous persistence. An Agent boundary containing a tool use remains
+coarse activity because another model step may follow. A newly saved Agent
+boundary without a tool use can produce `turn_finished`. A terminal manual
+Compaction boundary is not considered activity.
+These are persisted turn boundaries that may lag or skip a fast live turn;
+they do not reveal whether the turn succeeded, was cancelled, was interrupted,
+or failed. External-agent sidebar entries continue to use their own timestamp
+as `recent_activity`. Unknown, malformed, unsupported, or ambiguously closed
+structures also fail closed to `recent_activity`.
+
+The blob buffer and all other parsed data are discarded immediately. Thread
+titles are not selected; prompts, responses, source code, tool payloads, and
+transcript content are never logged, persisted, or returned to the UI. A
+displayed model therefore means “model in the latest persisted associated Zed
+thread,” not “model currently generating.”
 
 ## Hook observations and lifecycle records (schema version 1)
 
@@ -625,8 +721,12 @@ record: it hashes each bounded raw thread ID immediately, discards the raw ID
 and title, and retains only the hash and validated coarse fields in process
 memory for exact hook-session matching. Discovery tokens, socket paths, Cursor
 user-data paths, prompt text, and response text never enter the metadata
-protocol. The
-Claude status-line adapter
+protocol. The Zed adapter creates no record at all. Its workspace, process, and
+agent correlation exists only in the current snapshot; its optional bounded
+thread-blob parser exposes only the last structural message variant, tool-use
+presence, and model provider/name, then immediately discards the input buffer.
+It does not retain or expose thread titles, prompts, responses, source, tool
+payloads, or other thread fields. The Claude status-line adapter
 likewise creates the minimal usage record shown above and does not represent or
 persist the accompanying session ID, working directory, model, cost,
 repository data, or transcript path. Live Codex and Claude usage remains in

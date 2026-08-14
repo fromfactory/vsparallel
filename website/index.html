@@ -11,13 +11,13 @@
     />
     <meta
       name="description"
-      content="VSParallel is a local-first desktop companion for seeing activity across VS Code, Cursor, and Antigravity workspaces and switching between them fast."
+      content="VSParallel is a local-first desktop companion for seeing activity across VS Code, Cursor, Antigravity, and Zed workspaces and switching between them fast."
     />
     <meta property="og:type" content="website" />
     <meta property="og:title" content="VSParallel — Every workspace, one clear view" />
     <meta
       property="og:description"
-      content="See VS Code, Cursor, and Antigravity workspace activity, including coarse Cursor Agent, built-in model, Codex, and Claude Code lifecycle status."
+      content="See VS Code, Cursor, Antigravity, and Zed workspace activity, including coarse agent and model metadata where available."
     />
     <meta name="twitter:card" content="summary" />
     <meta
@@ -67,13 +67,13 @@
         <div class="container hero-content">
           <p class="eyebrow"><span aria-hidden="true"></span> Local-first desktop companion</p>
           <h1 id="hero-title">
-            Every VS Code, Cursor, and Antigravity workspace.
+            Every VS Code, Cursor, Antigravity, and Zed workspace.
             <span>One clear view.</span>
           </h1>
           <p class="hero-lead">
-            See workspace activity, focus, Cursor Agent and Antigravity built-in model
-            signals, Codex and Claude Code lifecycle status, and usage at a glance—then
-            jump straight to the project that needs you.
+            See open and recent workspaces, companion-reported focus, Cursor Agent,
+            Antigravity, and persisted Zed Agent turn and model signals, Codex and Claude Code
+            lifecycle status, and usage at a glance—then jump to the project that needs you.
           </p>
 
           <div class="hero-actions">
@@ -156,7 +156,7 @@
             </div>
 
             <figcaption>
-              Workspace focus, provider usage, and coarse lifecycle status—all in one compact view.
+              Workspace state, reported focus where available, provider usage, and coarse activity—all in one compact view.
             </figcaption>
           </figure>
         </div>
@@ -182,7 +182,7 @@
                 </svg>
               </div>
               <h3>One workspace overview</h3>
-              <p>See active and recently seen VS Code, Cursor, and Antigravity workspaces, names, paths, and open state in one place.</p>
+              <p>See open and recently seen VS Code, Cursor, Antigravity, and Zed workspaces, names, paths, and state in one place.</p>
             </article>
 
             <article class="feature-card">
@@ -193,7 +193,7 @@
                 </svg>
               </div>
               <h3>Activity at a glance</h3>
-              <p>Know which window is focused and which local workspaces are actively reporting.</p>
+              <p>Know which companion-backed window reports focus and which Zed workspaces are conservatively correlated as Open or Recent.</p>
             </article>
 
             <article class="feature-card">
@@ -204,7 +204,7 @@
                 </svg>
               </div>
               <h3>Agent activity visibility</h3>
-              <p>Optional hooks surface coarse Cursor Agent activity and bounded model or agent labels, Antigravity built-in model signals, plus Codex and Claude Code lifecycle status. Where Cursor's limited rollout exposes its local Desktop Bridge, an experimental opt-in can correlate running Cursor threads; otherwise Cursor Agents Window activity remains recent and hook-only.</p>
+              <p>Optional hooks surface coarse Cursor Agent activity and bounded model or agent labels, Antigravity model signals, plus Codex and Claude Code lifecycle status. Zed's automatic read-only adapter can show coarse Activity detected and Turn finished boundaries plus native model metadata. Those saved boundaries can lag live generation and do not identify the exact completion outcome.</p>
             </article>
 
             <article class="feature-card">
@@ -250,7 +250,11 @@
             <p>
               VSParallel keeps workspace monitoring on your device. It does not extract,
               retain, or transmit prompts, responses, source code, terminal contents,
-              transcripts, or Git data. If you enable the experimental Cursor bridge,
+              transcripts, or Git data. Zed monitoring reads bounded local SQLite
+              metadata in read-only mode; it never selects thread titles, and size-bounded
+              thread blobs are discarded after only the last structural message variant,
+              tool-use presence, and safely joinable model metadata are retained.
+              If you enable the experimental Cursor bridge,
               VSParallel sends only <code>listThreads</code> over local IPC, immediately
               hashes thread IDs, and does not retain titles, bridge credentials, paths,
               prompts, or responses.
@@ -297,7 +301,7 @@
           <div class="section-heading section-heading--centered">
             <p class="section-label">Available across your desktop</p>
             <h2 id="platforms-title">Pick your platform. Keep your flow.</h2>
-            <p>VSParallel fully supports Cursor IDE. Cursor's separate Agents Window has an experimental, off-by-default local bridge: enable Cursor's “Allow CLI to access desktop agents” beta setting, restart Cursor, and opt in from VSParallel. Only exact hook-matched running threads appear as open; rows cannot be focused or opened. VS Code 1.85+, Antigravity IDE, and hook-only Antigravity 2.0 are also supported.</p>
+            <p>VSParallel supports VS Code 1.85+, Cursor IDE, Antigravity IDE, and Zed. Zed needs no companion: its automatic read-only adapter marks a Stable workspace Open only with a live GUI process plus matching current session/window-stack evidence, and otherwise leaves it Recent. Other Zed release channels fail closed to Recent. Zed rows never claim focus or current model generation. Cursor's separate Agents Window and Antigravity 2.0 retain their documented bridge or hook-only limitations.</p>
           </div>
 
           <div class="platform-grid">
@@ -407,7 +411,7 @@
             <div>
               <p class="section-label">Ready when you are</p>
               <h2>Bring your workspaces together.</h2>
-              <p>Choose your platform above, add an editor companion, and enable the activity hooks you want to see. Cursor setup installs its companion and native hooks together; experimental Agents Window monitoring is a separate explicit opt-in.</p>
+              <p>Choose your platform above, add companions or hooks where applicable, and launch VSParallel. Zed is discovered automatically with a read-only native adapter; Cursor setup installs its companion and native hooks together.</p>
             </div>
             <div class="download-panel__actions">
               <a
@@ -439,7 +443,7 @@
           <span>VSParallel</span>
         </a>
         <p>
-          A local-first VS Code, Cursor, and Antigravity workspace companion. Open source under the
+          A local-first VS Code, Cursor, Antigravity, and Zed workspace companion. Open source under the
           <a href="https://github.com/fromfactory/vsparallel/blob/main/LICENSE">MIT License</a>.
         </p>
         <div class="footer-links">

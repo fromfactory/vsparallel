@@ -8,6 +8,7 @@ mod opener;
 mod state;
 mod tray;
 mod usage;
+mod zed_integration;
 
 pub use antigravity_integration::{run_antigravity_hook_stdio, AntigravityHookEvent};
 pub use claude_integration::run_claude_hook_stdio;
@@ -17,7 +18,7 @@ pub use usage::{run_claude_statusline_stdio, CLAUDE_STATUSLINE_ARGUMENT};
 
 use companion_integration::{CompanionOperationResult, CompanionStatus, CompanionStatusState};
 use opener::{
-    antigravity_ide_command, code_command, cursor_command, open_editor_with,
+    antigravity_ide_command, code_command, cursor_command, open_editor_targets_with,
     ProcessWorkspaceLauncher, WorkspaceLaunchMode,
 };
 use serde::Serialize;
@@ -185,11 +186,9 @@ async fn get_usage() -> Result<usage::UsageSnapshot, String> {
 fn current_snapshot() -> Result<Snapshot, String> {
     let now_ms = now_ms();
     let cursor_agents = cursor_agents_bridge::poll(now_ms, false);
+    let zed = zed_integration::load_zed_snapshot_from_environment(now_ms);
     let store = StateStore::from_environment()?;
-    Ok(match cursor_agents.snapshot.as_ref() {
-        Some(snapshot) => store.snapshot_with_cursor_agents(now_ms, Some(snapshot)),
-        None => store.snapshot(now_ms),
-    })
+    Ok(store.snapshot_with_integrations(now_ms, cursor_agents.snapshot.as_ref(), Some(&zed)))
 }
 
 #[tauri::command]
@@ -208,14 +207,17 @@ async fn set_cursor_agents_monitoring_enabled(
 #[tauri::command]
 async fn get_diagnostics() -> Result<Diagnostics, String> {
     run_background(|| {
+        let now = now_ms();
         let command = code_command();
         let antigravity_command = antigravity_ide_command();
         let cursor_command = cursor_command();
-        Ok(StateStore::from_environment()?.diagnostics(
-            now_ms(),
+        let zed = zed_integration::load_zed_snapshot_from_environment(now);
+        Ok(StateStore::from_environment()?.diagnostics_with_zed(
+            now,
             command,
             antigravity_command,
             cursor_command,
+            Some(&zed),
         ))
     })
     .await
@@ -1455,7 +1457,10 @@ fn windows_editor_process_matches(actual: &str, expected: &str) -> bool {
     actual == expected
         || matches!(
             (actual.as_str(), expected.as_str()),
-            ("vscodium", "codium") | ("codium", "vscodium")
+            ("vscodium", "codium")
+                | ("codium", "vscodium")
+                | ("zededitor", "zed")
+                | ("zed", "zededitor")
         )
 }
 
@@ -2176,11 +2181,14 @@ async fn open_workspace(
     let (open_target, launch_mode) = run_background(move || {
         let store = StateStore::from_environment()?;
         let now = now_ms();
-        if let Some(target) = store.find_active_workspace_open_target(&instance_id, now) {
+        let zed = zed_integration::load_zed_workspace_snapshot_from_environment(now);
+        if let Some(target) =
+            store.find_active_workspace_open_target_with_zed(&instance_id, now, &zed)
+        {
             return Ok((target, WorkspaceLaunchMode::PreferExisting));
         }
         store
-            .find_workspace_open_target(&instance_id, now)
+            .find_workspace_open_target_with_zed(&instance_id, now, &zed)
             .map(|target| (target, WorkspaceLaunchMode::NewWindow))
             .ok_or_else(|| {
                 "the selected workspace is no longer available or has no supported local open target"
@@ -2194,10 +2202,15 @@ async fn open_workspace(
     let panel_generation = enter_floating_panel(&window, &presentation).await?;
 
     let launch_result = run_background(move || {
-        open_editor_with(
+        if open_target.editor == Some(opener::EditorKind::Zed)
+            && open_target.zed_channel.as_deref() != Some("0-stable")
+        {
+            return Err("only safely identified Stable Zed workspaces can be opened".to_string());
+        }
+        open_editor_targets_with(
             &ProcessWorkspaceLauncher,
             open_target.editor,
-            &open_target.path,
+            &open_target.paths,
             launch_mode,
         )
     })
@@ -2226,16 +2239,23 @@ async fn open_workspace(
 }
 
 fn activate_tray_workspace(instance_id: &str) -> Result<(), String> {
+    let now = now_ms();
+    let zed = zed_integration::load_zed_workspace_snapshot_from_environment(now);
     let target = StateStore::from_environment()?
-        .find_active_workspace_open_target(instance_id, now_ms())
+        .find_active_workspace_open_target_with_zed(instance_id, now, &zed)
         .ok_or_else(|| {
             "the selected workspace is no longer active or has no supported local open target"
                 .to_string()
         })?;
-    open_editor_with(
+    if target.editor == Some(opener::EditorKind::Zed)
+        && target.zed_channel.as_deref() != Some("0-stable")
+    {
+        return Err("only safely identified Stable Zed workspaces can be opened".to_string());
+    }
+    open_editor_targets_with(
         &ProcessWorkspaceLauncher,
         target.editor,
-        &target.path,
+        &target.paths,
         WorkspaceLaunchMode::PreferExisting,
     )
     .map(|_| ())
@@ -2857,6 +2877,7 @@ mod tests {
             r#"C:\Users\dev\AppData\Local\Programs\cursor\Cursor.exe"#,
             "cursor.exe"
         ));
+        assert!(windows_editor_process_matches("zed-editor.exe", "zed.exe"));
         assert!(!windows_editor_process_matches("Codex.exe", "code"));
         assert!(!windows_editor_process_matches("", "code"));
     }

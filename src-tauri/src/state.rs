@@ -3,6 +3,9 @@ use crate::cursor_agents_bridge::{
     CursorAgentsBridgeSnapshot, CursorBridgeThread, CursorBridgeThreadStatus,
 };
 use crate::opener::EditorKind;
+use crate::zed_integration::{
+    ZedAgentActivity, ZedAgentLifecycle, ZedSnapshot, ZedWorkspaceObservation,
+};
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::{hash_map::DefaultHasher, BTreeSet, BinaryHeap, HashMap};
@@ -20,6 +23,7 @@ const MAX_RECORD_BYTES: u64 = 64 * 1024;
 const MAX_RECORD_CANDIDATES_PER_DIRECTORY: usize = 4_096;
 const MAX_FUTURE_SKEW_MS: i64 = 5 * 60 * 1_000;
 const MAX_CURSOR_METADATA_BYTES: usize = 128;
+const MAX_ZED_WORKSPACES_DISPLAYED: usize = 64;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -177,6 +181,7 @@ pub struct WorkspaceView {
     pub started_at_ms: i64,
     pub antigravity: Option<ActivityView>,
     pub cursor: Option<ActivityView>,
+    pub zed: Option<ActivityView>,
     pub codex: ActivityView,
     pub claude: ActivityView,
 }
@@ -199,10 +204,15 @@ pub struct Snapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WorkspaceOpenTarget {
-    pub path: PathBuf,
+    /// Exact, ordered local targets for one editor launch. Companion-backed
+    /// editors currently contribute one target; Zed may persist a multi-root
+    /// workspace and therefore contributes more than one.
+    pub paths: Vec<PathBuf>,
     /// `None` is a legacy heartbeat and deliberately uses the configured
     /// default VS Code command rather than trusting an on-disk executable.
     pub editor: Option<EditorKind>,
+    /// Zed release channel retained for fail-closed launcher selection.
+    pub zed_channel: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -216,6 +226,17 @@ pub struct Diagnostics {
     pub code_command: String,
     pub antigravity_ide_command: String,
     pub cursor_command: String,
+    pub zed_command: String,
+    pub valid_zed_workspace_records: usize,
+    pub active_zed_workspace_records: usize,
+    pub valid_zed_agent_records: usize,
+    pub zed_channels_loaded: usize,
+    pub malformed_zed_records: usize,
+    pub omitted_zed_records: usize,
+    pub zed_models_loaded: usize,
+    pub zed_agent_metadata_channels: usize,
+    pub zed_model_rows_considered: usize,
+    pub ambiguous_zed_live_channels: usize,
     pub valid_instance_records: usize,
     pub malformed_instance_records: usize,
     pub omitted_instance_records: usize,
@@ -283,14 +304,25 @@ impl StateStore {
         }
     }
 
+    #[cfg(test)]
     pub fn snapshot(&self, now_ms: i64) -> Snapshot {
-        self.snapshot_with_cursor_agents(now_ms, None)
+        self.snapshot_with_integrations(now_ms, None, None)
     }
 
+    #[cfg(test)]
     pub(crate) fn snapshot_with_cursor_agents(
         &self,
         now_ms: i64,
         cursor_agents: Option<&CursorAgentsBridgeSnapshot>,
+    ) -> Snapshot {
+        self.snapshot_with_integrations(now_ms, cursor_agents, None)
+    }
+
+    pub(crate) fn snapshot_with_integrations(
+        &self,
+        now_ms: i64,
+        cursor_agents: Option<&CursorAgentsBridgeSnapshot>,
+        zed: Option<&ZedSnapshot>,
     ) -> Snapshot {
         let instances = self.load_instances(now_ms);
         let codex = self.load_codex(now_ms);
@@ -352,6 +384,14 @@ impl StateStore {
             &[],
             now_ms,
         ));
+        if let Some(zed) = zed {
+            workspaces.extend(self.zed_workspace_views(
+                &zed.workspaces,
+                &codex.records,
+                &claude.records,
+                now_ms,
+            ));
+        }
         workspaces.extend(self.cursor_workspace_views(
             &cursor.records,
             &codex.records,
@@ -385,12 +425,30 @@ impl StateStore {
         }
     }
 
+    #[cfg(test)]
     pub fn diagnostics(
         &self,
         now_ms: i64,
         code_command: String,
         antigravity_ide_command: String,
         cursor_command: String,
+    ) -> Diagnostics {
+        self.diagnostics_with_zed(
+            now_ms,
+            code_command,
+            antigravity_ide_command,
+            cursor_command,
+            None,
+        )
+    }
+
+    pub(crate) fn diagnostics_with_zed(
+        &self,
+        now_ms: i64,
+        code_command: String,
+        antigravity_ide_command: String,
+        cursor_command: String,
+        zed: Option<&ZedSnapshot>,
     ) -> Diagnostics {
         let instances = self.load_instances(now_ms);
         let codex = self.load_codex(now_ms);
@@ -454,6 +512,7 @@ impl StateStore {
             Ok(None) => (None, None, "not_observed".to_string(), None),
             Err(_) => (None, None, "health_unreadable".to_string(), None),
         };
+        let zed_diagnostics = zed.map(|snapshot| &snapshot.diagnostics);
         Diagnostics {
             schema_version: SCHEMA_VERSION,
             state_directory: self.root.to_string_lossy().into_owned(),
@@ -463,6 +522,43 @@ impl StateStore {
             code_command,
             antigravity_ide_command,
             cursor_command,
+            zed_command: crate::opener::zed_command(),
+            valid_zed_workspace_records: zed.map_or(0, |snapshot| snapshot.workspaces.len()),
+            active_zed_workspace_records: zed.map_or(0, |snapshot| {
+                snapshot
+                    .workspaces
+                    .iter()
+                    .filter(|workspace| workspace.open)
+                    .count()
+            }),
+            valid_zed_agent_records: zed.map_or(0, |snapshot| {
+                snapshot
+                    .workspaces
+                    .iter()
+                    .filter(|workspace| workspace.agent.is_some())
+                    .count()
+            }),
+            zed_channels_loaded: zed_diagnostics.map_or(0, |value| value.channels_loaded),
+            malformed_zed_records: zed_diagnostics.map_or(0, |value| {
+                value
+                    .malformed_channels
+                    .saturating_add(value.malformed_records)
+                    .saturating_add(value.malformed_model_rows)
+            }),
+            omitted_zed_records: zed_diagnostics.map_or(0, |value| {
+                value
+                    .omitted_data_roots
+                    .saturating_add(value.omitted_channels)
+                    .saturating_add(value.omitted_workspaces)
+                    .saturating_add(value.omitted_threads)
+            }),
+            zed_models_loaded: zed_diagnostics.map_or(0, |value| value.models_loaded),
+            zed_agent_metadata_channels: zed_diagnostics
+                .map_or(0, |value| value.agent_metadata_channels),
+            zed_model_rows_considered: zed_diagnostics
+                .map_or(0, |value| value.model_rows_considered),
+            ambiguous_zed_live_channels: zed_diagnostics
+                .map_or(0, |value| value.ambiguous_live_channels),
             valid_instance_records: instances.records.len(),
             malformed_instance_records: instances.malformed,
             omitted_instance_records: instances.omitted,
@@ -517,6 +613,26 @@ impl StateStore {
         self.find_workspace_open_target_with_max_age(instance_id, now_ms, ACTIVE_TTL_MS)
     }
 
+    pub(crate) fn find_workspace_open_target_with_zed(
+        &self,
+        instance_id: &str,
+        now_ms: i64,
+        zed: &ZedSnapshot,
+    ) -> Option<WorkspaceOpenTarget> {
+        self.find_workspace_open_target(instance_id, now_ms)
+            .or_else(|| zed_open_target(zed, instance_id, now_ms, false))
+    }
+
+    pub(crate) fn find_active_workspace_open_target_with_zed(
+        &self,
+        instance_id: &str,
+        now_ms: i64,
+        zed: &ZedSnapshot,
+    ) -> Option<WorkspaceOpenTarget> {
+        self.find_active_workspace_open_target(instance_id, now_ms)
+            .or_else(|| zed_open_target(zed, instance_id, now_ms, true))
+    }
+
     fn find_workspace_open_target_with_max_age(
         &self,
         instance_id: &str,
@@ -536,8 +652,9 @@ impl StateStore {
             .and_then(|record| {
                 let path = open_target_path(&record)?;
                 path.exists().then(|| WorkspaceOpenTarget {
-                    path,
+                    paths: vec![path],
                     editor: record.editor.map(EditorKind::from),
+                    zed_channel: None,
                 })
             })
     }
@@ -625,6 +742,7 @@ impl StateStore {
             started_at_ms: record.started_at_ms,
             antigravity,
             cursor,
+            zed: None,
             codex: aggregate_activity(
                 "Codex",
                 &workspace_paths,
@@ -707,6 +825,7 @@ impl StateStore {
                         now_ms,
                     ),
                     cursor: None,
+                    zed: None,
                     codex: aggregate_activity(
                         "Codex",
                         &workspace_paths,
@@ -850,6 +969,7 @@ impl StateStore {
                     started_at_ms: newest.changed_at_ms,
                     antigravity: None,
                     cursor,
+                    zed: None,
                     codex: if bridge_observed {
                         unknown_activity("Codex", None, Some("Cursor agent thread (experimental)"))
                     } else {
@@ -882,6 +1002,138 @@ impl StateStore {
                     },
                 }
             })
+            .collect()
+    }
+
+    fn zed_workspace_views(
+        &self,
+        observations: &[ZedWorkspaceObservation],
+        codex_records: &[ActivityRecord],
+        claude_records: &[ActivityRecord],
+        now_ms: i64,
+    ) -> Vec<WorkspaceView> {
+        observations
+            .iter()
+            .filter_map(|observation| {
+                let fresh_agent = observation.agent.as_ref().filter(|agent| {
+                    now_ms.saturating_sub(zed_agent_observed_at_ms(agent)) <= ACTIVITY_STALE_MS
+                });
+                let evidence_at_ms = zed_observation_at_ms(observation)
+                    .or_else(|| observation.open.then_some(now_ms))
+                    .or_else(|| fresh_agent.map(zed_agent_observed_at_ms))?;
+                let primary_path = observation.paths.first()?.clone();
+                let editor_name = zed_editor_name(&observation.channel);
+                let root_name = primary_path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| "Zed workspace".to_string());
+                let name = if observation.paths.len() > 1 {
+                    format!("{root_name} +{}", observation.paths.len() - 1)
+                } else {
+                    root_name
+                };
+                let openable = observation
+                    .open_target
+                    .as_ref()
+                    .is_some_and(|paths| !paths.is_empty())
+                    && observation.channel == "0-stable";
+                let zed = fresh_agent.map(|agent| {
+                    let agent_kind = match agent.agent_kind.as_str() {
+                        "zed" => "Agent panel".to_string(),
+                        "external" => "External agent".to_string(),
+                        value => format!("External agent ({value})"),
+                    };
+                    let model_name = match (&agent.model_provider, &agent.model_name) {
+                        (Some(provider), Some(model)) => Some(format!("{provider} / {model}")),
+                        (None, Some(model)) => Some(model.clone()),
+                        (Some(provider), None) => Some(provider.clone()),
+                        (None, None) => None,
+                    };
+                    let lifecycle_at_ms = agent
+                        .lifecycle_changed_at_ms
+                        .unwrap_or(agent.changed_at_ms);
+                    let fresh_lifecycle = agent.lifecycle.filter(|_| {
+                        agent.lifecycle_changed_at_ms.is_some_and(|timestamp| {
+                            now_ms.saturating_sub(timestamp) <= ACTIVITY_STALE_MS
+                        })
+                    });
+                    let (state, label, changed_at_ms, detail) = match fresh_lifecycle {
+                        Some(ZedAgentLifecycle::ActivityDetected) if observation.open => (
+                            "activity_detected",
+                            "Activity detected",
+                            lifecycle_at_ms,
+                            "Zed persisted a submitted native Agent Panel turn whose final response boundary is not yet present. This is a coarse disk signal and can lag live generation."
+                                .to_string(),
+                        ),
+                        Some(ZedAgentLifecycle::TurnFinished) => (
+                            "turn_finished",
+                            "Turn finished",
+                            lifecycle_at_ms,
+                            "Zed persisted the final assistant boundary for the latest native Agent Panel turn. Zed does not persist the exact completion outcome for this adapter."
+                                .to_string(),
+                        ),
+                        _ => (
+                            "recent_activity",
+                            "Recent agent activity",
+                            agent.changed_at_ms,
+                            "Zed persisted a recent thread update for this workspace. No trustworthy native turn boundary is currently available."
+                                .to_string(),
+                        ),
+                    };
+                    activity_view_with_metadata(
+                        state,
+                        label,
+                        Some(changed_at_ms),
+                        detail,
+                        (None, model_name, Some(agent_kind)),
+                        None,
+                    )
+                });
+                let recently_active = fresh_agent.is_some();
+
+                Some(WorkspaceView {
+                    instance_id: zed_instance_id(observation),
+                    editor: EditorKind::Zed,
+                    editor_name: editor_name.clone(),
+                    surface: WorkspaceSurface::EditorWorkspace,
+                    name,
+                    path: Some(primary_path.to_string_lossy().into_owned()),
+                    openable,
+                    active: observation.open,
+                    focused: false,
+                    recently_active,
+                    remote_window: false,
+                    last_seen_at_ms: if observation.open {
+                        now_ms
+                    } else {
+                        evidence_at_ms
+                    },
+                    started_at_ms: evidence_at_ms,
+                    antigravity: None,
+                    cursor: None,
+                    zed,
+                    codex: aggregate_activity(
+                        "Codex",
+                        &observation.paths,
+                        codex_records,
+                        None,
+                        Some(&editor_name),
+                        false,
+                        now_ms,
+                    ),
+                    claude: aggregate_activity(
+                        "Claude Code",
+                        &observation.paths,
+                        claude_records,
+                        None,
+                        Some(&editor_name),
+                        false,
+                        now_ms,
+                    ),
+                })
+            })
+            .take(MAX_ZED_WORKSPACES_DISPLAYED)
             .collect()
     }
 
@@ -1007,6 +1259,59 @@ impl StateStore {
             true
         })
     }
+}
+
+fn zed_instance_id(observation: &ZedWorkspaceObservation) -> String {
+    observation.instance_id.clone()
+}
+
+fn zed_editor_name(channel: &str) -> String {
+    match channel {
+        "0-preview" => "Zed Preview".to_string(),
+        "0-nightly" => "Zed Nightly".to_string(),
+        "0-dev" => "Zed Dev".to_string(),
+        "0-stable" => "Zed".to_string(),
+        _ => "Zed (other channel)".to_string(),
+    }
+}
+
+fn zed_observation_at_ms(observation: &ZedWorkspaceObservation) -> Option<i64> {
+    observation.last_active_at_ms
+}
+
+fn zed_agent_observed_at_ms(agent: &ZedAgentActivity) -> i64 {
+    agent
+        .lifecycle_changed_at_ms
+        .map(|lifecycle| lifecycle.max(agent.changed_at_ms))
+        .unwrap_or(agent.changed_at_ms)
+}
+
+fn zed_open_target(
+    snapshot: &ZedSnapshot,
+    instance_id: &str,
+    _now_ms: i64,
+    require_open: bool,
+) -> Option<WorkspaceOpenTarget> {
+    if instance_id.is_empty() || instance_id.len() > 256 {
+        return None;
+    }
+    snapshot.workspaces.iter().find_map(|observation| {
+        if zed_instance_id(observation) != instance_id
+            || (require_open && !observation.open)
+            || observation.channel != "0-stable"
+        {
+            return None;
+        }
+        let paths = observation.open_target.as_ref()?;
+        if paths.is_empty() || !paths.iter().all(|path| path.exists()) {
+            return None;
+        }
+        Some(WorkspaceOpenTarget {
+            paths: paths.clone(),
+            editor: Some(EditorKind::Zed),
+            zed_channel: Some(observation.channel.clone()),
+        })
+    })
 }
 
 pub fn now_ms() -> i64 {
@@ -2125,7 +2430,7 @@ mod tests {
         let target = store
             .find_workspace_open_target("51adf7cb-d0ee-42a2-8d5d-dc8ef93d74f8", now)
             .unwrap();
-        assert_eq!(target.path, repo);
+        assert_eq!(target.paths, vec![repo]);
         assert_eq!(
             target.editor, None,
             "legacy records use the configured default"
@@ -2168,8 +2473,9 @@ mod tests {
         assert_eq!(
             store.find_workspace_open_target("antigravity-window", now),
             Some(WorkspaceOpenTarget {
-                path: repo,
+                paths: vec![repo],
                 editor: Some(EditorKind::AntigravityIde),
+                zed_channel: None,
             })
         );
     }
@@ -2195,8 +2501,9 @@ mod tests {
         assert_eq!(
             store.find_workspace_open_target("cursor-window", now),
             Some(WorkspaceOpenTarget {
-                path: repo,
+                paths: vec![repo],
                 editor: Some(EditorKind::Cursor),
+                zed_channel: None,
             })
         );
     }
@@ -3851,8 +4158,9 @@ mod tests {
         assert_eq!(
             StateStore::new(temp.path().to_path_buf()).find_workspace_open_target("repo", now),
             Some(WorkspaceOpenTarget {
-                path: repo,
+                paths: vec![repo],
                 editor: None,
+                zed_channel: None,
             })
         );
         assert!(StateStore::new(temp.path().to_path_buf())
@@ -3893,8 +4201,9 @@ mod tests {
         assert_eq!(
             store.find_active_workspace_open_target("active", now),
             Some(WorkspaceOpenTarget {
-                path: active_repo,
+                paths: vec![active_repo],
                 editor: None,
+                zed_channel: None,
             })
         );
         assert!(store
@@ -3903,9 +4212,278 @@ mod tests {
         assert_eq!(
             store.find_workspace_open_target("retained", now),
             Some(WorkspaceOpenTarget {
-                path: retained_repo,
+                paths: vec![retained_repo],
                 editor: None,
+                zed_channel: None,
             })
         );
+    }
+
+    #[test]
+    fn zed_observations_join_open_state_agent_model_and_hook_activity() {
+        use crate::zed_integration::{ZedAgentActivity, ZedDiagnostics, ZedWorkspaceObservation};
+
+        let temp = TempDir::new().unwrap();
+        let project = temp.path().join("zed-project");
+        fs::create_dir_all(&project).unwrap();
+        let now = 2_000_000_000_000;
+        write_json(
+            &temp.path().join("codex/zed-session.json"),
+            json!({
+                "schemaVersion": 1,
+                "sessionKey": "zed-session",
+                "cwd": project,
+                "state": "activity_detected",
+                "changedAtMs": now - 2_000,
+            }),
+        );
+        let zed = ZedSnapshot {
+            workspaces: vec![ZedWorkspaceObservation {
+                instance_id: "zed:opaque-project".to_string(),
+                channel: "0-stable".to_string(),
+                paths: vec![project.clone()],
+                open_target: Some(vec![project.clone()]),
+                open: true,
+                last_active_at_ms: Some(now - 1_000),
+                window_stack_index: Some(0),
+                agent: Some(ZedAgentActivity {
+                    agent_kind: "zed".to_string(),
+                    changed_at_ms: now - 500,
+                    interacted_at_ms: Some(now - 700),
+                    lifecycle: Some(ZedAgentLifecycle::ActivityDetected),
+                    lifecycle_changed_at_ms: Some(now - 700),
+                    model_provider: Some("anthropic".to_string()),
+                    model_name: Some("claude-sonnet-4".to_string()),
+                }),
+            }],
+            diagnostics: ZedDiagnostics {
+                channels_loaded: 1,
+                models_loaded: 1,
+                agent_metadata_channels: 1,
+                model_rows_considered: 1,
+                ..ZedDiagnostics::default()
+            },
+        };
+        let store = StateStore::new(temp.path().to_path_buf());
+        let snapshot = store.snapshot_with_integrations(now, None, Some(&zed));
+        let workspace = snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.editor == EditorKind::Zed)
+            .unwrap();
+
+        assert_eq!(workspace.instance_id, "zed:opaque-project");
+        assert!(workspace.active);
+        assert!(!workspace.focused);
+        assert!(workspace.openable);
+        assert_eq!(workspace.editor_name, "Zed");
+        assert_eq!(workspace.codex.state, "activity_detected");
+        assert_eq!(workspace.zed.as_ref().unwrap().label, "Activity detected");
+        assert_eq!(workspace.zed.as_ref().unwrap().state, "activity_detected");
+        assert_eq!(
+            workspace.zed.as_ref().unwrap().model_name.as_deref(),
+            Some("anthropic / claude-sonnet-4")
+        );
+        assert_eq!(
+            workspace.zed.as_ref().unwrap().agent_kind.as_deref(),
+            Some("Agent panel")
+        );
+        assert_eq!(
+            store.find_active_workspace_open_target_with_zed("zed:opaque-project", now, &zed,),
+            Some(WorkspaceOpenTarget {
+                paths: vec![project],
+                editor: Some(EditorKind::Zed),
+                zed_channel: Some("0-stable".to_string()),
+            })
+        );
+        let diagnostics = store.diagnostics_with_zed(
+            now,
+            "code".to_string(),
+            "antigravity-ide".to_string(),
+            "cursor".to_string(),
+            Some(&zed),
+        );
+        assert_eq!(diagnostics.valid_zed_workspace_records, 1);
+        assert_eq!(diagnostics.active_zed_workspace_records, 1);
+        assert_eq!(diagnostics.valid_zed_agent_records, 1);
+        assert_eq!(diagnostics.zed_channels_loaded, 1);
+        assert_eq!(diagnostics.zed_models_loaded, 1);
+        assert_eq!(diagnostics.zed_agent_metadata_channels, 1);
+        assert_eq!(diagnostics.zed_model_rows_considered, 1);
+    }
+
+    #[test]
+    fn zed_native_finished_boundary_and_closed_active_fallback_are_truthful() {
+        use crate::zed_integration::{ZedAgentActivity, ZedDiagnostics, ZedWorkspaceObservation};
+
+        let temp = TempDir::new().unwrap();
+        let finished_path = temp.path().join("finished");
+        let closed_path = temp.path().join("closed");
+        let now = 2_000_000_000_000;
+        let observation =
+            |instance_id: &str, path: PathBuf, open: bool, lifecycle: ZedAgentLifecycle| {
+                ZedWorkspaceObservation {
+                    instance_id: instance_id.to_string(),
+                    channel: "0-stable".to_string(),
+                    paths: vec![path.clone()],
+                    open_target: Some(vec![path]),
+                    open,
+                    last_active_at_ms: Some(now - 1_000),
+                    window_stack_index: open.then_some(0),
+                    agent: Some(ZedAgentActivity {
+                        agent_kind: "zed".to_string(),
+                        changed_at_ms: now - 500,
+                        interacted_at_ms: Some(now - 800),
+                        lifecycle: Some(lifecycle),
+                        lifecycle_changed_at_ms: Some(now - 400),
+                        model_provider: Some("openai".to_string()),
+                        model_name: Some("gpt".to_string()),
+                    }),
+                }
+            };
+        let mut metadata_only = observation(
+            "zed:metadata-only",
+            temp.path().join("metadata-only"),
+            true,
+            ZedAgentLifecycle::ActivityDetected,
+        );
+        let metadata_only_agent = metadata_only.agent.as_mut().unwrap();
+        metadata_only_agent.changed_at_ms = now - 100;
+        metadata_only_agent.interacted_at_ms = Some(now - ACTIVITY_STALE_MS - 2);
+        metadata_only_agent.lifecycle_changed_at_ms = Some(now - ACTIVITY_STALE_MS - 1);
+        let zed = ZedSnapshot {
+            workspaces: vec![
+                observation(
+                    "zed:finished",
+                    finished_path,
+                    false,
+                    ZedAgentLifecycle::TurnFinished,
+                ),
+                observation(
+                    "zed:closed-active",
+                    closed_path,
+                    false,
+                    ZedAgentLifecycle::ActivityDetected,
+                ),
+                metadata_only,
+            ],
+            diagnostics: ZedDiagnostics::default(),
+        };
+
+        let snapshot = StateStore::new(temp.path().to_path_buf()).snapshot_with_integrations(
+            now,
+            None,
+            Some(&zed),
+        );
+        let finished = snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.instance_id == "zed:finished")
+            .unwrap()
+            .zed
+            .as_ref()
+            .unwrap();
+        assert_eq!(finished.state, "turn_finished");
+        assert_eq!(finished.label, "Turn finished");
+        assert_eq!(finished.changed_at_ms, Some(now - 400));
+        assert_eq!(finished.model_name.as_deref(), Some("openai / gpt"));
+
+        let closed = snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.instance_id == "zed:closed-active")
+            .unwrap()
+            .zed
+            .as_ref()
+            .unwrap();
+        assert_eq!(closed.state, "recent_activity");
+        assert_eq!(closed.label, "Recent agent activity");
+
+        let metadata_only = snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.instance_id == "zed:metadata-only")
+            .unwrap()
+            .zed
+            .as_ref()
+            .unwrap();
+        assert_eq!(metadata_only.state, "recent_activity");
+        assert_eq!(metadata_only.label, "Recent agent activity");
+        assert_eq!(metadata_only.changed_at_ms, Some(now - 100));
+        assert_eq!(metadata_only.model_name.as_deref(), Some("openai / gpt"));
+    }
+
+    #[test]
+    fn zed_multi_root_and_saved_recent_observations_are_retained() {
+        use crate::zed_integration::{ZedAgentActivity, ZedDiagnostics, ZedWorkspaceObservation};
+
+        let temp = TempDir::new().unwrap();
+        let alpha = temp.path().join("alpha");
+        let beta = temp.path().join("beta");
+        fs::create_dir_all(&alpha).unwrap();
+        fs::create_dir_all(&beta).unwrap();
+        let now = 2_000_000_000_000;
+        let zed = ZedSnapshot {
+            workspaces: vec![
+                ZedWorkspaceObservation {
+                    instance_id: "zed:multi".to_string(),
+                    channel: "0-stable".to_string(),
+                    paths: vec![alpha.clone(), beta.clone()],
+                    open_target: Some(vec![alpha.clone(), beta.clone()]),
+                    open: false,
+                    last_active_at_ms: Some(now - 1_000),
+                    window_stack_index: None,
+                    agent: None,
+                },
+                ZedWorkspaceObservation {
+                    instance_id: "zed:old".to_string(),
+                    channel: "0-stable".to_string(),
+                    paths: vec![temp.path().join("old")],
+                    open_target: None,
+                    open: false,
+                    last_active_at_ms: Some(now - ACTIVITY_STALE_MS - 1),
+                    window_stack_index: None,
+                    agent: Some(ZedAgentActivity {
+                        agent_kind: "zed".to_string(),
+                        changed_at_ms: now - ACTIVITY_STALE_MS - 1,
+                        interacted_at_ms: Some(now - ACTIVITY_STALE_MS - 2),
+                        lifecycle: Some(ZedAgentLifecycle::ActivityDetected),
+                        lifecycle_changed_at_ms: Some(now - ACTIVITY_STALE_MS - 1),
+                        model_provider: Some("openai".to_string()),
+                        model_name: Some("old-model".to_string()),
+                    }),
+                },
+            ],
+            diagnostics: ZedDiagnostics::default(),
+        };
+        let store = StateStore::new(temp.path().to_path_buf());
+        let snapshot = store.snapshot_with_integrations(now, None, Some(&zed));
+
+        assert_eq!(snapshot.workspaces.len(), 2);
+        let multi = snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.instance_id == "zed:multi")
+            .unwrap();
+        assert!(multi.openable);
+        assert_eq!(
+            store.find_workspace_open_target_with_zed("zed:multi", now, &zed),
+            Some(WorkspaceOpenTarget {
+                paths: vec![alpha, beta],
+                editor: Some(EditorKind::Zed),
+                zed_channel: Some("0-stable".to_string()),
+            })
+        );
+        assert!(snapshot
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.instance_id == "zed:old"));
+        let old = snapshot
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.instance_id == "zed:old")
+            .unwrap();
+        assert!(old.zed.is_none());
+        assert!(!old.recently_active);
     }
 }
