@@ -67,7 +67,7 @@
         <div class="container hero-content">
           <p class="eyebrow"><span aria-hidden="true"></span> Local-first desktop companion</p>
           <h1 id="hero-title">
-            Every VS Code, Cursor, Antigravity, and Zed workspace.
+            Every AI coding editor workspace.
             <span>One clear view.</span>
           </h1>
           <p class="hero-lead">
@@ -205,7 +205,7 @@
                 </svg>
               </div>
               <h3>Agent activity and usage</h3>
-              <p>Optional hooks surface coarse Cursor Agent activity, Antigravity model signals, and Codex or Claude Code lifecycle status. Six usage cards keep unlike metrics honest: Codex, Claude, and Antigravity quota; Gemini and Zed token activity; and Cursor's richer CLI context when available, otherwise the latest local agent-turn input and output tokens. The local token and context signals are not plan or billing quota, and existing custom Cursor CLI status lines are preserved.</p>
+              <p>Track agent activity and see clearly labeled quota, token, and context signals.</p>
             </article>
 
             <article class="feature-card">
@@ -243,28 +243,114 @@
         </div>
       </section>
 
+      <section
+        class="section editor-support-section"
+        id="editor-support"
+        aria-labelledby="editor-support-title"
+      >
+        <div class="container">
+          <div class="section-heading section-heading--centered">
+            <p class="section-label">Editor support</p>
+            <h2 id="editor-support-title">Supported monitoring at a glance.</h2>
+            <p>See which workspace signals VSParallel can surface for each editor.</p>
+          </div>
+
+          <p class="comparison-scroll-hint">Swipe to compare <span aria-hidden="true">→</span></p>
+
+          <div
+            class="comparison-table-wrap"
+            role="region"
+            aria-label="Editor monitoring support comparison"
+            tabindex="0"
+          >
+            <table class="comparison-table">
+              <caption class="visually-hidden">
+                Comparison of editor monitoring capabilities in VSParallel
+              </caption>
+              <thead>
+                <tr>
+                  <th scope="col">Editor</th>
+                  <th scope="col">Workspaces</th>
+                  <th scope="col">Agent activity</th>
+                  <th scope="col">Model details</th>
+                  <th scope="col">Open / activate</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <th scope="row">
+                    <span class="comparison-editor">VS Code 1.85+</span>
+                    <span class="comparison-source">Companion + optional hooks</span>
+                  </th>
+                  <td><span class="support-check" aria-hidden="true">✓</span><span class="visually-hidden">Supported</span></td>
+                  <td><span class="support-check" aria-hidden="true">✓</span><span class="visually-hidden">Supported</span></td>
+                  <td><span class="support-unavailable" aria-hidden="true">—</span><span class="visually-hidden">Not available</span></td>
+                  <td><span class="support-check" aria-hidden="true">✓</span><span class="visually-hidden">Supported</span></td>
+                </tr>
+                <tr>
+                  <th scope="row">
+                    <span class="comparison-editor">Cursor IDE</span>
+                    <span class="comparison-source">Companion + Cursor hooks</span>
+                  </th>
+                  <td><span class="support-check" aria-hidden="true">✓</span><span class="visually-hidden">Supported</span></td>
+                  <td><span class="support-check" aria-hidden="true">✓</span><span class="visually-hidden">Supported</span></td>
+                  <td><span class="support-check" aria-hidden="true">✓</span><span class="visually-hidden">Supported</span></td>
+                  <td><span class="support-check" aria-hidden="true">✓</span><span class="visually-hidden">Supported</span></td>
+                </tr>
+                <tr>
+                  <th scope="row">
+                    <span class="comparison-editor">Antigravity IDE</span>
+                    <span class="comparison-source">Companion + Antigravity hooks</span>
+                  </th>
+                  <td><span class="support-check" aria-hidden="true">✓</span><span class="visually-hidden">Supported</span></td>
+                  <td><span class="support-check" aria-hidden="true">✓</span><span class="visually-hidden">Supported</span></td>
+                  <td><span class="support-check" aria-hidden="true">✓</span><span class="visually-hidden">Supported</span></td>
+                  <td><span class="support-check" aria-hidden="true">✓</span><span class="visually-hidden">Supported</span></td>
+                </tr>
+                <tr>
+                  <th scope="row">
+                    <span class="comparison-editor">Zed</span>
+                    <span class="comparison-source">Read-only local adapter</span>
+                  </th>
+                  <td><span class="support-check" aria-hidden="true">✓</span><span class="visually-hidden">Supported</span></td>
+                  <td><span class="support-check" aria-hidden="true">✓</span><span class="visually-hidden">Supported</span></td>
+                  <td><span class="support-check" aria-hidden="true">✓</span><span class="visually-hidden">Supported</span></td>
+                  <td><span class="support-check" aria-hidden="true">✓</span><span class="visually-hidden">Supported</span></td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="comparison-footer">
+            <p class="comparison-legend" aria-label="Comparison legend">
+              <span><span class="legend-check" aria-hidden="true">✓</span> Supported</span>
+              <span><span class="legend-unavailable" aria-hidden="true">—</span> Not available</span>
+            </p>
+            <div class="comparison-notes">
+              <p>
+                Optional hooks may be required, and model details appear only when the
+                editor exposes a recognized value. Zed uses persisted metadata and can
+                activate validated Stable workspaces.
+              </p>
+              <p>
+                Usage cards separately show Codex, Claude Code, and Antigravity quota, plus
+                Gemini, Zed, and Cursor token or context signals. Cursor's separate Agents
+                Window and Antigravity 2.0 have additional activity-only limits.
+              </p>
+            </div>
+          </div>
+        </div>
+      </section>
+
       <section class="section privacy-section" id="privacy" aria-labelledby="privacy-title">
         <div class="container privacy-panel">
           <div class="privacy-copy">
             <p class="section-label">Local-first by default</p>
             <h2 id="privacy-title">Your work stays yours.</h2>
             <p>
-              VSParallel keeps workspace monitoring on your device. It does not extract,
-              retain, or transmit prompts, responses, source code, terminal contents,
-              transcripts, or Git data. Zed monitoring reads bounded local SQLite
-              metadata in read-only mode; it never selects thread titles, and size-bounded
-              thread blobs are discarded after only the last structural message variant,
-              tool-use presence, safely joinable model metadata, and one checked
-              cumulative token total for the latest native thread are retained.
-              Gemini's opt-in documented
-              <code>AfterModel</code> hook ignores request and response content and
-              stores only the latest model-call token count. Live Antigravity quota
-              comes only from its official read-only
-              <code>agy -p &quot;/usage&quot; --output-format json</code> command.
-              If you enable the experimental Cursor bridge,
-              VSParallel sends only <code>listThreads</code> over local IPC, immediately
-              hashes thread IDs, and does not retain titles, bridge credentials, paths,
-              prompts, or responses.
+              Workspace monitoring stays on your device. VSParallel does not collect or
+              transmit prompts, responses, source code, terminal contents, transcripts,
+              or Git data.
             </p>
             <a class="text-link" href="https://github.com/fromfactory/vsparallel/blob/main/PRIVACY.md">
               Read the privacy details

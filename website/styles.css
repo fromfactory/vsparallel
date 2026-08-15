@@ -87,6 +87,18 @@ button {
   font: inherit;
 }
 
+.visually-hidden {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  padding: 0 !important;
+  border: 0 !important;
+  margin: -1px !important;
+  overflow: hidden !important;
+  clip: rect(0 0 0 0) !important;
+  white-space: nowrap !important;
+}
+
 img,
 svg,
 canvas {
@@ -635,6 +647,167 @@ canvas {
   line-height: 1.65;
 }
 
+.editor-support-section {
+  padding-top: 48px;
+}
+
+.comparison-scroll-hint {
+  display: none;
+}
+
+.comparison-table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 15px;
+  background:
+    linear-gradient(135deg, rgba(55, 148, 255, 0.04), transparent 38%),
+    var(--surface-soft);
+  box-shadow: 0 22px 60px rgba(0, 0, 0, 0.18);
+  scrollbar-color: var(--border-strong) transparent;
+  -webkit-overflow-scrolling: touch;
+}
+
+.comparison-table-wrap:focus-visible {
+  outline: 2px solid var(--accent-bright);
+  outline-offset: 4px;
+}
+
+.comparison-table {
+  width: 100%;
+  min-width: 680px;
+  border-collapse: collapse;
+}
+
+.comparison-table th,
+.comparison-table td {
+  padding: 19px 18px;
+  border-bottom: 1px solid var(--border);
+}
+
+.comparison-table thead th {
+  background: rgba(255, 255, 255, 0.025);
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 720;
+  letter-spacing: 0.065em;
+  line-height: 1.4;
+  text-align: center;
+  text-transform: uppercase;
+}
+
+.comparison-table thead th:first-child {
+  width: 28%;
+  text-align: left;
+}
+
+.comparison-table tbody th {
+  color: var(--text);
+  font-weight: 400;
+  text-align: left;
+}
+
+.comparison-table tbody td {
+  text-align: center;
+}
+
+.comparison-table tbody tr:last-child th,
+.comparison-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.comparison-table tbody tr {
+  transition: background-color 140ms ease;
+}
+
+.comparison-table tbody tr:hover {
+  background: rgba(255, 255, 255, 0.022);
+}
+
+.comparison-editor,
+.comparison-source {
+  display: block;
+}
+
+.comparison-editor {
+  font-size: 15px;
+  font-weight: 680;
+  letter-spacing: -0.015em;
+}
+
+.comparison-source {
+  margin-top: 3px;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.support-check {
+  display: inline-grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  border: 1px solid var(--green-border);
+  border-radius: 50%;
+  background: var(--green-soft);
+  color: #94ddb8;
+  font-size: 16px;
+  font-weight: 760;
+  line-height: 1;
+}
+
+.support-unavailable {
+  color: var(--text-muted);
+  font-size: 20px;
+  line-height: 1;
+}
+
+.comparison-footer {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 32px;
+  margin-top: 18px;
+}
+
+.comparison-legend,
+.comparison-notes p {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.65;
+}
+
+.comparison-legend {
+  display: flex;
+  flex: 0 0 auto;
+  gap: 16px;
+}
+
+.comparison-legend > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.legend-check {
+  color: #94ddb8;
+  font-weight: 760;
+}
+
+.legend-unavailable {
+  color: var(--text-muted);
+  font-size: 15px;
+}
+
+.comparison-notes {
+  max-width: 660px;
+  text-align: right;
+}
+
+.comparison-notes p + p {
+  margin-top: 4px;
+}
+
 .privacy-section {
   padding-top: 64px;
 }
@@ -1005,6 +1178,16 @@ canvas {
     padding: 48px;
   }
 
+  .comparison-footer {
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .comparison-notes {
+    max-width: none;
+    text-align: left;
+  }
+
   .platform-grid {
     grid-template-columns: 1fr;
   }
@@ -1015,6 +1198,33 @@ canvas {
 
   .download-panel {
     grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 730px) {
+  .comparison-scroll-hint {
+    display: block;
+    margin: -18px 0 9px;
+    color: var(--text-muted);
+    font-size: 11px;
+    font-weight: 620;
+    text-align: right;
+  }
+
+  .comparison-table thead th:first-child,
+  .comparison-table tbody th {
+    position: sticky;
+    left: 0;
+  }
+
+  .comparison-table thead th:first-child {
+    z-index: 2;
+    background: #151519;
+  }
+
+  .comparison-table tbody th {
+    z-index: 1;
+    background: #101013;
   }
 }
 
@@ -1095,6 +1305,19 @@ canvas {
 
   .feature-icon {
     margin-bottom: 34px;
+  }
+
+  .editor-support-section {
+    padding-top: 28px;
+  }
+
+  .comparison-table-wrap {
+    border-radius: 12px;
+  }
+
+  .comparison-table th,
+  .comparison-table td {
+    padding: 16px;
   }
 
   .privacy-section {
