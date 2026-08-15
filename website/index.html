@@ -11,13 +11,13 @@
     />
     <meta
       name="description"
-      content="VSParallel is a local-first desktop companion for seeing activity across VS Code, Cursor, Antigravity, and Zed workspaces and switching between them fast."
+      content="VSParallel is a local-first desktop companion for workspace activity plus clearly labelled Codex, Claude, Gemini, Antigravity, Zed, and Cursor usage signals."
     />
     <meta property="og:type" content="website" />
     <meta property="og:title" content="VSParallel — Every workspace, one clear view" />
     <meta
       property="og:description"
-      content="See VS Code, Cursor, Antigravity, and Zed workspace activity, including coarse agent and model metadata where available."
+      content="See VS Code, Cursor, Antigravity, and Zed workspace activity with clearly distinguished quota, token, and context usage cards."
     />
     <meta name="twitter:card" content="summary" />
     <meta
@@ -73,7 +73,8 @@
           <p class="hero-lead">
             See open and recent workspaces, companion-reported focus, Cursor Agent,
             Antigravity, and persisted Zed Agent turn and model signals, Codex and Claude Code
-            lifecycle status, and usage at a glance—then jump to the project that needs you.
+            lifecycle status, and six clearly labelled quota, token, and context
+            cards—then jump to the project that needs you.
           </p>
 
           <div class="hero-actions">
@@ -203,8 +204,8 @@
                   <path d="m9 12 2 2 4-4" />
                 </svg>
               </div>
-              <h3>Agent activity visibility</h3>
-              <p>Optional hooks surface coarse Cursor Agent activity and bounded model or agent labels, Antigravity model signals, plus Codex and Claude Code lifecycle status. Zed's automatic read-only adapter can show coarse Activity detected and Turn finished boundaries plus native model metadata. Those saved boundaries can lag live generation and do not identify the exact completion outcome.</p>
+              <h3>Agent activity and usage</h3>
+              <p>Optional hooks surface coarse Cursor Agent activity, Antigravity model signals, and Codex or Claude Code lifecycle status. Six usage cards keep unlike metrics honest: Codex, Claude, and Antigravity quota; Gemini and Zed token activity; and Cursor's richer CLI context when available, otherwise the latest local agent-turn input and output tokens. The local token and context signals are not plan or billing quota, and existing custom Cursor CLI status lines are preserved.</p>
             </article>
 
             <article class="feature-card">
@@ -253,7 +254,13 @@
               transcripts, or Git data. Zed monitoring reads bounded local SQLite
               metadata in read-only mode; it never selects thread titles, and size-bounded
               thread blobs are discarded after only the last structural message variant,
-              tool-use presence, and safely joinable model metadata are retained.
+              tool-use presence, safely joinable model metadata, and one checked
+              cumulative token total for the latest native thread are retained.
+              Gemini's opt-in documented
+              <code>AfterModel</code> hook ignores request and response content and
+              stores only the latest model-call token count. Live Antigravity quota
+              comes only from its official read-only
+              <code>agy -p &quot;/usage&quot; --output-format json</code> command.
               If you enable the experimental Cursor bridge,
               VSParallel sends only <code>listThreads</code> over local IPC, immediately
               hashes thread IDs, and does not retain titles, bridge credentials, paths,

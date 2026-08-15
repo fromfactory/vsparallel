@@ -507,7 +507,7 @@ dialog:focus-visible {
 
 .usage-grid {
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 8px;
 }
 
@@ -530,8 +530,40 @@ dialog:focus-visible {
   --usage-accent: #d49a6a;
 }
 
+.usage-card[data-provider="gemini"] {
+  --usage-accent: #a99af0;
+}
+
+.usage-card[data-provider="antigravity"] {
+  --usage-accent: #67c9ba;
+}
+
+.usage-card[data-provider="zed"] {
+  --usage-accent: #ddb269;
+}
+
+.usage-card[data-provider="cursor"] {
+  --usage-accent: #73bff2;
+}
+
 :root[data-color-theme="light"] .usage-card[data-provider="claude"] {
   --usage-accent: #9b5f31;
+}
+
+:root[data-color-theme="light"] .usage-card[data-provider="gemini"] {
+  --usage-accent: #6651b8;
+}
+
+:root[data-color-theme="light"] .usage-card[data-provider="antigravity"] {
+  --usage-accent: #25786e;
+}
+
+:root[data-color-theme="light"] .usage-card[data-provider="zed"] {
+  --usage-accent: #8a611d;
+}
+
+:root[data-color-theme="light"] .usage-card[data-provider="cursor"] {
+  --usage-accent: #176eaa;
 }
 
 .usage-card__identity {
@@ -598,6 +630,10 @@ dialog:focus-visible {
   box-shadow: inset 0 0 0 1px var(--divider-subtle);
 }
 
+.usage-meter[hidden] {
+  display: none;
+}
+
 .usage-meter__fill {
   display: block;
   width: calc(var(--usage-remaining) * 1%);
@@ -618,6 +654,10 @@ dialog:focus-visible {
   line-height: 1.25;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.usage-card[data-metric-kind="tokens"] .usage-card__value {
+  font-size: 13px;
 }
 
 .usage-card[data-level="warning"] {
@@ -2734,6 +2774,10 @@ html[data-workspace-opening="true"] .app-shell {
 }
 
 @media (max-width: 620px) {
+  .usage-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
   .window-control {
     width: 40px;
   }

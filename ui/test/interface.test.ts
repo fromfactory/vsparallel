@@ -124,7 +124,7 @@ test("the workspace empty state stays concise and explains visibility filtering"
   assert.match(javascript, /Settings › Visibility/);
 });
 
-test("global Codex and Claude usage meters emphasize remaining capacity", () => {
+test("the six-provider dashboard renders quota, context, and token usage", () => {
   const html = read("ui/index.html");
   const css = read("ui/styles.css");
   const javascript = read("ui/generated/app.js");
@@ -132,18 +132,32 @@ test("global Codex and Claude usage meters emphasize remaining capacity", () => 
     /<section\b(?=[^>]*class="[^"]*\busage-overview\b[^"]*")[^>]*>[\s\S]*?<\/section>/i,
   )?.[0];
   assert.ok(overview, "a global usage overview should exist outside workspace rows");
-  assert.match(overview, /id="usageHeading"[^>]*>\s*Usage remaining\s*</i);
+  assert.match(overview, /id="usageHeading"[^>]*>\s*Provider usage\s*</i);
   assert.match(overview, /\baria-busy="true"/i);
-  assert.equal(Array.from(overview.matchAll(/\bdata-provider="(?:codex|claude)"/g)).length, 2);
+  assert.equal(
+    Array.from(
+      overview.matchAll(
+        /\bdata-provider="(?:codex|claude|gemini|antigravity|zed|cursor)"/g,
+      ),
+    ).length,
+    6,
+  );
 
-  for (const [provider, label] of [["codex", "Codex"], ["claude", "Claude"]]) {
+  for (const [provider, label] of [
+    ["codex", "Codex"],
+    ["claude", "Claude"],
+    ["gemini", "Gemini"],
+    ["antigravity", "Antigravity"],
+    ["zed", "Zed Agent"],
+    ["cursor", "Cursor"],
+  ]) {
     const card = overview.match(
       new RegExp(`<article\\b(?=[^>]*data-provider="${provider}")[\\s\\S]*?<\\/article>`, "i"),
     )?.[0];
     assert.ok(card, `${label} should have one usage card`);
     assert.match(card, new RegExp(`>\\s*${label}\\s*<`, "i"));
     assert.match(card, /\bdata-state="checking"/i);
-    assert.match(card, /\baria-describedby="(?:codex|claude)UsageDetail"/i);
+    assert.match(card, new RegExp(`\\baria-describedby="${provider}UsageDetail"`, "i"));
     assert.match(card, /class="usage-card__state"[^>]*hidden[^>]*>\s*Stale\s*</i);
     assert.match(card, /class="usage-meter"[^>]*aria-hidden="true"/i);
     assert.doesNotMatch(card, /\brole="meter"/i);
@@ -151,7 +165,7 @@ test("global Codex and Claude usage meters emphasize remaining capacity", () => 
 
   assert.match(
     css,
-    /\.usage-grid\s*\{[^}]*grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\)/s,
+    /\.usage-grid\s*\{[^}]*grid-template-columns:\s*repeat\(3,\s*minmax\(0,\s*1fr\)\)/s,
   );
   assert.match(css, /\.usage-card__value\s*\{[^}]*font-variant-numeric:\s*tabular-nums/s);
   assert.match(css, /\.usage-meter__fill\s*\{[^}]*width:\s*calc\(var\(--usage-remaining\)\s*\*\s*1%\)/s);
@@ -160,7 +174,11 @@ test("global Codex and Claude usage meters emphasize remaining capacity", () => 
   assert.match(css, /\.usage-card\[data-state="stale"\][^{}]*\.usage-meter__fill\s*\{/s);
   assert.match(css, /\.usage-card__state\s*\{[^}]*text-transform:\s*uppercase/s);
   assert.match(javascript, /invoke\("get_usage",\s*\{\}\)/);
-  assert.match(javascript, /textContent\s*=\s*`\$\{roundedRemaining\}% left`/);
+  assert.match(javascript, /`\$\{roundedRemaining\}% left`/);
+  assert.match(javascript, /`\$\{roundedRemaining\}% context left`/);
+  assert.match(javascript, /textContent\s*=\s*`\$\{formattedTokens\} tokens`/);
+  assert.match(javascript, /resetUsageMeter\(target\.meter, true\)/);
+  assert.match(css, /\.usage-meter\[hidden\]\s*\{[^}]*display:\s*none/s);
   assert.match(javascript, /setAttribute\("role",\s*"meter"\)/);
   assert.match(javascript, /removeAttribute\("role"\)/);
   assert.match(javascript, /removeAttribute\("aria-valuenow"\)/);
@@ -203,13 +221,17 @@ test("visibility settings default on and synchronize editor and usage preference
     visibility,
     /<input\b(?=[^>]*id="usageVisibilityInput")(?=[^>]*checked)[^>]*>/i,
   );
+  assert.match(visibility, />\s*Provider usage\s*</i);
+  assert.match(visibility, /available quota, context, and token information/i);
+  assert.doesNotMatch(visibility, /Show Codex and Claude/i);
   assert.match(javascript, /invoke\("get_display_preferences",\s*\{\}\)/);
   assert.match(javascript, /invoke\("set_editor_visibility",\s*\{[\s\S]*editor:\s*kind,[\s\S]*visible:/);
   assert.match(javascript, /invoke\("set_usage_limit_percentage_visible",\s*\{\s*visible\s*\}\)/);
   assert.match(javascript, /await refreshSnapshot\(\)/);
   assert.match(javascript, /localStorage\.setItem\(\s*VISIBILITY_STORAGE_KEY/);
   assert.match(javascript, /function visibleWorkspaces\(/);
-  assert.match(javascript, /state\.usagePending \|\| !state\.usageVisible/);
+  assert.match(javascript, /if \(!state\.usageVisible\)/);
+  assert.match(javascript, /if \(state\.usageRefreshPromise\)/);
   assert.match(css, /\.usage-overview\[hidden\]\s*\{[^}]*display:\s*none/s);
 });
 
@@ -262,14 +284,19 @@ test("usage normalization selects the limiting window and bounds last-known fall
     "normalizeStateToken",
     "usageWindowLabel",
     "normalizeUsageWindow",
+    "normalizeUsageMetricKind",
     "normalizeUsageProvider",
+    "usageProviderHasMetric",
     "usageProviderWithFallback",
   ].map((name) => appFunction(javascript, name)).join("\n");
   interface UsageProvider {
     detail: string;
+    metricLabel: string;
+    metricKind: string;
     remainingPercent: number | null;
     resetsAtMs: number | null;
     state: string;
+    tokenCount: number | null;
     windowLabel: string | null;
     windows: unknown[];
   }
@@ -307,6 +334,7 @@ test("usage normalization selects the limiting window and bounds last-known fall
     ],
   }, "Codex");
   assert.equal(previous.remainingPercent, 18);
+  assert.equal(previous.metricKind, "quota");
   assert.equal(previous.windowLabel, "7-day limit");
   assert.equal(previous.resetsAtMs, 400_000);
 
@@ -326,6 +354,141 @@ test("usage normalization selects the limiting window and bounds last-known fall
   const fullyExpired = context.usageProviderWithFallback(unavailable, previous, 500_000);
   assert.equal(fullyExpired.state, "unavailable");
   assert.equal(fullyExpired.remainingPercent, null);
+
+  const gemini = context.normalizeUsageProvider({
+    state: "available",
+    metricKind: "tokens",
+    tokenCount: 12_345,
+    metricLabel: "Latest model call",
+    updatedAtMs: 1_000,
+  }, "Gemini");
+  assert.equal(gemini.metricKind, "tokens");
+  assert.equal(gemini.tokenCount, 12_345);
+  assert.equal(gemini.remainingPercent, null);
+  const tokenFallback = context.usageProviderWithFallback(
+    context.normalizeUsageProvider({ state: "unavailable", detail: "Refresh failed." }, "Gemini"),
+    gemini,
+    2_000,
+  );
+  assert.equal(tokenFallback.state, "stale");
+  assert.equal(tokenFallback.tokenCount, 12_345);
+  const disabledCapture = context.usageProviderWithFallback(
+    context.normalizeUsageProvider({
+      state: "unavailable",
+      detail: "Gemini token capture is disabled.",
+    }, "Gemini"),
+    gemini,
+    2_000,
+  );
+  assert.equal(disabledCapture.state, "unavailable");
+  assert.equal(disabledCapture.tokenCount, null);
+
+  for (const detail of [
+    "Gemini usage capture is installed, but Gemini CLI settings disable hooks.",
+    "Gemini usage capture is not installed. Open Setup & diagnostics.",
+    "Gemini usage capture needs repair in Setup & diagnostics.",
+    "The Gemini usage capture is incompatible. Repair it in Setup & diagnostics.",
+    "Gemini usage hook conflicts with an existing hook.",
+  ]) {
+    const setupRequired = context.usageProviderWithFallback(
+      context.normalizeUsageProvider({ state: "unavailable", detail }, "Gemini"),
+      gemini,
+      2_000,
+    );
+    assert.equal(setupRequired.state, "unavailable", detail);
+    assert.equal(setupRequired.tokenCount, null, detail);
+  }
+
+  const cursor = context.normalizeUsageProvider({
+    state: "available",
+    metricKind: "context",
+    remainingPercent: 72.5,
+    metricLabel: "Latest CLI context",
+    updatedAtMs: 1_000,
+  }, "Cursor");
+  assert.equal(cursor.metricKind, "context");
+  assert.equal(cursor.remainingPercent, 72.5);
+  assert.equal(cursor.tokenCount, null);
+
+  const cursorTurn = context.normalizeUsageProvider({
+    state: "available",
+    metricKind: "tokens",
+    tokenCount: 9_876,
+    metricLabel: "Latest Cursor turn",
+    updatedAtMs: 2_000,
+  }, "Cursor");
+  assert.equal(cursorTurn.metricKind, "tokens");
+  assert.equal(cursorTurn.tokenCount, 9_876);
+  assert.equal(cursorTurn.remainingPercent, null);
+  assert.equal(cursorTurn.metricLabel, "Latest Cursor turn");
+
+  const futureMetric = context.normalizeUsageProvider({
+    state: "available",
+    metricKind: "future-private-metric",
+    remainingPercent: 90,
+  }, "Provider");
+  assert.equal(futureMetric.metricKind, "none");
+  assert.equal(futureMetric.state, "unavailable");
+});
+
+test("a forced usage refresh supersedes an in-flight pre-uninstall response", async () => {
+  const javascript = read("ui/generated/app.js");
+  const refreshUsage = sliceBetween(
+    javascript,
+    /async function\s+refreshUsage\s*\(/,
+    /function\s+refreshUsageIfDue\s*\(/,
+    "refreshUsage",
+  );
+  const resolvers: Array<(value: unknown) => void> = [];
+  const rendered: unknown[] = [];
+  const state = {
+    usageVisible: true,
+    usagePending: false,
+    usageRefreshPromise: null as Promise<void> | null,
+    usageRefreshGeneration: 0,
+    lastUsageAttemptAtMs: null as number | null,
+    lastUsage: null as unknown,
+  };
+  const context = {
+    state,
+    updateRefreshControl() {},
+    invoke() {
+      return new Promise((resolve) => resolvers.push(resolve));
+    },
+    normalizeUsageSnapshot(value: unknown) {
+      return value;
+    },
+    unavailableUsageSnapshot(detail: string) {
+      return { detail };
+    },
+    resolveUsageSnapshot(current: unknown) {
+      return current;
+    },
+    renderUsageSnapshot(snapshot: unknown) {
+      rendered.push(snapshot);
+    },
+  } as unknown as {
+    refreshUsage(forceAfterPending?: boolean): Promise<void>;
+  };
+  vm.runInNewContext(refreshUsage, context);
+
+  const first = context.refreshUsage();
+  assert.equal(resolvers.length, 1);
+  const forced = context.refreshUsage(true);
+  assert.equal(state.usageRefreshGeneration, 1);
+
+  resolvers[0]({ source: "before uninstall" });
+  await first;
+  await Promise.resolve();
+  assert.equal(rendered.length, 0, "the invalidated response must never render");
+  assert.equal(resolvers.length, 2, "a fresh request must be queued after the pending one");
+
+  resolvers[1]({ source: "after uninstall" });
+  await forced;
+  assert.deepEqual(rendered, [{ source: "after uninstall" }]);
+  assert.deepEqual(state.lastUsage, { source: "after uninstall" });
+  assert.equal(state.usagePending, false);
+  assert.equal(state.usageRefreshPromise, null);
 });
 
 test("workspace activity preserves the backend's distinct no-activity label", () => {
@@ -974,7 +1137,7 @@ test("legacy companion heartbeats give an actionable IDE extension status", () =
   assert.equal(remoteInactive.label, "IDE extension installed · remote · inactive");
 });
 
-test("Codex setup keeps review guidance separate from installed status", () => {
+test("provider setup preserves review and manual-action states", () => {
   const javascript = read("ui/generated/app.js");
   const functions = [
     "isObject",
@@ -987,6 +1150,8 @@ test("Codex setup keeps review guidance separate from installed status", () => {
     normalizeIntegrationComponent(value: unknown, kind: string): {
       installed: boolean;
       reviewRequired: boolean | null;
+      token: string;
+      visualState: string;
     };
   };
   vm.runInNewContext(functions, context);
@@ -1001,6 +1166,14 @@ test("Codex setup keeps review guidance separate from installed status", () => {
     state: "installed",
     reviewRequired: true,
   }, "codex").reviewRequired, true);
+
+  const manuallyDisabled = context.normalizeIntegrationComponent({
+    state: "manual_action_required",
+    label: "Installed · enable hooks manually",
+  }, "gemini");
+  assert.equal(manuallyDisabled.installed, true);
+  assert.equal(manuallyDisabled.token, "manual_action_required");
+  assert.equal(manuallyDisabled.visualState, "warning");
 });
 
 test("editor setup combines required companion and hook components", () => {
@@ -1015,6 +1188,8 @@ test("editor setup combines required companion and hook components", () => {
       visualState: string;
       installed: boolean;
       actionLabel: string;
+      token: string;
+      label: string;
     };
   };
   vm.runInNewContext([
@@ -1038,6 +1213,9 @@ test("editor setup combines required companion and hook components", () => {
     visualState,
     installed,
     token,
+    label: token === "manual_action_required"
+      ? "Installed · custom status line kept"
+      : `${kind} ${visualState}`,
     actionLabel: visualState === "missing" ? "Install" : "Repair",
     detail: `${kind} ${visualState}`,
   });
@@ -1065,6 +1243,17 @@ test("editor setup combines required companion and hook components", () => {
     component("cursorCompanion", "error", false, "unavailable"),
     component("cursor", "error", false, "unavailable"),
   ).visualState, "error");
+  const customStatusLine = combine(
+    component("cursorCompanion", "ready", true),
+    component("cursor", "warning", true, "manual_action_required"),
+  );
+  assert.equal(customStatusLine.visualState, "warning");
+  assert.equal(customStatusLine.token, "manual_action_required");
+  assert.equal(customStatusLine.label, "Installed · custom status line kept");
+  assert.notEqual(combine(
+    component("cursorCompanion", "missing", false),
+    component("cursor", "warning", true, "manual_action_required"),
+  ).token, "manual_action_required");
 
   assert.doesNotMatch(html, /\bid="cursorCard"/i);
   assert.doesNotMatch(html, /\bid="antigravityCard"/i);
@@ -1087,6 +1276,11 @@ test("editor setup combines required companion and hook components", () => {
     runIntegrationAction,
     /catch\s*\([^)]*\)\s*\{[\s\S]*invoke\(["']get_integration_status["']/,
     "a partially applied setup action should refresh its visible status",
+  );
+  assert.match(
+    runIntegrationAction,
+    /resultComponent\.token === ["']manual_action_required["'][\s\S]*setIntegrationMessage\([\s\S]*["']warning["']/,
+    "a structurally installed integration that still needs manual action must not report success",
   );
 });
 
@@ -1320,6 +1514,7 @@ test("setup summary treats VS Code, Cursor, and Antigravity IDE as peer editor c
     antigravityIde: missing("antigravityIde"),
     cursor: missing("cursor"),
     antigravity: missing("antigravity"),
+    gemini: ready("gemini"),
     codex: ready("codex"),
     claude: ready("claude"),
   });
@@ -1356,6 +1551,7 @@ test("setup summary treats VS Code, Cursor, and Antigravity IDE as peer editor c
   assert.equal(neitherReady.attention, true);
 
   const optionalStatus = baseStatus();
+  optionalStatus.gemini = missing("gemini");
   optionalStatus.codex = missing("codex");
   optionalStatus.claude = missing("claude");
   const optionalHooksMissing = context.describeSetupSummary(optionalStatus, true, false, 0);
@@ -1426,11 +1622,25 @@ test("setup-all skips each editor whose CLI is unavailable", () => {
     setupAll,
     /command:\s*["']install_antigravity_monitoring["']/,
   );
+  assert.match(
+    setupAll,
+    /kind:\s*["']gemini["'][\s\S]*?command:\s*["']install_gemini_usage["']/,
+  );
   assert.doesNotMatch(setupAll, /install_cursor_hooks|install_antigravity_hooks/);
   assert.match(
     setupAll,
     /Monitoring installed\. Reload affected editors, restart provider sessions, and review \/hooks in Codex\./,
   );
+  assert.match(
+    setupAll,
+    /resultComponent\.token === ["']manual_action_required["'][\s\S]*manualActions\.push/,
+  );
+  assert.match(
+    setupAll,
+    /unconfirmed\.length === 0 && manualActions\.length === 0/,
+    "the all-installed success banner must exclude unresolved manual actions",
+  );
+  assert.match(setupAll, /Setup needs attention\.[\s\S]*Manual action remains:/);
 });
 
 test("settings keep integration summaries compact and expose details through accessible help", () => {
@@ -1445,7 +1655,7 @@ test("settings keep integration summaries compact and expose details through acc
     /<article\b([^>]*)>[\s\S]*?<\/article>/gi,
   ));
   const normalCards = cards.filter((match) => !/\bhidden\b/i.test(match[1]));
-  assert.equal(normalCards.length, 5, "the normal list should have five unified rows");
+  assert.equal(normalCards.length, 6, "the normal list should have six unified rows");
   const normalMarkup = normalCards.map((match) => match[0]).join("\n");
   const integrationText = normalMarkup.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ");
 
@@ -1455,6 +1665,7 @@ test("settings keep integration summaries compact and expose details through acc
     "companionCard",
     "cursorCompanionCard",
     "antigravityIdeCard",
+    "geminiCard",
     "codexCard",
     "claudeCard",
   ]) {
@@ -1469,6 +1680,7 @@ test("settings keep integration summaries compact and expose details through acc
     "Live workspace detection",
     "Live workspaces and agent activity",
     "Live workspaces and agent activity",
+    "Local model-call token totals",
     "Agent activity hooks",
     "Agent activity hooks",
   ]);
@@ -1476,9 +1688,9 @@ test("settings keep integration summaries compact and expose details through acc
   const helpTriggers = Array.from(normalMarkup.matchAll(
     /<button\b(?=[^>]*class="help-popover__trigger")(?=[^>]*type="button")(?=[^>]*aria-label="[^"]+")(?=[^>]*aria-describedby="([^"]+)")[^>]*>/gi,
   ));
-  assert.equal(helpTriggers.length, 5, "each integration should have a labeled help button");
+  assert.equal(helpTriggers.length, 6, "each integration should have a labeled help button");
   const helpIds = helpTriggers.map((match) => match[1]);
-  assert.equal(new Set(helpIds).size, 5, "each help button should describe a unique tooltip");
+  assert.equal(new Set(helpIds).size, 6, "each help button should describe a unique tooltip");
   for (const helpId of helpIds) {
     assert.match(
       normalMarkup,
@@ -1502,7 +1714,11 @@ test("settings keep integration summaries compact and expose details through acc
   );
   assert.ok(cursorCompanionCard, "the Cursor integration row should exist");
   assert.doesNotMatch(cursorCompanionCard[0], /optional-label|>\s*Optional\s*</i);
-  assert.match(cursorCompanionCard[0], /companion and activity hooks together/i);
+  assert.match(
+    cursorCompanionCard[0],
+    /reload Cursor IDE or open a new Cursor Agent CLI session[\s\S]*local Cursor agent turn in IDE Composer or the CLI[\s\S]*richer[\s\S]*context-left percentage/i,
+  );
+  assert.match(cursorCompanionCard[0], /never reads Cursor plan or billing quota/i);
   assert.match(cursorCompanionCard[0], />\s*Install\s*</i);
   assert.match(cursorCompanionCard[0], />\s*Uninstall\s*</i);
   assert.match(
@@ -1514,6 +1730,9 @@ test("settings keep integration summaries compact and expose details through acc
     /compatible, signed-in Claude Code CLI available to VSParallel, either standalone or from a local Claude Code extension in VS Code, Cursor, or Antigravity IDE/i,
   );
   assert.match(integrationText, /recent terminal status-line capture can provide fallback usage/i);
+  assert.match(integrationText, /Gemini CLI AfterModel hook/i);
+  assert.match(integrationText, /discards prompt and response content/i);
+  assert.match(integrationText, /not Gemini subscription quota/i);
   assert.doesNotMatch(integrationSection, /integration-usage-requirement|integration-activity-limitation/i);
   assert.match(css, /\.help-popover__trigger\s*\{[\s\S]*?width:\s*24px/i);
   assert.match(css, /\.help-popover__trigger:focus-visible\s*\{[\s\S]*?outline:/i);
@@ -1531,7 +1750,7 @@ test("settings keep integration summaries compact and expose details through acc
     "uninstall-all action",
   );
   const uninstallRefreshes = uninstallAll.match(
-    /Promise\.all\(\[refreshSnapshot\(\), refreshCursorAgentsBridgeStatus\(\)\]\)/g,
+    /Promise\.all\(\[[\s\S]*?refreshSnapshot\(\),[\s\S]*?refreshUsage\(true\),[\s\S]*?refreshCursorAgentsBridgeStatus\(\),?[\s\S]*?\]\)/g,
   ) ?? [];
   assert.equal(
     uninstallRefreshes.length,
@@ -1540,11 +1759,24 @@ test("settings keep integration summaries compact and expose details through acc
   );
   assert.match(
     uninstallAll,
-    /catch \(error\)[\s\S]*?setIntegrationMessage\(message, "error"\);[\s\S]*?Promise\.all\(\[refreshSnapshot\(\), refreshCursorAgentsBridgeStatus\(\)\]\)/,
+    /catch \(error\)[\s\S]*?setIntegrationMessage\(message, "error"\);[\s\S]*?Promise\.all\(\[[\s\S]*?refreshSnapshot\(\),[\s\S]*?refreshUsage\(true\),[\s\S]*?refreshCursorAgentsBridgeStatus\(\),?[\s\S]*?\]\)/,
+  );
+  const individualUninstall = sliceBetween(
+    javascript,
+    /async function\s+runIntegrationAction\s*\(/,
+    /function\s+formatNaturalList\s*\(/,
+    "individual integration action",
+  );
+  assert.equal(
+    individualUninstall.match(
+      /operation === "uninstall"[\s\S]*?Promise\.all\(\[refreshSnapshot\(\), refreshUsage\(true\)\]\)/g,
+    )?.length,
+    2,
+    "both successful and partial/error individual uninstalls should force a fresh usage snapshot",
   );
   assert.match(
     uninstallAll,
-    /Integration-backed editor monitoring was disabled[\s\S]*Automatic Zed discovery and usage-limit checks were unchanged\./,
+    /Integration-backed editor monitoring was disabled[\s\S]*Automatic Zed discovery and supported provider quota checks remain available\./,
   );
   assert.match(
     uninstallAll,
@@ -1553,13 +1785,16 @@ test("settings keep integration summaries compact and expose details through acc
   assert.match(css, /\.setup-message\.has-warning\s*\{[^}]*color:\s*var\(--amber-text\)/s);
   assert.match(
     javascript,
-    /will stop integration-backed editor monitoring[\s\S]*Automatic Zed discovery and usage-limit checks are unchanged\./,
+    /will stop integration-backed editor monitoring[\s\S]*Automatic Zed discovery and supported provider quota checks remain available\./,
   );
   assert.doesNotMatch(javascript, /(?:All local tracking|stop all local tracking)/i);
   assert.match(javascript, /:\s*"Set up monitoring"/);
   assert.match(javascript, /componentElements\.detail\.textContent = integrationPurpose\(component\.kind\)/);
   assert.match(javascript, /componentElements\.meta\.hidden = true/);
-  assert.match(javascript, /installButton\.hidden = component\.visualState === "ready"/);
+  assert.match(
+    javascript,
+    /installButton\.hidden = component\.visualState === "ready"[\s\S]*?component\.token === "manual_action_required"/,
+  );
   assert.match(javascript, /componentElements\.helpDetail\.textContent = helpDetails\.length/);
   assert.match(javascript, /Current status details are unavailable\./);
   assert.match(javascript, /function integrationPurpose\(/);
@@ -1572,7 +1807,22 @@ test("settings keep integration summaries compact and expose details through acc
   assert.match(javascript, /closeActiveHelpPopover\(\)/);
   assert.match(javascript, /Codex hooks installed\. Review \/hooks in Codex\./);
   assert.match(javascript, /Claude Code hooks installed\. Restart active sessions\./);
-  assert.match(javascript, /Cursor monitoring installed\. Reload open Cursor IDE windows\./);
+  assert.match(
+    integrationText,
+    /Gemini card has no capture[\s\S]*Install or Repair[\s\S]*new Gemini CLI session/i,
+  );
+  assert.match(
+    javascript,
+    /Gemini usage hook installed\. Open a new Gemini CLI session and start a turn\./,
+  );
+  assert.match(javascript, /install:\s*"install_gemini_usage"/);
+  assert.match(javascript, /uninstall:\s*"uninstall_gemini_usage"/);
+  assert.match(javascript, /gemini:\s*normalizeIntegrationComponent\(raw\.gemini, "gemini"\)/);
+  assert.match(javascript, /renderIntegrationComponent\(status\.gemini\)/);
+  assert.match(
+    javascript,
+    /Cursor monitoring installed\. Reload open Cursor IDE windows or open a new Cursor Agent CLI session, then start a turn\./,
+  );
   assert.match(javascript, /Antigravity integration installed\. Reload open Antigravity IDE windows/);
   assert.match(javascript, /Antigravity 2\.0 hook execution/);
   assert.match(javascript, /Antigravity IDE hook execution/);

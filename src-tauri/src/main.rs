@@ -94,6 +94,16 @@ fn main() {
         {
             std::process::exit(vsparallel_lib::run_claude_statusline_stdio());
         }
+        Some(argument)
+            if argument == std::ffi::OsStr::new(vsparallel_lib::GEMINI_USAGE_ARGUMENT) =>
+        {
+            std::process::exit(vsparallel_lib::run_gemini_usage_stdio());
+        }
+        Some(argument)
+            if argument == std::ffi::OsStr::new(vsparallel_lib::CURSOR_USAGE_ARGUMENT) =>
+        {
+            std::process::exit(vsparallel_lib::run_cursor_usage_stdio());
+        }
         _ => {}
     }
     prepare_desktop_environment();

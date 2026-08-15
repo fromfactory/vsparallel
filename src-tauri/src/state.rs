@@ -56,6 +56,7 @@ pub(crate) enum IntegrationSource {
     AntigravityIdeCompanion,
     CursorHooks,
     AntigravityHooks,
+    GeminiUsage,
     CodexHooks,
     ClaudeHooks,
 }
@@ -68,6 +69,7 @@ impl IntegrationSource {
             Self::AntigravityIdeCompanion => "antigravity-ide-companion",
             Self::CursorHooks => "cursor-hooks",
             Self::AntigravityHooks => "antigravity-hooks",
+            Self::GeminiUsage => "gemini-usage",
             Self::CodexHooks => "codex-hooks",
             Self::ClaudeHooks => "claude-hooks",
         }
@@ -1671,7 +1673,23 @@ fn purge_integration_source_at(root: &Path, source: IntegrationSource) -> Result
         | IntegrationSource::AntigravityIdeCompanion => {
             purge_companion_instance_records(root, source)
         }
-        IntegrationSource::CursorHooks => remove_managed_state_entry(root, "cursor"),
+        IntegrationSource::CursorHooks => {
+            let mut errors = Vec::new();
+            if let Err(error) = remove_managed_state_entry(root, "cursor") {
+                errors.push(error);
+            }
+            for filename in ["cursor.json", "cursor-turn.json"] {
+                if let Err(error) = remove_managed_state_file(root, "usage", filename) {
+                    errors.push(error);
+                }
+            }
+            if errors.is_empty() {
+                Ok(())
+            } else {
+                Err(errors.join("; "))
+            }
+        }
+        IntegrationSource::GeminiUsage => remove_managed_state_file(root, "usage", "gemini.json"),
         IntegrationSource::CodexHooks => remove_managed_state_entry(root, "codex"),
         IntegrationSource::ClaudeHooks => {
             let mut errors = Vec::new();
@@ -3196,6 +3214,31 @@ mod tests {
         assert!(!temp.path().join("claude").exists());
         assert!(!temp.path().join("usage/claude.json").exists());
         assert!(temp.path().join("usage/other.json").is_file());
+    }
+
+    #[test]
+    fn gemini_and_cursor_uninstall_remove_only_their_usage_caches() {
+        let temp = TempDir::new().unwrap();
+        for (relative, owned) in [
+            ("cursor/activity.json", true),
+            ("usage/cursor.json", true),
+            ("usage/cursor-turn.json", true),
+            ("usage/gemini.json", true),
+            ("usage/claude.json", false),
+        ] {
+            write_json(&temp.path().join(relative), json!({"owned": owned}));
+        }
+
+        purge_integration_source_at(temp.path(), IntegrationSource::GeminiUsage).unwrap();
+        assert!(!temp.path().join("usage/gemini.json").exists());
+        assert!(temp.path().join("usage/cursor.json").is_file());
+        assert!(temp.path().join("cursor/activity.json").is_file());
+
+        purge_integration_source_at(temp.path(), IntegrationSource::CursorHooks).unwrap();
+        assert!(!temp.path().join("usage/cursor.json").exists());
+        assert!(!temp.path().join("usage/cursor-turn.json").exists());
+        assert!(!temp.path().join("cursor").exists());
+        assert!(temp.path().join("usage/claude.json").is_file());
     }
 
     #[cfg(unix)]

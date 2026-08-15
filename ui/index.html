@@ -198,7 +198,7 @@
         aria-labelledby="usageHeading"
         aria-busy="true"
       >
-        <h2 class="sr-only" id="usageHeading">Usage remaining</h2>
+        <h2 class="sr-only" id="usageHeading">Provider usage</h2>
         <div class="usage-grid">
           <article
             class="usage-card"
@@ -251,6 +251,96 @@
               <span class="usage-meter__fill" id="claudeUsageFill"></span>
             </div>
             <span class="usage-card__detail" id="claudeUsageDetail">Checking usage…</span>
+          </article>
+
+          <article
+            class="usage-card"
+            id="geminiUsage"
+            data-provider="gemini"
+            data-state="checking"
+            aria-labelledby="geminiUsageName"
+            aria-describedby="geminiUsageDetail"
+          >
+            <div class="usage-card__identity">
+              <svg class="usage-card__icon" viewBox="0 0 20 20" aria-hidden="true">
+                <path d="M10 2.2c.5 4.8 2.8 7.1 7.6 7.8-4.8.6-7.1 3-7.6 7.8-.6-4.8-2.9-7.2-7.6-7.8 4.7-.7 7-3 7.6-7.8Z" />
+              </svg>
+              <span class="usage-card__name" id="geminiUsageName">Gemini</span>
+              <span class="usage-card__state" id="geminiUsageState" hidden>Stale</span>
+            </div>
+            <strong class="usage-card__value" id="geminiUsageValue">…</strong>
+            <div class="usage-meter" id="geminiUsageMeter" aria-hidden="true">
+              <span class="usage-meter__fill" id="geminiUsageFill"></span>
+            </div>
+            <span class="usage-card__detail" id="geminiUsageDetail">Checking usage…</span>
+          </article>
+
+          <article
+            class="usage-card"
+            id="antigravityUsage"
+            data-provider="antigravity"
+            data-state="checking"
+            aria-labelledby="antigravityUsageName"
+            aria-describedby="antigravityUsageDetail"
+          >
+            <div class="usage-card__identity">
+              <svg class="usage-card__icon" viewBox="0 0 20 20" aria-hidden="true">
+                <circle cx="10" cy="10" r="2.1" />
+                <path d="M3 10c1.8-4.8 4.1-7.2 7-7.2s5.2 2.4 7 7.2c-1.8 4.8-4.1 7.2-7 7.2S4.8 14.8 3 10Z" />
+              </svg>
+              <span class="usage-card__name" id="antigravityUsageName">Antigravity</span>
+              <span class="usage-card__state" id="antigravityUsageState" hidden>Stale</span>
+            </div>
+            <strong class="usage-card__value" id="antigravityUsageValue">…</strong>
+            <div class="usage-meter" id="antigravityUsageMeter" aria-hidden="true">
+              <span class="usage-meter__fill" id="antigravityUsageFill"></span>
+            </div>
+            <span class="usage-card__detail" id="antigravityUsageDetail">Checking usage…</span>
+          </article>
+
+          <article
+            class="usage-card"
+            id="zedUsage"
+            data-provider="zed"
+            data-state="checking"
+            aria-labelledby="zedUsageName"
+            aria-describedby="zedUsageDetail"
+          >
+            <div class="usage-card__identity">
+              <svg class="usage-card__icon" viewBox="0 0 20 20" aria-hidden="true">
+                <path d="M4 4h12L5 16h11" />
+              </svg>
+              <span class="usage-card__name" id="zedUsageName">Zed Agent</span>
+              <span class="usage-card__state" id="zedUsageState" hidden>Stale</span>
+            </div>
+            <strong class="usage-card__value" id="zedUsageValue">…</strong>
+            <div class="usage-meter" id="zedUsageMeter" aria-hidden="true">
+              <span class="usage-meter__fill" id="zedUsageFill"></span>
+            </div>
+            <span class="usage-card__detail" id="zedUsageDetail">Checking usage…</span>
+          </article>
+
+          <article
+            class="usage-card"
+            id="cursorUsage"
+            data-provider="cursor"
+            data-state="checking"
+            aria-labelledby="cursorUsageName"
+            aria-describedby="cursorUsageDetail"
+          >
+            <div class="usage-card__identity">
+              <svg class="usage-card__icon" viewBox="0 0 20 20" aria-hidden="true">
+                <path d="M4.1 2.8 16.2 10 4.1 17.2V2.8Z" />
+                <path d="m7.2 7.2 4.8 2.8-4.8 2.8V7.2Z" />
+              </svg>
+              <span class="usage-card__name" id="cursorUsageName">Cursor</span>
+              <span class="usage-card__state" id="cursorUsageState" hidden>Stale</span>
+            </div>
+            <strong class="usage-card__value" id="cursorUsageValue">…</strong>
+            <div class="usage-meter" id="cursorUsageMeter" aria-hidden="true">
+              <span class="usage-meter__fill" id="cursorUsageFill"></span>
+            </div>
+            <span class="usage-card__detail" id="cursorUsageDetail">Checking usage…</span>
           </article>
         </div>
         <p class="sr-only" id="usageStatus" role="status" aria-live="polite">
@@ -392,7 +482,7 @@
             <summary>
               <span>
                 <strong>Visibility</strong>
-                <small>Editors and usage limits</small>
+                <small>Editors and provider usage</small>
               </span>
               <svg class="monitor-diagnostics__chevron" viewBox="0 0 16 16" aria-hidden="true">
                 <path d="m4.5 6 3.5 3.5L11.5 6" />
@@ -451,8 +541,8 @@
               </label>
               <label class="settings-row settings-row--separated">
                 <span>
-                  <strong>Usage limit percentages</strong>
-                  <small>Show Codex and Claude usage-limit cards.</small>
+                  <strong>Provider usage</strong>
+                  <small>Show available quota, context, and token information.</small>
                 </span>
                 <span class="setting-switch">
                   <input id="usageVisibilityInput" type="checkbox" role="switch" checked />
@@ -610,7 +700,12 @@
                               popover="manual"
                             >
                               Installs and removes the Cursor companion and activity hooks together.
-                              Reload Cursor IDE windows after making a change.
+                              After setup, reload Cursor IDE or open a new Cursor Agent CLI session,
+                              then start a local Cursor agent turn in IDE Composer or the CLI to
+                              capture that turn's input and output token total. Cursor Agent CLI can
+                              additionally report its richer
+                              context-left percentage when no custom CLI status line is in use.
+                              VSParallel never reads Cursor plan or billing quota.
                               <span class="help-popover__status" id="cursorCompanionHelpStatus">
                                 Checking current status…
                               </span>
@@ -795,6 +890,74 @@
                     <button
                       class="setup-button setup-button--danger"
                       id="antigravityIdeUninstallButton"
+                      type="button"
+                      disabled
+                      hidden
+                    >
+                      Uninstall
+                    </button>
+                  </div>
+                </article>
+
+                <article class="integration-card" id="geminiCard">
+                  <div class="integration-card__header">
+                    <div class="integration-card__identity">
+                      <svg class="integration-card__icon" viewBox="0 0 24 24" aria-hidden="true">
+                        <path d="M12 2.7c.6 5.6 3.3 8.3 8.8 9.3-5.5.8-8.2 3.6-8.8 9.3-.7-5.7-3.4-8.5-8.8-9.3 5.4-1 8.1-3.7 8.8-9.3Z" />
+                      </svg>
+                      <div>
+                        <div class="integration-card__title-row">
+                          <h4>
+                            Gemini CLI
+                            <span class="optional-label">Optional</span>
+                          </h4>
+                          <span class="help-popover">
+                            <button
+                              class="help-popover__trigger"
+                              type="button"
+                              aria-label="About Gemini usage monitoring"
+                              aria-describedby="geminiUsageHelp"
+                            >?</button>
+                            <span
+                              class="help-popover__content"
+                              id="geminiUsageHelp"
+                              role="tooltip"
+                              popover="manual"
+                            >
+                              Installs a Gemini CLI AfterModel hook that keeps only the latest total
+                              token count locally. VSParallel discards prompt and response content.
+                              If the Gemini card has no capture, use Install or Repair here, then open
+                              a new Gemini CLI session and start a turn. This is local activity, not
+                              Gemini subscription quota; run <code>/stats model</code> in Gemini CLI
+                              for its live quota view.
+                              <span class="help-popover__status" id="geminiUsageHelpStatus">
+                                Checking current status…
+                              </span>
+                            </span>
+                          </span>
+                        </div>
+                        <p class="integration-detail" id="geminiDetail">
+                          Local model-call token totals
+                        </p>
+                      </div>
+                    </div>
+                    <span class="integration-status" id="geminiStatus" data-state="checking">
+                      Checking…
+                    </span>
+                  </div>
+                  <p class="integration-meta" id="geminiMeta" hidden></p>
+                  <div class="integration-actions">
+                    <button
+                      class="setup-button setup-button--primary"
+                      id="geminiInstallButton"
+                      type="button"
+                      disabled
+                    >
+                      Install
+                    </button>
+                    <button
+                      class="setup-button setup-button--danger"
+                      id="geminiUninstallButton"
                       type="button"
                       disabled
                       hidden

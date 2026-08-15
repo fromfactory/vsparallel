@@ -4,6 +4,7 @@ mod codex_integration;
 mod companion_integration;
 mod cursor_agents_bridge;
 mod cursor_integration;
+mod gemini_integration;
 mod opener;
 mod state;
 mod tray;
@@ -14,7 +15,11 @@ pub use antigravity_integration::{run_antigravity_hook_stdio, AntigravityHookEve
 pub use claude_integration::run_claude_hook_stdio;
 pub use codex_integration::run_codex_hook_stdio;
 pub use cursor_integration::{run_cursor_hook_stdio, CursorHookEvent};
-pub use usage::{run_claude_statusline_stdio, CLAUDE_STATUSLINE_ARGUMENT};
+pub use gemini_integration::GEMINI_USAGE_ARGUMENT;
+pub use usage::{
+    run_claude_statusline_stdio, run_cursor_usage_stdio, run_gemini_usage_stdio,
+    CLAUDE_STATUSLINE_ARGUMENT, CURSOR_USAGE_ARGUMENT,
+};
 
 use companion_integration::{CompanionOperationResult, CompanionStatus, CompanionStatusState};
 use opener::{
@@ -163,6 +168,7 @@ struct IntegrationStatusView {
     antigravity_ide: CompanionIntegrationView,
     cursor: LifecycleIntegrationView,
     antigravity: LifecycleIntegrationView,
+    gemini: LifecycleIntegrationView,
     codex: LifecycleIntegrationView,
     claude: LifecycleIntegrationView,
     requires_restart: bool,
@@ -464,6 +470,24 @@ async fn uninstall_claude_hooks() -> Result<IntegrationStatusView, String> {
 }
 
 #[tauri::command]
+async fn install_gemini_usage() -> Result<IntegrationStatusView, String> {
+    run_background(|| {
+        install_gemini_usage_component()?;
+        Ok(build_integration_status(true))
+    })
+    .await
+}
+
+#[tauri::command]
+async fn uninstall_gemini_usage() -> Result<IntegrationStatusView, String> {
+    run_background(|| {
+        uninstall_gemini_usage_component()?;
+        Ok(build_integration_status(true))
+    })
+    .await
+}
+
+#[tauri::command]
 async fn install_cursor_hooks() -> Result<IntegrationStatusView, String> {
     run_background(|| {
         install_cursor_hooks_component()?;
@@ -570,6 +594,12 @@ async fn uninstall_all_integrations() -> Result<IntegrationStatusView, String> {
             "Claude Code activity hooks",
             IntegrationSource::ClaudeHooks,
             uninstall_claude_hooks_component(),
+        );
+        collect_uninstall_all_result(
+            &mut failures,
+            "Gemini usage hook",
+            IntegrationSource::GeminiUsage,
+            uninstall_gemini_usage_component(),
         );
         collect_uninstall_result(
             &mut failures,
@@ -738,6 +768,22 @@ fn uninstall_claude_hooks_component() -> Result<(), String> {
     let change = claude_integration::uninstall_claude_integration(&claude_config_dir, &executable)?;
     verify_claude_change(&change, false)?;
     disable_verified_source(IntegrationSource::ClaudeHooks, "Claude Code activity hooks")
+}
+
+fn install_gemini_usage_component() -> Result<(), String> {
+    let config_dir = gemini_integration::gemini_config_dir_from_environment()?;
+    let executable = integration_executable()?;
+    let change = gemini_integration::install_gemini_integration(&config_dir, &executable)?;
+    verify_gemini_change(&change, true)?;
+    enable_verified_source(IntegrationSource::GeminiUsage, "Gemini usage hook")
+}
+
+fn uninstall_gemini_usage_component() -> Result<(), String> {
+    let config_dir = gemini_integration::gemini_config_dir_from_environment()?;
+    let executable = integration_executable()?;
+    let change = gemini_integration::uninstall_gemini_integration(&config_dir, &executable)?;
+    verify_gemini_change(&change, false)?;
+    disable_verified_source(IntegrationSource::GeminiUsage, "Gemini usage hook")
 }
 
 fn install_antigravity_monitoring_components<C, H>(
@@ -928,6 +974,22 @@ fn verify_claude_change(
     }
 }
 
+fn verify_gemini_change(
+    change: &gemini_integration::GeminiIntegrationChange,
+    expected_installed: bool,
+) -> Result<(), String> {
+    // A safe uninstall can leave a foreign hook that uses VSParallel's
+    // reserved name. That post-removal status is `conflict`, not
+    // `not_installed`, but `installed == false` confirms that no current
+    // VSParallel handler remains. Accept it so local capture is disabled and
+    // purged after either individual uninstall or Uninstall All.
+    if change.status.installed == expected_installed {
+        Ok(())
+    } else {
+        Err(change.status.message.clone())
+    }
+}
+
 async fn run_background<T, F>(operation: F) -> Result<T, String>
 where
     T: Send + 'static,
@@ -999,6 +1061,7 @@ fn build_integration_status_with_companions(
     );
     let cursor = cursor_view();
     let antigravity = antigravity_view();
+    let gemini = gemini_view();
     let codex = codex_view();
     let claude = claude_view();
     IntegrationStatusView {
@@ -1008,6 +1071,7 @@ fn build_integration_status_with_companions(
         antigravity_ide,
         cursor,
         antigravity,
+        gemini,
         codex,
         claude,
         requires_restart,
@@ -1117,6 +1181,78 @@ fn lifecycle_view_for_enabled_source(
         );
     }
     view
+}
+
+fn gemini_view() -> LifecycleIntegrationView {
+    let config_dir = match gemini_integration::gemini_config_dir_from_environment() {
+        Ok(path) => path,
+        Err(error) => return unavailable_gemini_view(error, None),
+    };
+    let config_path = Some(
+        config_dir
+            .join("settings.json")
+            .to_string_lossy()
+            .into_owned(),
+    );
+    let executable = match integration_executable() {
+        Ok(path) => path,
+        Err(error) => return unavailable_gemini_view(error, config_path),
+    };
+    match gemini_integration::gemini_integration_status(&config_dir, &executable) {
+        Ok(status) => gemini_lifecycle_view(
+            status,
+            state::integration_source_is_enabled(IntegrationSource::GeminiUsage).unwrap_or(false),
+        ),
+        Err(error) => unavailable_gemini_view(
+            format!("VSParallel could not safely read the Gemini CLI hook configuration: {error}"),
+            config_path,
+        ),
+    }
+}
+
+fn gemini_lifecycle_view(
+    status: gemini_integration::GeminiIntegrationStatus,
+    observation_enabled: bool,
+) -> LifecycleIntegrationView {
+    let (state, label) = match status.state.as_str() {
+        "installed" => ("installed", "Installed"),
+        "disabled" => (
+            "manual_action_required",
+            "Installed · enable hooks manually",
+        ),
+        "not_installed" => ("not_installed", "Not installed"),
+        "stale" => ("repair_needed", "Update available"),
+        "partial" => ("repair_needed", "Repair needed"),
+        "conflict" => ("unavailable", "Hook name conflict"),
+        _ => ("unavailable", "Status unavailable"),
+    };
+    let view = LifecycleIntegrationView {
+        state: state.to_string(),
+        label: label.to_string(),
+        detail: status.message,
+        config_path: Some(status.config_path),
+        review_required: None,
+    };
+
+    // Repair cannot change Gemini CLI's user-controlled hooksConfig settings.
+    // Keep this as an explicit manual-action state even when local observation
+    // was disabled by a prior uninstall. Once the user enables hooks, the
+    // normal local-observation repair state can be offered if it is needed.
+    if status.hooks_disabled && status.installed {
+        view
+    } else {
+        lifecycle_view_for_enabled_source(view, observation_enabled)
+    }
+}
+
+fn unavailable_gemini_view(error: String, config_path: Option<String>) -> LifecycleIntegrationView {
+    LifecycleIntegrationView {
+        state: "unavailable".to_string(),
+        label: "Status unavailable".to_string(),
+        detail: error,
+        config_path,
+        review_required: None,
+    }
 }
 
 fn codex_view() -> LifecycleIntegrationView {
@@ -1286,29 +1422,51 @@ fn cursor_view() -> LifecycleIntegrationView {
         Err(error) => return unavailable_cursor_view(error, config_path),
     };
     match cursor_integration::cursor_integration_status(&config_dir, &executable) {
-        Ok(status) => {
-            let (state, label) = match status.state.as_str() {
-                "installed" => ("installed", "Installed"),
-                "not_installed" => ("not_installed", "Not installed"),
-                "stale" => ("repair_needed", "Update available"),
-                "partial" => ("repair_needed", "Repair needed"),
-                _ => ("unavailable", "Status unavailable"),
-            };
-            lifecycle_view_for_source(
-                LifecycleIntegrationView {
-                    state: state.to_string(),
-                    label: label.to_string(),
-                    detail: status.message,
-                    config_path: Some(status.config_path),
-                    review_required: None,
-                },
-                IntegrationSource::CursorHooks,
-            )
-        }
+        Ok(status) => cursor_lifecycle_view(
+            status,
+            state::integration_source_is_enabled(IntegrationSource::CursorHooks).unwrap_or(false),
+        ),
         Err(error) => unavailable_cursor_view(
             format!("VSParallel could not safely read the Cursor hook configuration: {error}"),
             config_path,
         ),
+    }
+}
+
+fn cursor_lifecycle_view(
+    status: cursor_integration::CursorIntegrationStatus,
+    observation_enabled: bool,
+) -> LifecycleIntegrationView {
+    let custom_status_line =
+        status.state == "installed" && status.usage_capture_state == "conflict";
+    let (state, label) = if custom_status_line && observation_enabled {
+        (
+            "manual_action_required",
+            "Installed · custom status line kept",
+        )
+    } else {
+        match status.state.as_str() {
+            "installed" => ("installed", "Installed"),
+            "not_installed" => ("not_installed", "Not installed"),
+            "stale" => ("repair_needed", "Update available"),
+            "partial" => ("repair_needed", "Repair needed"),
+            _ => ("unavailable", "Status unavailable"),
+        }
+    };
+    let view = LifecycleIntegrationView {
+        state: state.to_string(),
+        label: label.to_string(),
+        detail: status.message,
+        config_path: Some(status.config_path),
+        review_required: None,
+    };
+
+    if custom_status_line && observation_enabled {
+        // Installing again deliberately preserves a user-owned status line, so
+        // there is no automated repair action to offer for this condition.
+        view
+    } else {
+        lifecycle_view_for_enabled_source(view, observation_enabled)
     }
 }
 
@@ -1512,7 +1670,7 @@ fn validate_macos_integration_location(path: &Path) -> Result<(), String> {
     );
     if mounted_volume || app_translocation {
         return Err(
-            "VSParallel is running from a temporary macOS location. Copy VSParallel.app to /Applications, relaunch it there, then use Repair for the affected editor companions and Cursor, Antigravity, Codex, or Claude Code lifecycle integrations."
+            "VSParallel is running from a temporary macOS location. Copy VSParallel.app to /Applications, relaunch it there, then use Repair for the affected editor companions or provider integrations, including Gemini usage capture."
                 .to_string(),
         );
     }
@@ -3054,6 +3212,8 @@ pub fn run() {
             uninstall_codex_hooks,
             install_claude_hooks,
             uninstall_claude_hooks,
+            install_gemini_usage,
+            uninstall_gemini_usage,
             install_antigravity_hooks,
             uninstall_antigravity_hooks,
             uninstall_all_integrations,
@@ -3467,6 +3627,75 @@ mod tests {
     }
 
     #[test]
+    fn disabled_gemini_hooks_require_manual_action_instead_of_repair() {
+        let status = gemini_integration::GeminiIntegrationStatus {
+            state: "disabled".to_string(),
+            installed: true,
+            config_path: "/config/settings.json".to_string(),
+            backup_path: "/config/settings.json.vsparallel.bak".to_string(),
+            event_states: std::collections::BTreeMap::from([(
+                "AfterModel".to_string(),
+                "current".to_string(),
+            )]),
+            hooks_disabled: true,
+            message: "Enable Gemini CLI hooks manually.".to_string(),
+        };
+
+        for observation_enabled in [false, true] {
+            let view = gemini_lifecycle_view(status.clone(), observation_enabled);
+            assert_eq!(view.state, "manual_action_required");
+            assert_eq!(view.label, "Installed · enable hooks manually");
+            assert_eq!(view.detail, "Enable Gemini CLI hooks manually.");
+            assert_eq!(view.config_path.as_deref(), Some("/config/settings.json"));
+        }
+    }
+
+    #[test]
+    fn custom_cursor_status_line_requires_manual_action_without_overwriting_it() {
+        let status = cursor_integration::CursorIntegrationStatus {
+            state: "installed".to_string(),
+            installed: true,
+            config_path: "/config/hooks.json".to_string(),
+            backup_path: "/config/hooks.json.vsparallel.bak".to_string(),
+            event_states: std::collections::BTreeMap::new(),
+            usage_capture_state: "conflict".to_string(),
+            message: "An existing custom Cursor Agent status line was kept.".to_string(),
+        };
+
+        let view = cursor_lifecycle_view(status.clone(), true);
+        assert_eq!(view.state, "manual_action_required");
+        assert_eq!(view.label, "Installed · custom status line kept");
+        assert_eq!(view.detail, status.message);
+
+        let suppressed = cursor_lifecycle_view(status, false);
+        assert_eq!(suppressed.state, "repair_needed");
+        assert!(suppressed.detail.contains("Local observation is disabled"));
+    }
+
+    #[test]
+    fn gemini_uninstall_accepts_a_remaining_foreign_name_conflict() {
+        let change = gemini_integration::GeminiIntegrationChange {
+            changed: true,
+            migrated: false,
+            status: gemini_integration::GeminiIntegrationStatus {
+                state: "conflict".to_string(),
+                installed: false,
+                config_path: "/config/settings.json".to_string(),
+                backup_path: "/config/settings.json.vsparallel.bak".to_string(),
+                event_states: std::collections::BTreeMap::from([(
+                    "AfterModel".to_string(),
+                    "conflict".to_string(),
+                )]),
+                hooks_disabled: false,
+                message: "A foreign hook keeps the reserved name.".to_string(),
+            },
+        };
+
+        assert!(verify_gemini_change(&change, false).is_ok());
+        assert!(verify_gemini_change(&change, true).is_err());
+    }
+
+    #[test]
     fn integration_executable_must_be_an_absolute_existing_file() {
         assert!(validate_integration_executable(PathBuf::from("relative"), "test").is_err());
 
@@ -3527,6 +3756,7 @@ mod tests {
                     config_path: "/config/hooks.json".to_string(),
                     backup_path: "/config/hooks.json.vsparallel.bak".to_string(),
                     event_states: std::collections::BTreeMap::new(),
+                    usage_capture_state: "current".to_string(),
                     message: message.to_string(),
                 },
             }
@@ -3787,6 +4017,7 @@ mod tests {
             ),
             cursor: lifecycle.clone(),
             antigravity: lifecycle.clone(),
+            gemini: lifecycle.clone(),
             codex,
             claude: lifecycle,
             requires_restart: false,
@@ -3803,5 +4034,6 @@ mod tests {
         assert!(serialized["antigravityIde"].is_object());
         assert_eq!(serialized["cursor"]["state"], "not_installed");
         assert_eq!(serialized["antigravity"]["state"], "not_installed");
+        assert_eq!(serialized["gemini"]["state"], "not_installed");
     }
 }

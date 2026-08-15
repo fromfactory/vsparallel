@@ -1,12 +1,13 @@
 //! Local Cursor lifecycle-hook integration for VSParallel.
 //!
-//! Cursor loads native user hooks from `~/.cursor/hooks.json`. This module
-//! merges one VSParallel-owned command into each of `workspaceOpen`,
-//! `sessionStart`, `beforeSubmitPrompt`, `stop`, and `sessionEnd`, while
-//! preserving every unrelated setting and hook. Hook payloads are consumed
-//! through a capped streaming deserializer: prompt text, responses,
-//! transcripts, attachments, user identity, and tool data are ignored without
-//! becoming part of the persisted data model.
+//! Cursor loads native user hooks from `~/.cursor/hooks.json` and Cursor Agent
+//! CLI settings from `~/.cursor/cli-config.json`. This module merges one
+//! VSParallel-owned command into each lifecycle event and, when no custom
+//! status line exists, installs a context-capacity capture command. Every
+//! unrelated setting and hook is preserved. Payloads are consumed through
+//! capped streaming deserializers: prompt text, responses, transcripts,
+//! attachments, user identity, and tool data are ignored without becoming
+//! part of the persisted data model.
 
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
@@ -25,8 +26,13 @@ use std::os::windows::{ffi::OsStrExt, fs::MetadataExt};
 
 const HOOKS_FILENAME: &str = "hooks.json";
 const BACKUP_FILENAME: &str = "hooks.json.vsparallel.bak";
+const CLI_CONFIG_FILENAME: &str = "cli-config.json";
+const CLI_BACKUP_FILENAME: &str = "cli-config.json.vsparallel.bak";
 const HOOK_ARGUMENT: &str = "cursor-hook";
+const USAGE_ARGUMENT: &str = crate::usage::CURSOR_USAGE_ARGUMENT;
 const HOOK_TIMEOUT_SECONDS: u64 = 2;
+const USAGE_UPDATE_INTERVAL_MS: u64 = 1_000;
+const USAGE_TIMEOUT_MS: u64 = 2_000;
 const CONFIG_VERSION: u64 = 1;
 const SCHEMA_VERSION: u32 = 1;
 const MAX_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
@@ -117,6 +123,25 @@ enum EventState {
     Missing,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UsageCaptureState {
+    Current,
+    Stale,
+    Missing,
+    Conflict,
+}
+
+impl UsageCaptureState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Current => "current",
+            Self::Stale => "stale",
+            Self::Missing => "missing",
+            Self::Conflict => "conflict",
+        }
+    }
+}
+
 impl EventState {
     fn as_str(self) -> &'static str {
         match self {
@@ -127,7 +152,7 @@ impl EventState {
     }
 }
 
-/// Serializable setup status for Cursor's global native hook configuration.
+/// Serializable setup status for Cursor's global native hook and CLI config.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CursorIntegrationStatus {
@@ -136,6 +161,7 @@ pub struct CursorIntegrationStatus {
     pub config_path: String,
     pub backup_path: String,
     pub event_states: BTreeMap<String, String>,
+    pub usage_capture_state: String,
     pub message: String,
 }
 
@@ -176,6 +202,10 @@ struct HookPayload {
     composer_mode: Option<String>,
     #[serde(default)]
     is_background_agent: Option<bool>,
+    #[serde(default)]
+    input_tokens: Option<u64>,
+    #[serde(default)]
+    output_tokens: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -295,18 +325,25 @@ pub fn cursor_config_dir_from_environment() -> Result<PathBuf, String> {
         .map_err(|_| "could not determine the Cursor global configuration directory".to_string())
 }
 
-/// Inspect VSParallel's Cursor hook entries without changing the config file.
+/// Inspect VSParallel's Cursor hook and context-capture entries without changes.
 pub fn cursor_integration_status(
     config_dir: &Path,
     executable: &Path,
 ) -> Result<CursorIntegrationStatus, String> {
     let paths = IntegrationPaths::new(config_dir)?;
     let handlers = managed_handlers(executable)?;
+    let usage_handler = managed_usage_status_line(executable)?;
     let (config, _) = read_config(&paths.config)?;
-    status_from_config(&paths, &config, &handlers)
+    let (cli_config, _) = read_cli_config(&paths.cli_config)?;
+    status_from_config(
+        &paths,
+        &config,
+        &handlers,
+        usage_capture_state(&cli_config, &usage_handler),
+    )
 }
 
-/// Install or repair only VSParallel-owned entries in global `hooks.json`.
+/// Install or repair only VSParallel-owned lifecycle and context entries.
 pub fn install_cursor_integration(
     config_dir: &Path,
     executable: &Path,
@@ -314,55 +351,96 @@ pub fn install_cursor_integration(
     let paths = IntegrationPaths::new(config_dir)?;
     validate_install_executable(executable)?;
     let handlers = managed_handlers(executable)?;
+    let usage_handler = managed_usage_status_line(executable)?;
     let (mut config, original) = read_config(&paths.config)?;
+    let (mut cli_config, cli_original) = read_cli_config(&paths.cli_config)?;
     let existing = event_entries_for_all(&config)?;
     let states = event_states_from_entries(&existing, &handlers);
+    let usage_state = usage_capture_state(&cli_config, &usage_handler);
     let needs_version = !config.contains_key("version");
+    let hooks_need_change =
+        needs_version || states.values().any(|state| *state != EventState::Current);
+    let usage_needs_change = matches!(
+        usage_state,
+        UsageCaptureState::Missing | UsageCaptureState::Stale
+    );
 
-    if !needs_version && states.values().all(|state| *state == EventState::Current) {
+    if !hooks_need_change && !usage_needs_change {
         return Ok(CursorIntegrationChange {
             changed: false,
             migrated: false,
-            status: status_from_states(&paths, states),
+            status: status_from_states(&paths, states, usage_state),
         });
     }
 
-    if needs_version {
-        config.insert("version".to_string(), Value::from(CONFIG_VERSION));
+    // Both files are managed as one setup operation. Validate every backup
+    // target that may be needed before the first external write so a bad CLI
+    // backup cannot leave only the lifecycle half updated (or vice versa).
+    if hooks_need_change {
+        validate_backup_target(&paths.backup)?;
     }
-    let hooks = hooks_map_mut(&mut config, true)?.expect("create=true returns a hooks object");
+    if usage_needs_change {
+        validate_backup_target(&paths.cli_backup)?;
+    }
+
     let mut migrated = false;
-
-    for event in EVENTS {
-        if states[&event] == EventState::Current {
-            continue;
+    if hooks_need_change {
+        if needs_version {
+            config.insert("version".to_string(), Value::from(CONFIG_VERSION));
         }
-        let entries = existing[&event].clone().unwrap_or_default();
-        let (mut filtered, removed) = without_owned_entries(entries, event, &handlers[&event]);
-        migrated |= removed;
-        filtered.push(handlers[&event].clone());
-        hooks.insert(event.config_name().to_string(), Value::Array(filtered));
+        let hooks = hooks_map_mut(&mut config, true)?.expect("create=true returns a hooks object");
+
+        for event in EVENTS {
+            if states[&event] == EventState::Current {
+                continue;
+            }
+            let entries = existing[&event].clone().unwrap_or_default();
+            let (mut filtered, removed) = without_owned_entries(entries, event, &handlers[&event]);
+            migrated |= removed;
+            filtered.push(handlers[&event].clone());
+            hooks.insert(event.config_name().to_string(), Value::Array(filtered));
+        }
+
+        ensure_backup(&paths.backup, &original)?;
+        atomic_write_json(&paths.config, &config)?;
     }
 
-    ensure_backup(&paths.backup, &original)?;
-    atomic_write_json(&paths.config, &config)?;
+    if usage_needs_change {
+        migrated |= usage_state == UsageCaptureState::Stale;
+        cli_config.insert("statusLine".to_string(), usage_handler.clone());
+        ensure_backup(&paths.cli_backup, &cli_original)?;
+        atomic_write_json(&paths.cli_config, &cli_config)?;
+    }
+
     Ok(CursorIntegrationChange {
         changed: true,
         migrated,
-        status: status_from_config(&paths, &config, &handlers)?,
+        status: status_from_config(
+            &paths,
+            &config,
+            &handlers,
+            usage_capture_state(&cli_config, &usage_handler),
+        )?,
     })
 }
 
-/// Remove only VSParallel-owned Cursor handlers and preserve all other config.
+/// Remove only VSParallel-owned Cursor entries and preserve all other config.
 pub fn uninstall_cursor_integration(
     config_dir: &Path,
     executable: &Path,
 ) -> Result<CursorIntegrationChange, String> {
     let paths = IntegrationPaths::new(config_dir)?;
     let handlers = managed_handlers(executable)?;
+    let usage_handler = managed_usage_status_line(executable)?;
     let (mut config, original) = read_config(&paths.config)?;
+    let (mut cli_config, cli_original) = read_cli_config(&paths.cli_config)?;
     let existing = event_entries_for_all(&config)?;
     let mut changed = false;
+    let mut hooks_changed = false;
+    let usage_changed = matches!(
+        usage_capture_state(&cli_config, &usage_handler),
+        UsageCaptureState::Current | UsageCaptureState::Stale
+    );
 
     if let Some(hooks) = hooks_map_mut(&mut config, false)? {
         for event in EVENTS {
@@ -373,19 +451,39 @@ pub fn uninstall_cursor_integration(
             if removed {
                 hooks.insert(event.config_name().to_string(), Value::Array(filtered));
                 changed = true;
+                hooks_changed = true;
             }
         }
     }
 
-    if changed {
+    if hooks_changed {
+        validate_backup_target(&paths.backup)?;
+    }
+    if usage_changed {
+        validate_backup_target(&paths.cli_backup)?;
+    }
+
+    if hooks_changed {
         ensure_backup(&paths.backup, &original)?;
         atomic_write_json(&paths.config, &config)?;
+    }
+
+    if usage_changed {
+        cli_config.remove("statusLine");
+        ensure_backup(&paths.cli_backup, &cli_original)?;
+        atomic_write_json(&paths.cli_config, &cli_config)?;
+        changed = true;
     }
 
     Ok(CursorIntegrationChange {
         changed,
         migrated: false,
-        status: status_from_config(&paths, &config, &handlers)?,
+        status: status_from_config(
+            &paths,
+            &config,
+            &handlers,
+            usage_capture_state(&cli_config, &usage_handler),
+        )?,
     })
 }
 
@@ -425,6 +523,18 @@ fn run_cursor_hook_with<R: Read, W: Write>(
             let _ = writer.write_all(b"{}\n");
             let _ = writer.flush();
             return 0;
+        }
+        if event == CursorHookEvent::Stop {
+            // Only these two counters cross into the usage recorder. Cache
+            // reads/writes are input breakdowns and remain unrepresented;
+            // lifecycle metadata is handled separately below and never enters
+            // the usage record.
+            let _ = crate::usage::capture_cursor_turn_usage(
+                root,
+                changed_at_ms,
+                payload.input_tokens,
+                payload.output_tokens,
+            );
         }
         for (record_key, record) in records_from_payload(event, &payload, changed_at_ms) {
             // Monitoring is observational. Parsing, path, and persistence
@@ -907,6 +1017,8 @@ fn known_agent_kind(value: &str) -> bool {
 struct IntegrationPaths {
     config: PathBuf,
     backup: PathBuf,
+    cli_config: PathBuf,
+    cli_backup: PathBuf,
 }
 
 impl IntegrationPaths {
@@ -919,6 +1031,8 @@ impl IntegrationPaths {
         Ok(Self {
             config: config_dir.join(HOOKS_FILENAME),
             backup: config_dir.join(BACKUP_FILENAME),
+            cli_config: config_dir.join(CLI_CONFIG_FILENAME),
+            cli_backup: config_dir.join(CLI_BACKUP_FILENAME),
         })
     }
 }
@@ -958,6 +1072,29 @@ fn managed_handler(executable: &Path, event: CursorHookEvent) -> Result<Value, S
         "type": "command",
         "command": command,
         "timeout": HOOK_TIMEOUT_SECONDS,
+    }))
+}
+
+fn managed_usage_status_line(executable: &Path) -> Result<Value, String> {
+    if !executable.is_absolute() {
+        return Err("the VSParallel usage executable must be an absolute path".to_string());
+    }
+    let executable = executable
+        .to_str()
+        .ok_or_else(|| "the VSParallel usage executable path is not valid Unicode".to_string())?;
+    if executable.contains(['\0', '\n', '\r']) {
+        return Err("the VSParallel usage executable path contains unsafe characters".to_string());
+    }
+    #[cfg(windows)]
+    let command = format!("{} {USAGE_ARGUMENT}", quote_windows(executable));
+    #[cfg(not(windows))]
+    let command = format!("{} {USAGE_ARGUMENT}", quote_posix(executable));
+    Ok(serde_json::json!({
+        "type": "command",
+        "command": command,
+        "padding": 0,
+        "updateIntervalMs": USAGE_UPDATE_INTERVAL_MS,
+        "timeoutMs": USAGE_TIMEOUT_MS,
     }))
 }
 
@@ -1051,6 +1188,45 @@ fn read_config(path: &Path) -> Result<(Map<String, Value>, Vec<u8>), String> {
     }
     hooks_map(&object)?;
     Ok((object, raw))
+}
+
+fn read_cli_config(path: &Path) -> Result<(Map<String, Value>, Vec<u8>), String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok((Map::new(), b"{}\n".to_vec()));
+        }
+        Err(error) => return Err(format!("could not inspect {}: {error}", path.display())),
+    };
+    if is_link_or_reparse_point(&metadata) || !metadata.is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    if metadata.len() > MAX_CONFIG_BYTES {
+        return Err(format!(
+            "{} exceeds the {} byte safety limit; it was left unchanged",
+            path.display(),
+            MAX_CONFIG_BYTES
+        ));
+    }
+    let raw =
+        fs::read(path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
+    let json_bytes = raw.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(&raw);
+    let value: Value = serde_json::from_slice(json_bytes).map_err(|error| {
+        format!(
+            "{} is not valid UTF-8 JSON; it was left unchanged: {error}",
+            path.display()
+        )
+    })?;
+    value
+        .as_object()
+        .cloned()
+        .map(|object| (object, raw))
+        .ok_or_else(|| {
+            format!(
+                "{} must contain a JSON object; it was left unchanged",
+                path.display()
+            )
+        })
 }
 
 fn hooks_map(config: &Map<String, Value>) -> Result<Option<&Map<String, Value>>, String> {
@@ -1238,17 +1414,100 @@ fn without_owned_entries(
     (filtered, removed)
 }
 
+fn usage_capture_state(config: &Map<String, Value>, current: &Value) -> UsageCaptureState {
+    let Some(candidate) = config.get("statusLine") else {
+        return UsageCaptureState::Missing;
+    };
+    if candidate == current {
+        return UsageCaptureState::Current;
+    }
+    if is_stale_usage_status_line(candidate) {
+        UsageCaptureState::Stale
+    } else {
+        UsageCaptureState::Conflict
+    }
+}
+
+fn is_stale_usage_status_line(candidate: &Value) -> bool {
+    let Some(object) = candidate.as_object() else {
+        return false;
+    };
+    const ALLOWED_KEYS: [&str; 5] = [
+        "type",
+        "command",
+        "padding",
+        "updateIntervalMs",
+        "timeoutMs",
+    ];
+    if object.len() > ALLOWED_KEYS.len()
+        || object
+            .keys()
+            .any(|key| !ALLOWED_KEYS.contains(&key.as_str()))
+        || object.get("type").and_then(Value::as_str) != Some("command")
+    {
+        return false;
+    }
+    object
+        .get("command")
+        .and_then(Value::as_str)
+        .is_some_and(command_targets_vsparallel_usage)
+}
+
+fn command_targets_vsparallel_usage(command: &str) -> bool {
+    if command.is_empty()
+        || command.len() > MAX_WORKSPACE_PATH_BYTES
+        || command.contains(['\0', '\n', '\r'])
+    {
+        return false;
+    }
+    let suffix = format!(" {USAGE_ARGUMENT}");
+    let Some(executable_word) = command.strip_suffix(&suffix) else {
+        return false;
+    };
+    let executable = parse_exact_executable_word(executable_word);
+    executable
+        .as_deref()
+        .is_some_and(historical_vsparallel_executable)
+}
+
+fn parse_exact_executable_word(value: &str) -> Option<String> {
+    if value.is_empty() {
+        return None;
+    }
+
+    #[cfg(not(windows))]
+    if value.starts_with('\'') {
+        return parse_posix_single_quoted_word(value);
+    }
+
+    #[cfg(windows)]
+    if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
+        let inner = &value[1..value.len() - 1];
+        return (!inner.contains('"')).then(|| inner.to_string());
+    }
+
+    (!value.chars().any(char::is_whitespace)
+        && !value.contains(['\'', '"', ';', '&', '|', '`', '$', '<', '>', '(', ')']))
+    .then(|| value.to_string())
+}
+
 fn status_from_config(
     paths: &IntegrationPaths,
     config: &Map<String, Value>,
     handlers: &BTreeMap<CursorHookEvent, Value>,
+    usage_state: UsageCaptureState,
 ) -> Result<CursorIntegrationStatus, String> {
-    Ok(status_from_states(paths, event_states(config, handlers)?))
+    Ok(status_from_states(
+        paths,
+        event_states(config, handlers)?,
+        usage_state,
+    ))
 }
 
 fn status_from_states(
     paths: &IntegrationPaths,
     states: BTreeMap<CursorHookEvent, EventState>,
+    usage_state: UsageCaptureState,
 ) -> CursorIntegrationStatus {
     let current = states
         .values()
@@ -1258,7 +1517,7 @@ fn status_from_states(
         .values()
         .filter(|state| **state == EventState::Stale)
         .count();
-    let state = if current == EVENTS.len() {
+    let hook_state = if current == EVENTS.len() {
         "installed"
     } else if current == 0 && stale == 0 {
         "not_installed"
@@ -1267,12 +1526,35 @@ fn status_from_states(
     } else {
         "partial"
     };
-    let message = match state {
+    let state = match (hook_state, usage_state) {
+        ("installed", UsageCaptureState::Current | UsageCaptureState::Conflict) => "installed",
+        ("installed", UsageCaptureState::Missing | UsageCaptureState::Stale) => "partial",
+        ("not_installed", UsageCaptureState::Current | UsageCaptureState::Stale) => "partial",
+        _ => hook_state,
+    };
+    let mut message = match state {
         "installed" => "Cursor workspace and agent monitoring is installed.",
         "not_installed" => "Cursor workspace and agent monitoring is not installed.",
         "stale" => "An older VSParallel Cursor integration can be repaired.",
         _ => "Cursor workspace and agent monitoring is only partially installed.",
-    };
+    }
+    .to_string();
+    match usage_state {
+        UsageCaptureState::Current => {
+            message.push_str(" Cursor Agent CLI context capture is installed.");
+        }
+        UsageCaptureState::Stale => {
+            message.push_str(" Cursor Agent CLI context capture needs repair.");
+        }
+        UsageCaptureState::Missing => {
+            message.push_str(" Cursor Agent CLI context capture is not installed.");
+        }
+        UsageCaptureState::Conflict => {
+            message.push_str(
+                " An existing custom Cursor Agent status line was kept; context capture is disabled.",
+            );
+        }
+    }
     CursorIntegrationStatus {
         state: state.to_string(),
         installed: state == "installed",
@@ -1282,7 +1564,8 @@ fn status_from_states(
             .into_iter()
             .map(|(event, state)| (event.config_name().to_string(), state.as_str().to_string()))
             .collect(),
-        message: message.to_string(),
+        usage_capture_state: usage_state.as_str().to_string(),
+        message,
     }
 }
 
@@ -1326,6 +1609,17 @@ fn ensure_backup(path: &Path, original: &[u8]) -> Result<bool, String> {
             }
         }
         Err(error) => Err(format!("could not create {}: {error}", path.display())),
+    }
+}
+
+fn validate_backup_target(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if is_link_or_reparse_point(&metadata) || !metadata.is_file() => {
+            Err(format!("{} is not a regular file", path.display()))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("could not inspect {}: {error}", path.display())),
     }
 }
 
@@ -1804,6 +2098,10 @@ mod tests {
         serde_json::from_slice(&fs::read(config_dir.join(HOOKS_FILENAME)).unwrap()).unwrap()
     }
 
+    fn parse_cli_config(config_dir: &Path) -> Value {
+        serde_json::from_slice(&fs::read(config_dir.join(CLI_CONFIG_FILENAME)).unwrap()).unwrap()
+    }
+
     fn hook_with_root(
         event: CursorHookEvent,
         input: &str,
@@ -2093,6 +2391,79 @@ mod tests {
             assert_eq!(output, b"{}\n");
             assert_eq!(records(temp.path())[0].1["state"], expected);
         }
+    }
+
+    #[test]
+    fn stop_hook_captures_turn_tokens_without_content_or_cache_breakdowns() {
+        let temp = TempDir::new().unwrap();
+        let input = json!({
+            "conversation_id":"private-conversation",
+            "generation_id":"private-generation",
+            "workspace_roots":[temp.path().join("workspace")],
+            "model":"private-model",
+            "status":"completed",
+            "input_tokens":191_000,
+            "output_tokens":2_345,
+            "cache_read_tokens":176_000,
+            "cache_write_tokens":12_000,
+            "text":"SECRET RESPONSE CONTENT"
+        });
+
+        let (code, output) = hook_with_root(
+            CursorHookEvent::Stop,
+            &input.to_string(),
+            temp.path(),
+            20_000,
+        );
+        assert_eq!(code, 0);
+        assert_eq!(output, b"{}\n");
+
+        let path = temp.path().join("usage").join("cursor-turn.json");
+        let persisted = fs::read_to_string(path).unwrap();
+        let record: Value = serde_json::from_str(&persisted).unwrap();
+        assert_eq!(record.as_object().unwrap().len(), 3);
+        assert_eq!(record["schemaVersion"], 1);
+        assert_eq!(record["capturedAtMs"], 20_000);
+        assert_eq!(record["totalTokens"], 193_345);
+        for secret in [
+            "private-conversation",
+            "private-generation",
+            "private-model",
+            "SECRET RESPONSE CONTENT",
+            "cache_read_tokens",
+            "cache_write_tokens",
+        ] {
+            assert!(!persisted.contains(secret), "persisted {secret}");
+        }
+    }
+
+    #[test]
+    fn disabled_cursor_source_does_not_capture_turn_tokens() {
+        let temp = TempDir::new().unwrap();
+        crate::state::set_integration_source_enabled_at(
+            temp.path(),
+            crate::state::IntegrationSource::CursorHooks,
+            false,
+        )
+        .unwrap();
+        let input = json!({
+            "conversation_id":"private-conversation",
+            "workspace_roots":[temp.path().join("workspace")],
+            "status":"completed",
+            "input_tokens":100,
+            "output_tokens":25
+        });
+
+        let (code, output) = hook_with_root(
+            CursorHookEvent::Stop,
+            &input.to_string(),
+            temp.path(),
+            20_000,
+        );
+        assert_eq!(code, 0);
+        assert_eq!(output, b"{}\n");
+        assert!(!temp.path().join("usage").join("cursor-turn.json").exists());
+        assert!(!temp.path().join("cursor").exists());
     }
 
     #[test]
@@ -2489,6 +2860,7 @@ mod tests {
         assert!(installed.changed);
         assert!(!installed.migrated);
         assert!(installed.status.installed);
+        assert_eq!(installed.status.usage_capture_state, "current");
         assert_eq!(installed.status.event_states["workspaceOpen"], "current");
         assert_eq!(installed.status.event_states["sessionEnd"], "current");
         let config = parse_config(&config_dir);
@@ -2516,11 +2888,110 @@ mod tests {
             fs::read(config_dir.join(BACKUP_FILENAME)).unwrap(),
             original
         );
+        let cli_config = parse_cli_config(&config_dir);
+        assert_eq!(
+            cli_config["statusLine"],
+            managed_usage_status_line(&executable).unwrap()
+        );
+        assert_eq!(
+            fs::read(config_dir.join(CLI_BACKUP_FILENAME)).unwrap(),
+            b"{}\n"
+        );
 
         let backup = fs::read(config_dir.join(BACKUP_FILENAME)).unwrap();
         let second = install_cursor_integration(&config_dir, &executable).unwrap();
         assert!(!second.changed);
         assert_eq!(fs::read(config_dir.join(BACKUP_FILENAME)).unwrap(), backup);
+    }
+
+    #[test]
+    fn custom_cursor_status_line_is_reported_and_never_overwritten() {
+        let temp = TempDir::new().unwrap();
+        let config_dir = temp.path().join(".cursor");
+        let executable = executable(temp.path());
+        let custom = json!({
+            "type":"command",
+            "command":"custom-context-renderer",
+            "updateIntervalMs":5_000,
+            "privateSetting":"keep-me"
+        });
+        write_json(
+            &config_dir.join(CLI_CONFIG_FILENAME),
+            &json!({"theme":"custom","statusLine":custom.clone()}),
+        );
+        let before = fs::read(config_dir.join(CLI_CONFIG_FILENAME)).unwrap();
+
+        let installed = install_cursor_integration(&config_dir, &executable).unwrap();
+        assert!(installed.status.installed);
+        assert_eq!(installed.status.usage_capture_state, "conflict");
+        assert!(installed.status.message.contains("was kept"));
+        assert_eq!(
+            fs::read(config_dir.join(CLI_CONFIG_FILENAME)).unwrap(),
+            before
+        );
+        assert!(!config_dir.join(CLI_BACKUP_FILENAME).exists());
+
+        let removed = uninstall_cursor_integration(&config_dir, &executable).unwrap();
+        assert_eq!(removed.status.usage_capture_state, "conflict");
+        assert_eq!(parse_cli_config(&config_dir)["statusLine"], custom);
+    }
+
+    #[test]
+    fn compound_status_line_that_mentions_vsparallel_is_preserved_as_custom() {
+        let temp = TempDir::new().unwrap();
+        let config_dir = temp.path().join(".cursor");
+        let executable = executable(temp.path());
+        let owned_command = managed_usage_status_line(&executable).unwrap()["command"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let custom = json!({
+            "type":"command",
+            "command":format!("render-custom-context && {owned_command}"),
+            "padding":0,
+            "updateIntervalMs":1_000,
+            "timeoutMs":2_000
+        });
+        write_json(
+            &config_dir.join(CLI_CONFIG_FILENAME),
+            &json!({"statusLine":custom.clone()}),
+        );
+        let before = fs::read(config_dir.join(CLI_CONFIG_FILENAME)).unwrap();
+
+        let installed = install_cursor_integration(&config_dir, &executable).unwrap();
+        assert_eq!(installed.status.usage_capture_state, "conflict");
+        assert_eq!(
+            fs::read(config_dir.join(CLI_CONFIG_FILENAME)).unwrap(),
+            before
+        );
+        assert!(!config_dir.join(CLI_BACKUP_FILENAME).exists());
+
+        let removed = uninstall_cursor_integration(&config_dir, &executable).unwrap();
+        assert_eq!(removed.status.usage_capture_state, "conflict");
+        assert_eq!(parse_cli_config(&config_dir)["statusLine"], custom);
+    }
+
+    #[test]
+    fn missing_context_capture_makes_current_hooks_repairable() {
+        let temp = TempDir::new().unwrap();
+        let config_dir = temp.path().join(".cursor");
+        let executable = executable(temp.path());
+        install_cursor_integration(&config_dir, &executable).unwrap();
+        write_json(
+            &config_dir.join(CLI_CONFIG_FILENAME),
+            &json!({"theme":"keep-me"}),
+        );
+
+        let status = cursor_integration_status(&config_dir, &executable).unwrap();
+        assert_eq!(status.state, "partial");
+        assert!(!status.installed);
+        assert_eq!(status.usage_capture_state, "missing");
+
+        let repaired = install_cursor_integration(&config_dir, &executable).unwrap();
+        assert!(repaired.changed);
+        assert!(repaired.status.installed);
+        assert_eq!(repaired.status.usage_capture_state, "current");
+        assert_eq!(parse_cli_config(&config_dir)["theme"], "keep-me");
     }
 
     #[test]
@@ -2626,6 +3097,31 @@ mod tests {
         ));
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn usage_ownership_requires_one_exact_posix_command() {
+        let executable = "/tmp/owner's app/vsparallel";
+        let owned = format!("{} {USAGE_ARGUMENT}", quote_posix(executable));
+        assert!(command_targets_vsparallel_usage(&owned));
+
+        for custom in [
+            format!("render-custom && {owned}"),
+            format!("{} --compact {USAGE_ARGUMENT}", quote_posix(executable)),
+            format!(
+                "{} > /tmp/context {USAGE_ARGUMENT}",
+                quote_posix(executable)
+            ),
+            format!("{owned} && {owned}"),
+            format!("{owned} extra"),
+            format!("{owned} "),
+        ] {
+            assert!(
+                !command_targets_vsparallel_usage(&custom),
+                "unexpectedly owned: {custom}"
+            );
+        }
+    }
+
     #[test]
     fn uninstall_removes_only_owned_entries() {
         let temp = TempDir::new().unwrap();
@@ -2650,6 +3146,28 @@ mod tests {
             json!([{"command":"also-keep-me"}])
         );
         assert!(!remaining.to_string().contains("cursor-hook"));
+        let cli_config = parse_cli_config(&config_dir);
+        assert!(cli_config.get("statusLine").is_none());
+        assert_eq!(removed.status.usage_capture_state, "missing");
+    }
+
+    #[test]
+    fn malformed_cli_config_prevents_any_installation_changes() {
+        let temp = TempDir::new().unwrap();
+        let config_dir = temp.path().join(".cursor");
+        let executable = executable(temp.path());
+        let original_hooks = json!({"version":1,"theme":"keep-me","hooks":{}});
+        write_json(&config_dir.join(HOOKS_FILENAME), &original_hooks);
+        fs::write(config_dir.join(CLI_CONFIG_FILENAME), b"not json").unwrap();
+        let hooks_before = fs::read(config_dir.join(HOOKS_FILENAME)).unwrap();
+
+        assert!(install_cursor_integration(&config_dir, &executable).is_err());
+        assert_eq!(
+            fs::read(config_dir.join(HOOKS_FILENAME)).unwrap(),
+            hooks_before
+        );
+        assert!(!config_dir.join(BACKUP_FILENAME).exists());
+        assert!(!config_dir.join(CLI_BACKUP_FILENAME).exists());
     }
 
     #[test]
@@ -2714,6 +3232,37 @@ mod tests {
         let before = fs::read(backup_dir.join(HOOKS_FILENAME)).unwrap();
         assert!(install_cursor_integration(&backup_dir, &executable).is_err());
         assert_eq!(fs::read(backup_dir.join(HOOKS_FILENAME)).unwrap(), before);
+        assert_eq!(fs::read(&victim).unwrap(), b"{\"victim\":true}\n");
+
+        let cli_config_dir = temp.path().join("cli-config-link");
+        fs::create_dir_all(&cli_config_dir).unwrap();
+        write_json(
+            &cli_config_dir.join(HOOKS_FILENAME),
+            &json!({"version":1,"hooks":{}}),
+        );
+        symlink(&victim, cli_config_dir.join(CLI_CONFIG_FILENAME)).unwrap();
+        let hooks_before = fs::read(cli_config_dir.join(HOOKS_FILENAME)).unwrap();
+        assert!(install_cursor_integration(&cli_config_dir, &executable).is_err());
+        assert_eq!(
+            fs::read(cli_config_dir.join(HOOKS_FILENAME)).unwrap(),
+            hooks_before
+        );
+        assert_eq!(fs::read(&victim).unwrap(), b"{\"victim\":true}\n");
+
+        let cli_backup_dir = temp.path().join("cli-backup-link");
+        fs::create_dir_all(&cli_backup_dir).unwrap();
+        write_json(
+            &cli_backup_dir.join(HOOKS_FILENAME),
+            &json!({"version":1,"hooks":{}}),
+        );
+        symlink(&victim, cli_backup_dir.join(CLI_BACKUP_FILENAME)).unwrap();
+        let hooks_before = fs::read(cli_backup_dir.join(HOOKS_FILENAME)).unwrap();
+        assert!(install_cursor_integration(&cli_backup_dir, &executable).is_err());
+        assert_eq!(
+            fs::read(cli_backup_dir.join(HOOKS_FILENAME)).unwrap(),
+            hooks_before
+        );
+        assert!(!cli_backup_dir.join(CLI_CONFIG_FILENAME).exists());
         assert_eq!(fs::read(&victim).unwrap(), b"{\"victim\":true}\n");
     }
 
@@ -2796,8 +3345,20 @@ mod tests {
             .permissions()
             .mode()
             & 0o777;
+        let cli_config_mode = fs::metadata(config_dir.join(CLI_CONFIG_FILENAME))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let cli_backup_mode = fs::metadata(config_dir.join(CLI_BACKUP_FILENAME))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(config_mode, 0o600);
         assert_eq!(backup_mode, 0o600);
+        assert_eq!(cli_config_mode, 0o600);
+        assert_eq!(cli_backup_mode, 0o600);
 
         let input = json!({
             "conversation_id":"session",

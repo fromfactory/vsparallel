@@ -1,11 +1,14 @@
-//! Privacy-conscious usage-limit collection for Codex and Claude Code.
+//! Privacy-conscious usage collection for supported local coding agents.
 //!
 //! Codex exposes live limits through its documented app-server protocol. Claude
 //! Code exposes equivalent values through the control channel used by its Agent
 //! SDK; a compact status-line cache remains as a compatibility fallback. In
 //! particular, Claude's session identifier, working directory, transcript path,
 //! and prompt are never represented by the deserialization or persistence types
-//! below.
+//! below. Antigravity quota is queried only through the provider-owned `agy`
+//! read-only command. Gemini, Cursor Agent, and Zed expose local usage signals
+//! rather than personal-plan quota, so their cards are explicitly labelled as
+//! token or context metrics.
 
 use crate::companion_integration::{CodeCliRunner, ProcessCodeCliRunner};
 use serde::{Deserialize, Serialize};
@@ -28,13 +31,18 @@ use std::os::unix::fs::PermissionsExt;
 use std::os::windows::{ffi::OsStrExt, fs::MetadataExt};
 
 pub const CLAUDE_STATUSLINE_ARGUMENT: &str = "claude-usage";
+pub const CURSOR_USAGE_ARGUMENT: &str = "cursor-usage";
 
 const CODEX_EXTENSION_ID: &str = "openai.chatgpt";
 const CLAUDE_EXTENSION_ID: &str = "anthropic.claude-code";
 const USAGE_SCHEMA_VERSION: u32 = 1;
 const CLAUDE_RECORD_SCHEMA_VERSION: u32 = 1;
+const LOCAL_USAGE_RECORD_SCHEMA_VERSION: u32 = 1;
 const CLAUDE_RECORD_DIRECTORY: &str = "usage";
 const CLAUDE_RECORD_FILENAME: &str = "claude.json";
+const GEMINI_RECORD_FILENAME: &str = "gemini.json";
+const CURSOR_RECORD_FILENAME: &str = "cursor.json";
+const CURSOR_TURN_RECORD_FILENAME: &str = "cursor-turn.json";
 const CODEX_PROTOCOL_TIMEOUT: Duration = Duration::from_secs(6);
 const CODEX_OUTPUT_LIMIT: usize = 256 * 1024;
 const CODEX_LINE_LIMIT: usize = 128 * 1024;
@@ -46,8 +54,15 @@ const PROVIDER_GRACEFUL_EXIT_TIMEOUT: Duration = Duration::from_millis(250);
 const PROVIDER_READER_JOIN_TIMEOUT: Duration = Duration::from_millis(250);
 const PROVIDER_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const CLAUDE_INPUT_LIMIT: usize = 256 * 1024;
+const GEMINI_USAGE_INPUT_LIMIT: usize = 32 * 1024 * 1024;
+const CURSOR_USAGE_INPUT_LIMIT: usize = 2 * 1024 * 1024;
 const CLAUDE_RECORD_LIMIT: u64 = 16 * 1024;
+const LOCAL_USAGE_RECORD_LIMIT: u64 = 16 * 1024;
 const CLAUDE_STALE_AFTER_MS: i64 = 15 * 60 * 1_000;
+const LOCAL_USAGE_STALE_AFTER_MS: i64 = 15 * 60 * 1_000;
+const LOCAL_USAGE_EXPIRES_AFTER_MS: i64 = 24 * 60 * 60 * 1_000;
+const ANTIGRAVITY_COMMAND_TIMEOUT: Duration = Duration::from_secs(12);
+const ANTIGRAVITY_OUTPUT_LIMIT: usize = 512 * 1024;
 const PROVIDER_EXTENSION_RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
 const MAX_FUTURE_SKEW_MS: i64 = 5 * 60 * 1_000;
 const AUTOMATIC_SOURCE_PREFIX: &str = "vsparallel-source=automatic;";
@@ -96,8 +111,14 @@ pub struct UsageWindowView {
 pub struct ProviderUsageView {
     /// `available`, `stale`, or `unavailable`.
     pub state: String,
+    /// `quota`, `context`, `tokens`, or `none`.
+    pub metric_kind: String,
     /// The most constrained window, so a single gauge never overstates capacity.
     pub remaining_percent: Option<f64>,
+    /// Present only for an unbounded local token metric.
+    pub token_count: Option<u64>,
+    /// A concise description such as `Latest model call`.
+    pub metric_label: String,
     pub windows: Vec<UsageWindowView>,
     pub updated_at_ms: Option<i64>,
     pub detail: String,
@@ -113,6 +134,10 @@ pub struct UsageSnapshot {
     pub generated_at_ms: i64,
     pub codex: ProviderUsageView,
     pub claude: ProviderUsageView,
+    pub gemini: ProviderUsageView,
+    pub antigravity: ProviderUsageView,
+    pub zed: ProviderUsageView,
+    pub cursor: ProviderUsageView,
 }
 
 /// Injectable boundary around the Codex app-server conversation.
@@ -151,6 +176,15 @@ impl Default for ProcessClaudeUsageRunner {
     }
 }
 
+/// Injectable boundary around Antigravity CLI's documented, read-only
+/// `/usage` JSON command.
+pub trait AntigravityUsageRunner: Sync {
+    fn read_rate_limits(&self, executable: &OsStr) -> Result<Value, String>;
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ProcessAntigravityUsageRunner;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderCommand {
     pub executable: OsString,
@@ -167,6 +201,11 @@ pub fn claude_command() -> ProviderCommand {
     claude_command_from(env::var_os("VSPARALLEL_CLAUDE_COMMAND"))
 }
 
+/// Resolve the official Antigravity CLI without interpreting shell syntax.
+pub fn antigravity_command() -> ProviderCommand {
+    provider_command_from(env::var_os("VSPARALLEL_ANTIGRAVITY_COMMAND"), "agy")
+}
+
 /// Collect a fresh snapshot using the current clock and environment.
 ///
 /// Provider failures are represented in the returned data; a missing executable,
@@ -180,6 +219,7 @@ pub fn get_usage_snapshot() -> UsageSnapshot {
 pub fn build_usage_snapshot(now_ms: i64) -> UsageSnapshot {
     let codex_command = codex_command();
     let claude_command = claude_command();
+    let antigravity_command = antigravity_command();
     let state_root = crate::state::state_dir_from_environment().ok();
     let codex_runner = ProcessCodexUsageRunner {
         allow_extension_fallback: codex_command.allow_extension_fallback,
@@ -187,14 +227,105 @@ pub fn build_usage_snapshot(now_ms: i64) -> UsageSnapshot {
     let claude_runner = ProcessClaudeUsageRunner {
         allow_extension_fallback: claude_command.allow_extension_fallback,
     };
-    build_usage_snapshot_with(
-        &codex_runner,
-        codex_command.executable.as_os_str(),
-        &claude_runner,
-        claude_command.executable.as_os_str(),
-        state_root.as_deref(),
-        now_ms,
-    )
+    let antigravity_runner = ProcessAntigravityUsageRunner;
+
+    let (mut snapshot, antigravity_result, zed_usage) = thread::scope(|scope| {
+        let base = scope.spawn(|| {
+            build_usage_snapshot_with(
+                &codex_runner,
+                codex_command.executable.as_os_str(),
+                &claude_runner,
+                claude_command.executable.as_os_str(),
+                state_root.as_deref(),
+                now_ms,
+            )
+        });
+        let antigravity = scope.spawn(|| {
+            antigravity_runner.read_rate_limits(antigravity_command.executable.as_os_str())
+        });
+        let zed = scope.spawn(|| crate::zed_integration::load_zed_usage_from_environment(now_ms));
+        (
+            base.join()
+                .unwrap_or_else(|_| unavailable_usage_snapshot(now_ms)),
+            antigravity.join().unwrap_or_else(|_| {
+                Err("Antigravity usage worker stopped unexpectedly".to_string())
+            }),
+            zed.join().ok().flatten(),
+        )
+    });
+
+    snapshot.antigravity = match antigravity_result {
+        Ok(result) => antigravity_provider_view(&result, now_ms).unwrap_or_else(|| {
+            unavailable_provider(
+                "Antigravity returned no compatible quota buckets. Update Antigravity CLI, then refresh usage.",
+            )
+        }),
+        Err(error) => unavailable_provider(&antigravity_failure_detail(&error)),
+    };
+    snapshot.zed = zed_usage
+        .map(|usage| {
+            token_provider(
+                usage.total_tokens,
+                usage.updated_at_ms,
+                "Latest native thread",
+                "Local tokens recorded by Zed; this is not plan or billing quota.",
+                now_ms,
+            )
+        })
+        .unwrap_or_else(|| {
+            unavailable_provider(
+                "No native Zed Agent token record is available yet. Start a Zed Agent turn, then refresh.",
+            )
+        });
+    snapshot.gemini = reconcile_gemini_integration_status(
+        snapshot.gemini,
+        current_gemini_integration_status().ok().as_ref(),
+    );
+    snapshot
+}
+
+fn current_gemini_integration_status(
+) -> Result<crate::gemini_integration::GeminiIntegrationStatus, String> {
+    let config_dir = crate::gemini_integration::gemini_config_dir_from_environment()?;
+    let executable = crate::integration_executable()?;
+    crate::gemini_integration::gemini_integration_status(&config_dir, &executable)
+}
+
+fn reconcile_gemini_integration_status(
+    mut usage: ProviderUsageView,
+    status: Option<&crate::gemini_integration::GeminiIntegrationStatus>,
+) -> ProviderUsageView {
+    let Some(status) = status else {
+        return usage;
+    };
+    let lifecycle_detail = match status.state.as_str() {
+        "not_installed" => Some(
+            "Gemini usage capture is not installed. Install it in Setup & diagnostics, restart Gemini CLI, then start a new turn.",
+        ),
+        "disabled" => Some(
+            "Gemini usage capture is installed, but Gemini CLI settings disable hooks. Enable hooks in Gemini CLI settings, restart Gemini CLI, then start a new turn.",
+        ),
+        "stale" => Some(
+            "The Gemini usage hook needs repair. Repair it in Setup & diagnostics, restart Gemini CLI, then start a new turn.",
+        ),
+        "conflict" => Some(
+            "The Gemini usage hook name conflicts with another command. Resolve the conflict shown in Setup & diagnostics before starting a new turn.",
+        ),
+        _ => None,
+    };
+    let Some(lifecycle_detail) = lifecycle_detail else {
+        return usage;
+    };
+
+    if usage.token_count.is_none() {
+        return unavailable_provider(lifecycle_detail);
+    }
+
+    // Preserve the last privacy-filtered token count, but do not present it as
+    // current when the hook that refreshes it cannot run.
+    usage.state = "stale".to_string();
+    usage.detail = lifecycle_detail.to_string();
+    usage
 }
 
 /// Testable snapshot builder with injected process and state boundaries.
@@ -264,11 +395,60 @@ pub fn build_usage_snapshot_with<
         })
         .unwrap_or_else(|| unavailable_provider(&claude_error));
 
+    let gemini = state_root
+        .filter(|root| {
+            crate::state::integration_source_is_enabled_at(
+                root,
+                crate::state::IntegrationSource::GeminiUsage,
+            )
+        })
+        .map(|root| load_gemini_usage(root, now_ms))
+        .unwrap_or_else(|| {
+            unavailable_provider(
+                "Gemini token capture is disabled. Enable it in Setup & diagnostics.",
+            )
+        });
+    let cursor = state_root
+        .filter(|root| {
+            crate::state::integration_source_is_enabled_at(
+                root,
+                crate::state::IntegrationSource::CursorHooks,
+            )
+        })
+        .map(|root| load_cursor_usage(root, now_ms))
+        .unwrap_or_else(|| {
+            unavailable_provider(
+                "Cursor Agent context capture is disabled. Enable Cursor monitoring in Setup & diagnostics.",
+            )
+        });
+
     UsageSnapshot {
         schema_version: USAGE_SCHEMA_VERSION,
         generated_at_ms: now_ms,
         codex,
         claude,
+        gemini,
+        antigravity: unavailable_provider(
+            "Install Antigravity CLI 1.1.11 or newer to view model quota.",
+        ),
+        zed: unavailable_provider(
+            "No native Zed Agent token record is available yet. Start a Zed Agent turn, then refresh.",
+        ),
+        cursor,
+    }
+}
+
+fn unavailable_usage_snapshot(now_ms: i64) -> UsageSnapshot {
+    let unavailable = || unavailable_provider("Usage collection stopped unexpectedly.");
+    UsageSnapshot {
+        schema_version: USAGE_SCHEMA_VERSION,
+        generated_at_ms: now_ms,
+        codex: unavailable(),
+        claude: unavailable(),
+        gemini: unavailable(),
+        antigravity: unavailable(),
+        zed: unavailable(),
+        cursor: unavailable(),
     }
 }
 
@@ -343,6 +523,198 @@ impl ClaudeUsageRunner for ProcessClaudeUsageRunner {
         };
         result.map_err(|error| tag_provider_failure(error, self.allow_extension_fallback))
     }
+}
+
+impl AntigravityUsageRunner for ProcessAntigravityUsageRunner {
+    fn read_rate_limits(&self, executable: &OsStr) -> Result<Value, String> {
+        antigravity_usage_request(executable)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AntigravityCliResponse {
+    status: String,
+    #[serde(default)]
+    command: Option<AntigravityCliCommand>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AntigravityCliCommand {
+    name: String,
+    #[serde(default)]
+    data: Option<AntigravityCliUsageData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AntigravityCliUsageData {
+    #[serde(default)]
+    groups: Vec<AntigravityCliUsageGroup>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AntigravityCliUsageGroup {
+    #[serde(default)]
+    buckets: Vec<AntigravityCliUsageBucket>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AntigravityCliUsageBucket {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    window: String,
+    #[serde(default)]
+    remaining_fraction: Option<f64>,
+    #[serde(default)]
+    reset_time: Option<String>,
+}
+
+/// Invoke only the official, read-only Antigravity slash command introduced in
+/// CLI 1.1.11. The broad response is immediately narrowed to display-safe
+/// bucket fields; authentication data is never read by VSParallel.
+fn antigravity_usage_request(executable: &OsStr) -> Result<Value, String> {
+    antigravity_usage_request_with_timeout(executable, ANTIGRAVITY_COMMAND_TIMEOUT)
+}
+
+fn antigravity_usage_request_with_timeout(
+    executable: &OsStr,
+    command_timeout: Duration,
+) -> Result<Value, String> {
+    let mut command = Command::new(executable);
+    command
+        .args(["-p", "/usage", "--output-format", "json"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|_| "could not start Antigravity CLI".to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "could not read Antigravity CLI output".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "could not read Antigravity CLI diagnostics".to_string())?;
+    let (stdout_sender, stdout_receiver) = mpsc::sync_channel(1);
+    let (stderr_sender, stderr_receiver) = mpsc::sync_channel(1);
+    let _stdout_reader = thread::spawn(move || {
+        let _ = stdout_sender.send(read_capped_bytes(stdout, ANTIGRAVITY_OUTPUT_LIMIT));
+    });
+    let _stderr_reader = thread::spawn(move || {
+        let _ = stderr_sender.send(drain_capped(stderr, ANTIGRAVITY_OUTPUT_LIMIT).map(|_| ()));
+    });
+    let deadline = Instant::now() + command_timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(PROVIDER_EXIT_POLL_INTERVAL);
+            }
+            Ok(None) => {
+                let _ = terminate_and_reap(&mut child);
+                return Err("Antigravity CLI usage request timed out".to_string());
+            }
+            Err(_) => {
+                let _ = terminate_and_reap(&mut child);
+                return Err("Antigravity CLI stopped unexpectedly".to_string());
+            }
+        }
+    };
+    if !status.success() {
+        // A descendant may still own an inherited pipe even though the CLI
+        // process has exited. Best-effort group termination keeps that work
+        // from lingering; the detached readers never hold up this refresh.
+        let _ = terminate_child(&mut child);
+        return Err("Antigravity CLI rejected the usage request".to_string());
+    }
+    let stdout =
+        match stdout_receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(Ok(stdout)) => stdout,
+            Ok(Err(_)) => {
+                let _ = terminate_child(&mut child);
+                return Err("Antigravity CLI output exceeded its safety limit".to_string());
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let _ = terminate_child(&mut child);
+                return Err("Antigravity CLI usage request timed out".to_string());
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = terminate_child(&mut child);
+                return Err("Antigravity CLI output reader stopped unexpectedly".to_string());
+            }
+        };
+    match stderr_receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            let _ = terminate_child(&mut child);
+            return Err("Antigravity CLI diagnostics exceeded their safety limit".to_string());
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            let _ = terminate_child(&mut child);
+            return Err("Antigravity CLI usage request timed out".to_string());
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = terminate_child(&mut child);
+            return Err("Antigravity CLI diagnostic reader stopped unexpectedly".to_string());
+        }
+    }
+
+    parse_antigravity_usage_output(&stdout)
+}
+
+fn parse_antigravity_usage_output(stdout: &[u8]) -> Result<Value, String> {
+    let response: AntigravityCliResponse = serde_json::from_slice(stdout)
+        .map_err(|_| "Antigravity CLI returned malformed usage output".to_string())?;
+    if response.status != "SUCCESS" {
+        return Err("Antigravity CLI did not return a successful usage result".to_string());
+    }
+    let command = response
+        .command
+        .filter(|command| command.name == "usage")
+        .ok_or_else(|| "Antigravity CLI returned a different command result".to_string())?;
+    let data = command
+        .data
+        .ok_or_else(|| "Antigravity CLI usage result had no quota data".to_string())?;
+    let buckets: Vec<Value> = data
+        .groups
+        .into_iter()
+        .flat_map(|group| group.buckets)
+        .take(64)
+        .filter_map(|bucket| {
+            let remaining_fraction = bucket
+                .remaining_fraction
+                .filter(|value| value.is_finite())?;
+            let name = bounded_display_value(&bucket.name, 128)
+                .or_else(|| bounded_display_value(&bucket.id, 128))?;
+            let window = bounded_display_value(&bucket.window, 128).unwrap_or_default();
+            let reset_time = bucket
+                .reset_time
+                .as_deref()
+                .and_then(|value| bounded_display_value(value, 128));
+            Some(json!({
+                "name": name,
+                "window": window,
+                "remainingFraction": remaining_fraction,
+                "resetTime": reset_time,
+            }))
+        })
+        .collect();
+    Ok(json!({ "buckets": buckets }))
+}
+
+fn bounded_display_value(value: &str, maximum_bytes: usize) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty() && value.len() <= maximum_bytes && !value.chars().any(char::is_control))
+        .then(|| value.to_string())
 }
 
 fn tag_provider_failure(error: String, automatic: bool) -> String {
@@ -1169,6 +1541,18 @@ fn drain_capped(mut reader: impl Read, limit: usize) -> io::Result<usize> {
     ))
 }
 
+fn read_capped_bytes(reader: impl Read, limit: usize) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(limit.min(16 * 1024));
+    reader.take((limit + 1) as u64).read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "provider process output exceeded its safety limit",
+        ));
+    }
+    Ok(bytes)
+}
+
 fn codex_provider_view(result: &Value, now_ms: i64) -> Option<ProviderUsageView> {
     let selected = result
         .get("rateLimitsByLimitId")
@@ -1238,6 +1622,49 @@ fn claude_provider_view(result: &Value, now_ms: i64) -> Option<ProviderUsageView
     )
 }
 
+fn antigravity_provider_view(result: &Value, now_ms: i64) -> Option<ProviderUsageView> {
+    let buckets = result.get("buckets")?.as_array()?;
+    let mut windows = Vec::with_capacity(buckets.len().min(64));
+    for bucket in buckets.iter().take(64) {
+        let remaining_fraction = finite_number(bucket.get("remainingFraction")?)?;
+        let remaining_percent = (remaining_fraction * 100.0).clamp(0.0, 100.0);
+        let name = bucket
+            .get("name")
+            .and_then(Value::as_str)
+            .and_then(|value| bounded_display_value(value, 128))?;
+        let window = bucket
+            .get("window")
+            .and_then(Value::as_str)
+            .and_then(|value| bounded_display_value(value, 128));
+        let label = window
+            .filter(|value| {
+                !name
+                    .to_ascii_lowercase()
+                    .contains(&value.to_ascii_lowercase())
+            })
+            .map_or(name.clone(), |value| format!("{name} · {value}"));
+        let resets_at_ms = bucket
+            .get("resetTime")
+            .and_then(Value::as_str)
+            .and_then(rfc3339_to_millis);
+        if resets_at_ms.is_some_and(|reset| reset <= now_ms) {
+            continue;
+        }
+        windows.push(usage_window(
+            label,
+            None,
+            100.0 - remaining_percent,
+            resets_at_ms,
+        ));
+    }
+    provider_from_windows(
+        windows,
+        now_ms,
+        "Live model quota from the official Antigravity CLI.",
+        "available",
+    )
+}
+
 fn claude_live_window_view(
     value: &Value,
     duration_minutes: i64,
@@ -1262,6 +1689,11 @@ fn claude_reset_to_millis(value: &Value) -> Option<i64> {
         return seconds_to_millis(seconds);
     }
     let timestamp = OffsetDateTime::parse(value.as_str()?, &Rfc3339).ok()?;
+    seconds_to_millis(timestamp.unix_timestamp())?.checked_add(i64::from(timestamp.millisecond()))
+}
+
+fn rfc3339_to_millis(value: &str) -> Option<i64> {
+    let timestamp = OffsetDateTime::parse(value, &Rfc3339).ok()?;
     seconds_to_millis(timestamp.unix_timestamp())?.checked_add(i64::from(timestamp.millisecond()))
 }
 
@@ -1308,13 +1740,17 @@ fn provider_from_windows(
     detail: &str,
     state: &str,
 ) -> Option<ProviderUsageView> {
-    let remaining_percent = windows
+    let limiting_window = windows
         .iter()
-        .map(|window| window.remaining_percent)
-        .reduce(f64::min)?;
+        .min_by(|left, right| left.remaining_percent.total_cmp(&right.remaining_percent))?;
+    let remaining_percent = limiting_window.remaining_percent;
+    let metric_label = limiting_window.label.clone();
     Some(ProviderUsageView {
         state: state.to_string(),
+        metric_kind: "quota".to_string(),
         remaining_percent: Some(remaining_percent),
+        token_count: None,
+        metric_label,
         windows,
         updated_at_ms: Some(updated_at_ms),
         detail: detail.to_string(),
@@ -1324,9 +1760,81 @@ fn provider_from_windows(
 fn unavailable_provider(detail: &str) -> ProviderUsageView {
     ProviderUsageView {
         state: "unavailable".to_string(),
+        metric_kind: "none".to_string(),
         remaining_percent: None,
+        token_count: None,
+        metric_label: String::new(),
         windows: Vec::new(),
         updated_at_ms: None,
+        detail: detail.to_string(),
+    }
+}
+
+fn token_provider(
+    token_count: u64,
+    updated_at_ms: i64,
+    metric_label: &str,
+    detail: &str,
+    now_ms: i64,
+) -> ProviderUsageView {
+    let age_ms = now_ms.saturating_sub(updated_at_ms);
+    if updated_at_ms < 0
+        || updated_at_ms > now_ms.saturating_add(MAX_FUTURE_SKEW_MS)
+        || age_ms > LOCAL_USAGE_EXPIRES_AFTER_MS
+    {
+        return unavailable_provider(detail);
+    }
+    ProviderUsageView {
+        state: if age_ms > LOCAL_USAGE_STALE_AFTER_MS {
+            "stale".to_string()
+        } else {
+            "available".to_string()
+        },
+        metric_kind: "tokens".to_string(),
+        remaining_percent: None,
+        token_count: Some(token_count),
+        metric_label: metric_label.to_string(),
+        windows: Vec::new(),
+        updated_at_ms: Some(updated_at_ms),
+        detail: detail.to_string(),
+    }
+}
+
+fn context_provider(
+    remaining_percent: f64,
+    updated_at_ms: i64,
+    metric_label: &str,
+    detail: &str,
+    now_ms: i64,
+) -> ProviderUsageView {
+    if !remaining_percent.is_finite() {
+        return unavailable_provider(detail);
+    }
+    let age_ms = now_ms.saturating_sub(updated_at_ms);
+    if updated_at_ms < 0
+        || updated_at_ms > now_ms.saturating_add(MAX_FUTURE_SKEW_MS)
+        || age_ms > LOCAL_USAGE_EXPIRES_AFTER_MS
+    {
+        return unavailable_provider(detail);
+    }
+    let remaining_percent = remaining_percent.clamp(0.0, 100.0);
+    ProviderUsageView {
+        state: if age_ms > LOCAL_USAGE_STALE_AFTER_MS {
+            "stale".to_string()
+        } else {
+            "available".to_string()
+        },
+        metric_kind: "context".to_string(),
+        remaining_percent: Some(remaining_percent),
+        token_count: None,
+        metric_label: metric_label.to_string(),
+        windows: vec![usage_window(
+            metric_label.to_string(),
+            None,
+            100.0 - remaining_percent,
+            None,
+        )],
+        updated_at_ms: Some(updated_at_ms),
         detail: detail.to_string(),
     }
 }
@@ -1381,6 +1889,18 @@ fn provider_failure_detail(
         );
     }
     fallback.to_string()
+}
+
+fn antigravity_failure_detail(error: &str) -> String {
+    let normalized = error.to_ascii_lowercase();
+    if normalized.contains("timed out") || normalized.contains("stopped") {
+        return "Antigravity CLI did not answer the read-only usage request. Try again after opening or signing in to Antigravity.".to_string();
+    }
+    if normalized.contains("malformed") || normalized.contains("different command") {
+        return "Antigravity CLI returned incompatible usage data. Update Antigravity CLI, then refresh usage.".to_string();
+    }
+    "Install or update Antigravity CLI to 1.1.11 or newer and sign in to view model quota."
+        .to_string()
 }
 
 fn codex_command_from(value: Option<OsString>) -> ProviderCommand {
@@ -1603,30 +2123,429 @@ fn write_claude_record(path: &Path, record: &ClaudeUsageRecord) -> Result<(), St
     atomic_write_bytes(path, &bytes)
 }
 
+/// Fail-open entry point for Gemini CLI's documented `AfterModel` hook.
+pub fn run_gemini_usage_stdio() -> i32 {
+    let state_root = crate::state::state_dir_from_environment().ok();
+    run_gemini_usage(
+        io::stdin().lock(),
+        io::stdout().lock(),
+        state_root.as_deref(),
+        crate::state::now_ms(),
+    )
+}
+
+/// Capture only the stable numeric token total and return a valid, silent hook
+/// response. Full request/response content is streamed past `IgnoredAny` by
+/// Serde and is never persisted or returned.
+pub fn run_gemini_usage<R: Read, W: Write>(
+    input: R,
+    mut output: W,
+    state_root: Option<&Path>,
+    captured_at_ms: i64,
+) -> i32 {
+    if let Some(root) = state_root.filter(|root| {
+        crate::state::integration_source_is_enabled_at(
+            root,
+            crate::state::IntegrationSource::GeminiUsage,
+        )
+    }) {
+        let _ = capture_gemini_usage(input, root, captured_at_ms);
+    }
+    let _ = output.write_all(b"{\"suppressOutput\":true}\n");
+    let _ = output.flush();
+    0
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiAfterModelInput {
+    hook_event_name: String,
+    llm_response: GeminiLlmResponse,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiLlmResponse {
+    #[serde(rename = "usageMetadata")]
+    usage_metadata: Option<GeminiUsageMetadata>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GeminiUsageMetadata {
+    #[serde(rename = "totalTokenCount")]
+    total_token_count: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct GeminiUsageRecord {
+    schema_version: u32,
+    captured_at_ms: i64,
+    total_tokens: u64,
+}
+
+fn capture_gemini_usage(
+    input: impl Read,
+    state_root: &Path,
+    captured_at_ms: i64,
+) -> Result<(), String> {
+    if captured_at_ms < 0 {
+        return Err("Gemini usage timestamp was invalid".to_string());
+    }
+    // AfterModel includes the original request, so a legitimate long-context
+    // event can be much larger than the tiny field retained below. Serde still
+    // streams ignored request/response content without representing it in our
+    // input type; the larger cap bounds total work while accommodating current
+    // long-context Gemini models.
+    let mut deserializer =
+        serde_json::Deserializer::from_reader(input.take((GEMINI_USAGE_INPUT_LIMIT + 1) as u64));
+    let payload = GeminiAfterModelInput::deserialize(&mut deserializer)
+        .map_err(|_| "Gemini usage input was malformed".to_string())?;
+    deserializer
+        .end()
+        .map_err(|_| "Gemini usage input exceeded its safety limit".to_string())?;
+    if payload.hook_event_name != "AfterModel" {
+        return Err("Gemini usage input was not an AfterModel event".to_string());
+    }
+    let total_tokens = payload
+        .llm_response
+        .usage_metadata
+        .map(|usage| usage.total_token_count)
+        .ok_or_else(|| "Gemini usage input had no final token total".to_string())?;
+    let record = GeminiUsageRecord {
+        schema_version: LOCAL_USAGE_RECORD_SCHEMA_VERSION,
+        captured_at_ms,
+        total_tokens,
+    };
+    write_local_usage_record(&gemini_record_path(state_root), &record, "Gemini")
+}
+
+fn gemini_record_path(state_root: &Path) -> PathBuf {
+    state_root
+        .join(CLAUDE_RECORD_DIRECTORY)
+        .join(GEMINI_RECORD_FILENAME)
+}
+
+fn load_gemini_usage(state_root: &Path, now_ms: i64) -> ProviderUsageView {
+    let detail = "Latest Gemini CLI model-call tokens; this is not subscription quota. Run /stats model in Gemini CLI for its live quota view.";
+    let Some(record) =
+        read_local_usage_record::<GeminiUsageRecord>(&gemini_record_path(state_root), now_ms)
+    else {
+        return unavailable_provider(
+            "No Gemini token capture yet. Enable the Gemini usage hook in Setup & diagnostics, then start a new turn. Gemini CLI shows live quota through /stats model.",
+        );
+    };
+    if record.schema_version != LOCAL_USAGE_RECORD_SCHEMA_VERSION {
+        return unavailable_provider(
+            "The Gemini usage capture is incompatible. Repair the Gemini integration in Setup & diagnostics.",
+        );
+    }
+    token_provider(
+        record.total_tokens,
+        record.captured_at_ms,
+        "Latest model call",
+        detail,
+        now_ms,
+    )
+}
+
+/// Fail-open entry point for Cursor Agent's documented custom status line.
+pub fn run_cursor_usage_stdio() -> i32 {
+    let state_root = crate::state::state_dir_from_environment().ok();
+    run_cursor_usage(
+        io::stdin().lock(),
+        io::stdout().lock(),
+        state_root.as_deref(),
+        crate::state::now_ms(),
+    )
+}
+
+pub fn run_cursor_usage<R: Read, W: Write>(
+    input: R,
+    mut output: W,
+    state_root: Option<&Path>,
+    captured_at_ms: i64,
+) -> i32 {
+    let remaining = state_root
+        .filter(|root| {
+            crate::state::integration_source_is_enabled_at(
+                root,
+                crate::state::IntegrationSource::CursorHooks,
+            )
+        })
+        .and_then(|root| capture_cursor_usage(input, root, captured_at_ms).ok());
+    if let Some(remaining) = remaining {
+        let _ = write!(output, "{}% context left", remaining.round() as i64);
+    }
+    let _ = output.flush();
+    0
+}
+
+#[derive(Debug, Deserialize)]
+struct CursorStatusLineInput {
+    context_window: CursorContextWindowInput,
+}
+
+#[derive(Debug, Deserialize)]
+struct CursorContextWindowInput {
+    #[serde(default)]
+    used_percentage: Option<f64>,
+    #[serde(default)]
+    remaining_percentage: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CursorContextUsageRecord {
+    schema_version: u32,
+    captured_at_ms: i64,
+    remaining_percent: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CursorTurnUsageRecord {
+    schema_version: u32,
+    captured_at_ms: i64,
+    total_tokens: u64,
+}
+
+fn capture_cursor_usage(
+    input: impl Read,
+    state_root: &Path,
+    captured_at_ms: i64,
+) -> Result<f64, String> {
+    if captured_at_ms < 0 {
+        return Err("Cursor usage timestamp was invalid".to_string());
+    }
+    let mut deserializer =
+        serde_json::Deserializer::from_reader(input.take((CURSOR_USAGE_INPUT_LIMIT + 1) as u64));
+    let payload = CursorStatusLineInput::deserialize(&mut deserializer)
+        .map_err(|_| "Cursor usage input was malformed".to_string())?;
+    deserializer
+        .end()
+        .map_err(|_| "Cursor usage input exceeded its safety limit".to_string())?;
+    let remaining = payload
+        .context_window
+        .remaining_percentage
+        .filter(|value| value.is_finite())
+        .or_else(|| {
+            payload
+                .context_window
+                .used_percentage
+                .filter(|value| value.is_finite())
+                .map(|used| 100.0 - used)
+        })
+        .ok_or_else(|| "Cursor usage input had no context percentage".to_string())?
+        .clamp(0.0, 100.0);
+    let record = CursorContextUsageRecord {
+        schema_version: LOCAL_USAGE_RECORD_SCHEMA_VERSION,
+        captured_at_ms,
+        remaining_percent: remaining,
+    };
+    write_local_usage_record(&cursor_record_path(state_root), &record, "Cursor")?;
+    Ok(remaining)
+}
+
+/// Persist the latest Cursor agent turn total without retaining the response,
+/// conversation identifiers, model, workspace, or cache-token breakdowns.
+///
+/// Cursor reports cache reads and writes as subsets of its input total, so the
+/// local metric is deliberately only `input_tokens + output_tokens`.
+pub(crate) fn capture_cursor_turn_usage(
+    state_root: &Path,
+    captured_at_ms: i64,
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+) -> Result<(), String> {
+    if captured_at_ms < 0 {
+        return Err("Cursor turn usage timestamp was invalid".to_string());
+    }
+    let total_tokens = match (input_tokens, output_tokens) {
+        (None, None) => {
+            return Err("Cursor turn usage input had no token counts".to_string());
+        }
+        (input, output) => input
+            .unwrap_or(0)
+            .checked_add(output.unwrap_or(0))
+            .ok_or_else(|| "Cursor turn usage token total overflowed".to_string())?,
+    };
+    if total_tokens == 0 {
+        return Err("Cursor turn usage token total was empty".to_string());
+    }
+
+    let record = CursorTurnUsageRecord {
+        schema_version: LOCAL_USAGE_RECORD_SCHEMA_VERSION,
+        captured_at_ms,
+        total_tokens,
+    };
+    write_local_usage_record(&cursor_turn_record_path(state_root), &record, "Cursor")
+}
+
+fn cursor_record_timestamp_is_compatible(captured_at_ms: i64, now_ms: i64) -> bool {
+    captured_at_ms >= 0 && captured_at_ms <= now_ms.saturating_add(MAX_FUTURE_SKEW_MS)
+}
+
+fn cursor_record_timestamp_is_valid(captured_at_ms: i64, now_ms: i64) -> bool {
+    cursor_record_timestamp_is_compatible(captured_at_ms, now_ms)
+        && now_ms.saturating_sub(captured_at_ms) <= LOCAL_USAGE_EXPIRES_AFTER_MS
+}
+
+fn cursor_context_record_is_compatible(record: &CursorContextUsageRecord, now_ms: i64) -> bool {
+    record.schema_version == LOCAL_USAGE_RECORD_SCHEMA_VERSION
+        && record.remaining_percent.is_finite()
+        && (0.0..=100.0).contains(&record.remaining_percent)
+        && cursor_record_timestamp_is_compatible(record.captured_at_ms, now_ms)
+}
+
+fn cursor_context_record_is_valid(record: &CursorContextUsageRecord, now_ms: i64) -> bool {
+    cursor_context_record_is_compatible(record, now_ms)
+        && cursor_record_timestamp_is_valid(record.captured_at_ms, now_ms)
+}
+
+fn cursor_context_record_is_fresh(record: &CursorContextUsageRecord, now_ms: i64) -> bool {
+    cursor_context_record_is_valid(record, now_ms)
+        && now_ms.saturating_sub(record.captured_at_ms) <= LOCAL_USAGE_STALE_AFTER_MS
+}
+
+fn cursor_turn_record_is_compatible(record: &CursorTurnUsageRecord, now_ms: i64) -> bool {
+    record.schema_version == LOCAL_USAGE_RECORD_SCHEMA_VERSION
+        && record.total_tokens > 0
+        && cursor_record_timestamp_is_compatible(record.captured_at_ms, now_ms)
+}
+
+fn cursor_turn_record_is_valid(record: &CursorTurnUsageRecord, now_ms: i64) -> bool {
+    cursor_turn_record_is_compatible(record, now_ms)
+        && cursor_record_timestamp_is_valid(record.captured_at_ms, now_ms)
+}
+
+fn cursor_record_path(state_root: &Path) -> PathBuf {
+    state_root
+        .join(CLAUDE_RECORD_DIRECTORY)
+        .join(CURSOR_RECORD_FILENAME)
+}
+
+fn cursor_turn_record_path(state_root: &Path) -> PathBuf {
+    state_root
+        .join(CLAUDE_RECORD_DIRECTORY)
+        .join(CURSOR_TURN_RECORD_FILENAME)
+}
+
+enum CursorUsageObservation {
+    Context(CursorContextUsageRecord),
+    Turn(CursorTurnUsageRecord),
+}
+
+fn load_cursor_usage(state_root: &Path, now_ms: i64) -> ProviderUsageView {
+    let context_path = cursor_record_path(state_root);
+    let turn_path = cursor_turn_record_path(state_root);
+    let parsed_context = read_local_usage_record::<CursorContextUsageRecord>(&context_path, now_ms);
+    let parsed_turn = read_local_usage_record::<CursorTurnUsageRecord>(&turn_path, now_ms);
+    let incompatible_context = fs::symlink_metadata(&context_path).is_ok()
+        && parsed_context
+            .as_ref()
+            .is_none_or(|record| !cursor_context_record_is_compatible(record, now_ms));
+    let incompatible_turn = fs::symlink_metadata(&turn_path).is_ok()
+        && parsed_turn
+            .as_ref()
+            .is_none_or(|record| !cursor_turn_record_is_compatible(record, now_ms));
+    let context = parsed_context.filter(|record| cursor_context_record_is_valid(record, now_ms));
+    let turn = parsed_turn.filter(|record| cursor_turn_record_is_valid(record, now_ms));
+
+    // A recent CLI context observation is more actionable than a token total,
+    // even when the Stop hook ran slightly later. Once context is stale, use
+    // the newest valid observation; ties deterministically favor context.
+    let observation = match (context, turn) {
+        (Some(context), _) if cursor_context_record_is_fresh(&context, now_ms) => {
+            Some(CursorUsageObservation::Context(context))
+        }
+        (Some(context), Some(turn)) if context.captured_at_ms >= turn.captured_at_ms => {
+            Some(CursorUsageObservation::Context(context))
+        }
+        (Some(_), Some(turn)) | (None, Some(turn)) => Some(CursorUsageObservation::Turn(turn)),
+        (Some(context), None) => Some(CursorUsageObservation::Context(context)),
+        (None, None) => None,
+    };
+
+    let Some(observation) = observation else {
+        if incompatible_context || incompatible_turn {
+            return unavailable_provider(
+                "The Cursor usage capture is incompatible. Repair Cursor monitoring in Setup & diagnostics.",
+            );
+        }
+        return unavailable_provider(
+            "No Cursor usage capture is available. Review Cursor monitoring status, then start a Cursor turn. Cursor plan quota remains available only inside Cursor.",
+        );
+    };
+
+    match observation {
+        CursorUsageObservation::Context(record) => context_provider(
+            record.remaining_percent,
+            record.captured_at_ms,
+            "Latest CLI context",
+            "Cursor Agent CLI context capacity; this is not Composer plan quota.",
+            now_ms,
+        ),
+        CursorUsageObservation::Turn(record) => token_provider(
+            record.total_tokens,
+            record.captured_at_ms,
+            "Latest Cursor turn",
+            "Latest local Cursor agent-turn input and output tokens; cache-token fields are breakdowns and are not added. This is not plan or billing quota.",
+            now_ms,
+        ),
+    }
+}
+
+fn write_local_usage_record<T: Serialize>(
+    path: &Path,
+    record: &T,
+    provider: &str,
+) -> Result<(), String> {
+    let bytes = serde_json::to_vec(record)
+        .map_err(|_| format!("could not serialize the {provider} usage record"))?;
+    atomic_write_bytes(path, &bytes)
+}
+
+fn read_local_usage_record<T: for<'de> Deserialize<'de>>(path: &Path, now_ms: i64) -> Option<T> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if is_link_or_reparse_point(&metadata)
+        || !metadata.is_file()
+        || metadata.len() > LOCAL_USAGE_RECORD_LIMIT
+    {
+        return None;
+    }
+    let bytes = fs::read(path).ok()?;
+    if bytes.len() as u64 > LOCAL_USAGE_RECORD_LIMIT {
+        return None;
+    }
+    let value: T = serde_json::from_slice(&bytes).ok()?;
+    // Timestamp/schema validation remains in the concrete view constructor;
+    // this generic helper only enforces the bounded regular-file boundary.
+    let _ = now_ms;
+    Some(value)
+}
+
 fn atomic_write_bytes(path: &Path, content: &[u8]) -> Result<(), String> {
     let parent = path
         .parent()
-        .ok_or_else(|| "Claude usage record had no parent directory".to_string())?;
-    fs::create_dir_all(parent)
-        .map_err(|_| "could not create the Claude usage directory".to_string())?;
+        .ok_or_else(|| "usage record had no parent directory".to_string())?;
+    fs::create_dir_all(parent).map_err(|_| "could not create the usage directory".to_string())?;
     let parent_metadata = fs::symlink_metadata(parent)
-        .map_err(|_| "could not inspect the Claude usage directory".to_string())?;
+        .map_err(|_| "could not inspect the usage directory".to_string())?;
     if is_link_or_reparse_point(&parent_metadata) || !parent_metadata.is_dir() {
-        return Err("Claude usage directory was not a regular directory".to_string());
+        return Err("usage directory was not a regular directory".to_string());
     }
     set_private_directory_permissions(parent);
     reject_unsafe_existing_target(path)?;
 
     let mut temporary = TempFileBuilder::new()
-        .prefix(".claude-usage.")
+        .prefix(".vsparallel-usage.")
         .suffix(".tmp")
         .tempfile_in(parent)
-        .map_err(|_| "could not create a temporary Claude usage record".to_string())?;
+        .map_err(|_| "could not create a temporary usage record".to_string())?;
     set_private_file_permissions(temporary.path());
     temporary
         .write_all(content)
         .and_then(|_| temporary.as_file().sync_all())
-        .map_err(|_| "could not write the temporary Claude usage record".to_string())?;
+        .map_err(|_| "could not write the temporary usage record".to_string())?;
     replace_temporary_file(temporary, path)?;
     set_private_file_permissions(path);
     sync_parent(parent);
@@ -1636,11 +2555,11 @@ fn atomic_write_bytes(path: &Path, content: &[u8]) -> Result<(), String> {
 fn reject_unsafe_existing_target(path: &Path) -> Result<(), String> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if is_link_or_reparse_point(&metadata) || !metadata.is_file() => {
-            Err("Claude usage record target was not a regular file".to_string())
+            Err("usage record target was not a regular file".to_string())
         }
         Ok(_) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(_) => Err("could not inspect the Claude usage record".to_string()),
+        Err(_) => Err("could not inspect the usage record".to_string()),
     }
 }
 
@@ -1663,7 +2582,7 @@ fn is_link_or_reparse_point(metadata: &fs::Metadata) -> bool {
 fn replace_temporary_file(temporary: tempfile::NamedTempFile, target: &Path) -> Result<(), String> {
     temporary
         .persist(target)
-        .map_err(|_| "could not atomically replace the Claude usage record".to_string())?;
+        .map_err(|_| "could not atomically replace the usage record".to_string())?;
     Ok(())
 }
 
@@ -1680,7 +2599,7 @@ fn replace_temporary_file(temporary: tempfile::NamedTempFile, target: &Path) -> 
         )
     };
     if replaced == 0 {
-        return Err("could not atomically replace the Claude usage record".to_string());
+        return Err("could not atomically replace the usage record".to_string());
     }
     Ok(())
 }
@@ -1689,7 +2608,7 @@ fn replace_temporary_file(temporary: tempfile::NamedTempFile, target: &Path) -> 
 fn nul_terminated_wide_path(path: &Path) -> Result<Vec<u16>, String> {
     let mut encoded: Vec<u16> = path.as_os_str().encode_wide().collect();
     if encoded.contains(&0) {
-        return Err("Claude usage record path contained an embedded NUL".to_string());
+        return Err("usage record path contained an embedded NUL".to_string());
     }
     encoded.push(0);
     Ok(encoded)
@@ -1838,6 +2757,18 @@ mod tests {
         (code, output)
     }
 
+    fn gemini_input(root: &Path, input: &[u8], now_ms: i64) -> (i32, Vec<u8>) {
+        let mut output = Vec::new();
+        let code = run_gemini_usage(input, &mut output, Some(root), now_ms);
+        (code, output)
+    }
+
+    fn cursor_input(root: &Path, input: &[u8], now_ms: i64) -> (i32, Vec<u8>) {
+        let mut output = Vec::new();
+        let code = run_cursor_usage(input, &mut output, Some(root), now_ms);
+        (code, output)
+    }
+
     #[test]
     fn codex_prefers_named_bucket_and_reports_remaining_capacity() {
         let result = json!({
@@ -1942,6 +2873,433 @@ mod tests {
         assert_eq!(view.windows.len(), 1);
         assert_eq!(view.windows[0].label, "7-day limit");
         assert_eq!(view.remaining_percent, Some(60.0));
+    }
+
+    #[test]
+    fn antigravity_output_is_narrowed_to_quota_buckets() {
+        let raw = json!({
+            "status":"SUCCESS",
+            "account":{"email":"private@example.invalid","token":"private-token"},
+            "command":{
+                "name":"usage",
+                "data":{"groups":[{
+                    "privateGroup":"secret-group",
+                    "buckets":[
+                        {
+                            "id":"gemini-pool",
+                            "name":"Gemini models",
+                            "window":"weekly",
+                            "remaining_fraction":0.42,
+                            "reset_time":"2030-01-02T03:04:05.678Z",
+                            "privateField":"secret-bucket"
+                        },
+                        {"id":"missing-fraction","name":"Ignored"}
+                    ]
+                }]}
+            }
+        });
+
+        let narrowed = parse_antigravity_usage_output(&serde_json::to_vec(&raw).unwrap()).unwrap();
+        let serialized = narrowed.to_string();
+        for secret in [
+            "private@example.invalid",
+            "private-token",
+            "secret-group",
+            "secret-bucket",
+        ] {
+            assert!(!serialized.contains(secret));
+        }
+        assert_eq!(narrowed["buckets"].as_array().unwrap().len(), 1);
+        let view = antigravity_provider_view(&narrowed, 1_000).unwrap();
+        assert_eq!(view.metric_kind, "quota");
+        assert_eq!(view.remaining_percent, Some(42.0));
+        assert_eq!(view.windows[0].label, "Gemini models · weekly");
+        assert_eq!(view.windows[0].resets_at_ms, Some(1_893_553_445_678));
+
+        for invalid in [
+            json!({"status":"FAILED","command":{"name":"usage","data":{"groups":[]}}}),
+            json!({"status":"SUCCESS","command":{"name":"chat","data":{"groups":[]}}}),
+        ] {
+            assert!(
+                parse_antigravity_usage_output(&serde_json::to_vec(&invalid).unwrap()).is_err()
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn antigravity_reader_timeout_bounds_descendant_held_pipes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let executable = temp.path().join("agy-with-pipe-descendant");
+        fs::write(
+            &executable,
+            "#!/bin/sh\nsleep 30 &\nprintf '%s\\n' '{\"status\":\"SUCCESS\",\"command\":{\"name\":\"usage\",\"data\":{\"groups\":[]}}}'\nexit 0\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&executable, permissions).unwrap();
+
+        let started = Instant::now();
+        let error = antigravity_usage_request_with_timeout(
+            executable.as_os_str(),
+            Duration::from_millis(150),
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "Antigravity CLI usage request timed out");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn gemini_capture_persists_only_latest_model_call_token_total() {
+        let temp = TempDir::new().unwrap();
+        let input = json!({
+            "hook_event_name":"AfterModel",
+            "session_id":"private-session",
+            "llm_request":{"contents":[{"text":"SECRET PROMPT"}]},
+            "llm_response":{
+                "candidates":[{"content":{"parts":[{"text":"SECRET RESPONSE"}]}}],
+                "usageMetadata":{"totalTokenCount":12_345,"private":"secret-metadata"}
+            }
+        });
+
+        let (code, output) =
+            gemini_input(temp.path(), &serde_json::to_vec(&input).unwrap(), 10_000);
+        assert_eq!(code, 0);
+        assert_eq!(output, b"{\"suppressOutput\":true}\n");
+        let record = fs::read(gemini_record_path(temp.path())).unwrap();
+        let persisted = String::from_utf8(record.clone()).unwrap();
+        for secret in [
+            "private-session",
+            "SECRET PROMPT",
+            "SECRET RESPONSE",
+            "secret-metadata",
+        ] {
+            assert!(!persisted.contains(secret));
+        }
+        let value: Value = serde_json::from_slice(&record).unwrap();
+        assert_eq!(value.as_object().unwrap().len(), 3);
+        assert_eq!(value["totalTokens"], 12_345);
+
+        let fresh = load_gemini_usage(temp.path(), 11_000);
+        assert_eq!(fresh.state, "available");
+        assert_eq!(fresh.metric_kind, "tokens");
+        assert_eq!(fresh.token_count, Some(12_345));
+        assert_eq!(fresh.metric_label, "Latest model call");
+        let stale = load_gemini_usage(temp.path(), 10_000 + LOCAL_USAGE_STALE_AFTER_MS + 1);
+        assert_eq!(stale.state, "stale");
+        let expired = load_gemini_usage(temp.path(), 10_000 + LOCAL_USAGE_EXPIRES_AFTER_MS + 1);
+        assert_eq!(expired.state, "unavailable");
+        assert_eq!(expired.token_count, None);
+    }
+
+    #[test]
+    fn gemini_capture_accepts_valid_long_context_events() {
+        let temp = TempDir::new().unwrap();
+        let input = json!({
+            "hook_event_name":"AfterModel",
+            "llm_request":{"messages":[{"content":"x".repeat(3 * 1024 * 1024)}]},
+            "llm_response":{"usageMetadata":{"totalTokenCount":987_654}}
+        });
+        let bytes = serde_json::to_vec(&input).unwrap();
+        assert!(bytes.len() > 2 * 1024 * 1024);
+
+        let (code, output) = gemini_input(temp.path(), &bytes, 12_000);
+        assert_eq!(code, 0);
+        assert_eq!(output, b"{\"suppressOutput\":true}\n");
+        assert_eq!(
+            load_gemini_usage(temp.path(), 12_001).token_count,
+            Some(987_654)
+        );
+    }
+
+    fn gemini_lifecycle_status(state: &str) -> crate::gemini_integration::GeminiIntegrationStatus {
+        crate::gemini_integration::GeminiIntegrationStatus {
+            state: state.to_string(),
+            installed: state == "installed" || state == "disabled",
+            config_path: "/tmp/.gemini/settings.json".to_string(),
+            backup_path: "/tmp/.gemini/settings.json.vsparallel.bak".to_string(),
+            event_states: std::collections::BTreeMap::from([(
+                "AfterModel".to_string(),
+                if state == "installed" || state == "disabled" {
+                    "current"
+                } else {
+                    state
+                }
+                .to_string(),
+            )]),
+            hooks_disabled: state == "disabled",
+            message: format!("Gemini lifecycle state: {state}"),
+        }
+    }
+
+    #[test]
+    fn gemini_usage_explains_when_the_capture_hook_is_not_installed() {
+        let usage = unavailable_provider("No capture yet.");
+        let status = gemini_lifecycle_status("not_installed");
+
+        let reconciled = reconcile_gemini_integration_status(usage, Some(&status));
+
+        assert_eq!(reconciled.state, "unavailable");
+        assert!(reconciled.detail.contains("not installed"));
+        assert!(reconciled.detail.contains("Setup & diagnostics"));
+    }
+
+    #[test]
+    fn gemini_usage_keeps_the_last_count_but_marks_it_stale_when_repair_is_needed() {
+        let usage = token_provider(42, 10_000, "Latest model call", "captured", 10_001);
+        let status = gemini_lifecycle_status("stale");
+
+        let reconciled = reconcile_gemini_integration_status(usage, Some(&status));
+
+        assert_eq!(reconciled.state, "stale");
+        assert_eq!(reconciled.token_count, Some(42));
+        assert!(reconciled.detail.contains("needs repair"));
+    }
+
+    #[test]
+    fn cursor_capture_persists_only_context_capacity() {
+        let temp = TempDir::new().unwrap();
+        let input = json!({
+            "session_id":"private-session",
+            "workspace":{"current_dir":"/private/project"},
+            "model":{"display_name":"private-model"},
+            "context_window":{
+                "used_percentage":37.5,
+                "privateTokens":["SECRET PROMPT","SECRET RESPONSE"]
+            }
+        });
+
+        let (code, output) =
+            cursor_input(temp.path(), &serde_json::to_vec(&input).unwrap(), 20_000);
+        assert_eq!(code, 0);
+        assert_eq!(output, b"63% context left");
+        let record = fs::read(cursor_record_path(temp.path())).unwrap();
+        let persisted = String::from_utf8(record.clone()).unwrap();
+        for secret in [
+            "private-session",
+            "/private/project",
+            "private-model",
+            "SECRET PROMPT",
+            "SECRET RESPONSE",
+        ] {
+            assert!(!persisted.contains(secret));
+        }
+        let value: Value = serde_json::from_slice(&record).unwrap();
+        assert_eq!(value.as_object().unwrap().len(), 3);
+        assert_eq!(value["remainingPercent"], 62.5);
+
+        let view = load_cursor_usage(temp.path(), 21_000);
+        assert_eq!(view.state, "available");
+        assert_eq!(view.metric_kind, "context");
+        assert_eq!(view.remaining_percent, Some(62.5));
+        assert_eq!(view.metric_label, "Latest CLI context");
+        assert!(view.detail.contains("not Composer plan quota"));
+    }
+
+    #[test]
+    fn cursor_turn_capture_persists_only_input_and_output_total() {
+        let temp = TempDir::new().unwrap();
+        capture_cursor_turn_usage(temp.path(), 20_000, Some(191_000), Some(2_345)).unwrap();
+
+        let record = fs::read(cursor_turn_record_path(temp.path())).unwrap();
+        let value: Value = serde_json::from_slice(&record).unwrap();
+        assert_eq!(value.as_object().unwrap().len(), 3);
+        assert_eq!(value["schemaVersion"], LOCAL_USAGE_RECORD_SCHEMA_VERSION);
+        assert_eq!(value["capturedAtMs"], 20_000);
+        assert_eq!(value["totalTokens"], 193_345);
+        assert!(value.get("remainingPercent").is_none());
+
+        let view = load_cursor_usage(temp.path(), 21_000);
+        assert_eq!(view.state, "available");
+        assert_eq!(view.metric_kind, "tokens");
+        assert_eq!(view.token_count, Some(193_345));
+        assert_eq!(view.metric_label, "Latest Cursor turn");
+        assert!(view.detail.contains("Cursor agent-turn"));
+        assert!(view.detail.contains("not added"));
+    }
+
+    #[test]
+    fn cursor_selection_prefers_fresh_context_then_newest_record() {
+        let temp = TempDir::new().unwrap();
+        capture_cursor_turn_usage(temp.path(), 10_000, Some(100), Some(25)).unwrap();
+        assert_eq!(
+            load_cursor_usage(temp.path(), 10_001).token_count,
+            Some(125)
+        );
+
+        let (code, output) = cursor_input(
+            temp.path(),
+            br#"{"context_window":{"remaining_percentage":72.5}}"#,
+            20_000,
+        );
+        assert_eq!(code, 0);
+        assert_eq!(output, b"73% context left");
+        let context = load_cursor_usage(temp.path(), 20_001);
+        assert_eq!(context.metric_kind, "context");
+        assert_eq!(context.remaining_percent, Some(72.5));
+
+        capture_cursor_turn_usage(
+            temp.path(),
+            20_000 + LOCAL_USAGE_STALE_AFTER_MS,
+            Some(200),
+            Some(50),
+        )
+        .unwrap();
+        let preserved = load_cursor_usage(temp.path(), 20_000 + LOCAL_USAGE_STALE_AFTER_MS);
+        assert_eq!(preserved.metric_kind, "context");
+        assert_eq!(preserved.remaining_percent, Some(72.5));
+
+        capture_cursor_turn_usage(
+            temp.path(),
+            20_000 + LOCAL_USAGE_STALE_AFTER_MS + 1,
+            Some(200),
+            Some(50),
+        )
+        .unwrap();
+        let tokens = load_cursor_usage(temp.path(), 20_000 + LOCAL_USAGE_STALE_AFTER_MS + 1);
+        assert_eq!(tokens.metric_kind, "tokens");
+        assert_eq!(tokens.token_count, Some(250));
+    }
+
+    #[test]
+    fn cursor_turn_capture_rejects_empty_or_overflowing_totals_without_clobbering() {
+        let temp = TempDir::new().unwrap();
+        cursor_input(
+            temp.path(),
+            br#"{"context_window":{"remaining_percentage":80}}"#,
+            1,
+        );
+        let before = fs::read(cursor_record_path(temp.path())).unwrap();
+
+        assert!(capture_cursor_turn_usage(temp.path(), 1, None, None).is_err());
+        assert!(capture_cursor_turn_usage(temp.path(), 1, Some(0), Some(0)).is_err());
+        assert!(capture_cursor_turn_usage(temp.path(), 1, Some(u64::MAX), Some(1)).is_err());
+        assert_eq!(fs::read(cursor_record_path(temp.path())).unwrap(), before);
+        assert!(!cursor_turn_record_path(temp.path()).exists());
+    }
+
+    #[test]
+    fn cursor_turn_capture_accepts_either_token_counter_on_its_own() {
+        let input_only = TempDir::new().unwrap();
+        capture_cursor_turn_usage(input_only.path(), 10_000, Some(125), None).unwrap();
+        assert_eq!(
+            load_cursor_usage(input_only.path(), 10_001).token_count,
+            Some(125)
+        );
+
+        let output_only = TempDir::new().unwrap();
+        capture_cursor_turn_usage(output_only.path(), 10_000, None, Some(25)).unwrap();
+        assert_eq!(
+            load_cursor_usage(output_only.path(), 10_001).token_count,
+            Some(25)
+        );
+    }
+
+    #[test]
+    fn cursor_legacy_context_record_remains_compatible_and_wins_ties() {
+        let temp = TempDir::new().unwrap();
+        let usage_dir = temp.path().join(CLAUDE_RECORD_DIRECTORY);
+        fs::create_dir_all(&usage_dir).unwrap();
+        fs::write(
+            cursor_record_path(temp.path()),
+            br#"{"schemaVersion":1,"capturedAtMs":10000,"remainingPercent":64.5}"#,
+        )
+        .unwrap();
+        capture_cursor_turn_usage(temp.path(), 10_000, Some(100), Some(25)).unwrap();
+
+        let view = load_cursor_usage(temp.path(), 10_000 + LOCAL_USAGE_STALE_AFTER_MS + 1);
+        assert_eq!(view.state, "stale");
+        assert_eq!(view.metric_kind, "context");
+        assert_eq!(view.remaining_percent, Some(64.5));
+        assert_eq!(view.updated_at_ms, Some(10_000));
+    }
+
+    #[test]
+    fn cursor_invalid_record_does_not_hide_valid_other_source() {
+        let invalid_context = TempDir::new().unwrap();
+        let usage_dir = invalid_context.path().join(CLAUDE_RECORD_DIRECTORY);
+        fs::create_dir_all(&usage_dir).unwrap();
+        fs::write(
+            cursor_record_path(invalid_context.path()),
+            br#"{"schemaVersion":999,"capturedAtMs":20000,"remainingPercent":50}"#,
+        )
+        .unwrap();
+        capture_cursor_turn_usage(invalid_context.path(), 19_000, Some(100), Some(25)).unwrap();
+        let tokens = load_cursor_usage(invalid_context.path(), 20_000);
+        assert_eq!(tokens.metric_kind, "tokens");
+        assert_eq!(tokens.token_count, Some(125));
+
+        let invalid_turn = TempDir::new().unwrap();
+        cursor_input(
+            invalid_turn.path(),
+            br#"{"context_window":{"remaining_percentage":70}}"#,
+            10_000,
+        );
+        fs::write(
+            cursor_turn_record_path(invalid_turn.path()),
+            br#"{"schemaVersion":1,"capturedAtMs":20000,"totalTokens":0}"#,
+        )
+        .unwrap();
+        let context =
+            load_cursor_usage(invalid_turn.path(), 10_000 + LOCAL_USAGE_STALE_AFTER_MS + 1);
+        assert_eq!(context.metric_kind, "context");
+        assert_eq!(context.remaining_percent, Some(70.0));
+    }
+
+    #[test]
+    fn cursor_expired_records_request_a_new_turn_instead_of_repair() {
+        let temp = TempDir::new().unwrap();
+        cursor_input(
+            temp.path(),
+            br#"{"context_window":{"remaining_percentage":70}}"#,
+            10_000,
+        );
+        capture_cursor_turn_usage(temp.path(), 20_000, Some(100), Some(25)).unwrap();
+
+        let view = load_cursor_usage(temp.path(), 20_000 + LOCAL_USAGE_EXPIRES_AFTER_MS + 1);
+        assert_eq!(view.state, "unavailable");
+        assert!(view.detail.contains("No Cursor usage capture"));
+        assert!(!view.detail.contains("incompatible"));
+        assert!(!view.detail.contains("Repair"));
+    }
+
+    #[test]
+    fn disabled_local_usage_hooks_fail_open_without_persisting() {
+        let temp = TempDir::new().unwrap();
+        crate::state::set_integration_source_enabled_at(
+            temp.path(),
+            crate::state::IntegrationSource::GeminiUsage,
+            false,
+        )
+        .unwrap();
+        crate::state::set_integration_source_enabled_at(
+            temp.path(),
+            crate::state::IntegrationSource::CursorHooks,
+            false,
+        )
+        .unwrap();
+
+        let (gemini_code, gemini_output) = gemini_input(
+            temp.path(),
+            br#"{"hook_event_name":"AfterModel","llm_response":{"usageMetadata":{"totalTokenCount":5}}}"#,
+            1_000,
+        );
+        let (cursor_code, cursor_output) = cursor_input(
+            temp.path(),
+            br#"{"context_window":{"remaining_percentage":50}}"#,
+            1_000,
+        );
+        assert_eq!(gemini_code, 0);
+        assert_eq!(gemini_output, b"{\"suppressOutput\":true}\n");
+        assert_eq!(cursor_code, 0);
+        assert!(cursor_output.is_empty());
+        assert!(!gemini_record_path(temp.path()).exists());
+        assert!(!cursor_record_path(temp.path()).exists());
+        assert!(!cursor_turn_record_path(temp.path()).exists());
     }
 
     #[test]

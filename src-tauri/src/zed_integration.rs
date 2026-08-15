@@ -29,8 +29,8 @@
 //! * Lifecycle and model fields are populated only after a bounded
 //!   sidebar/session join and selective JSON or zstd thread-data parse. The
 //!   parser retains only message variant names, the presence of a tool-use
-//!   boundary, and the bounded provider/model pair. It discards all decoded
-//!   message and tool content.
+//!   boundary, the bounded provider/model pair, and Zed's four cumulative
+//!   token counters. It discards all decoded message and tool content.
 
 use rusqlite::{Connection, OpenFlags};
 use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
@@ -159,6 +159,18 @@ pub(crate) struct ZedAgentActivity {
     pub(crate) model_name: Option<String>,
 }
 
+/// Cumulative token usage for the newest valid local native Zed thread.
+///
+/// Zed's upstream `TokenUsage::total_tokens()` adds regular input, output,
+/// cache-creation input, and cache-read input tokens. We mirror that definition
+/// exactly, while using checked addition so corrupt persisted values fail
+/// closed instead of wrapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ZedUsageObservation {
+    pub(crate) total_tokens: u64,
+    pub(crate) updated_at_ms: i64,
+}
+
 /// Aggregate, non-sensitive adapter health counters.
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -259,6 +271,15 @@ pub(crate) fn load_zed_snapshot_from_environment(now_ms: i64) -> ZedSnapshot {
     load_zed_snapshot_from_environment_with_detail(now_ms, SnapshotDetail::WithAgentMetadata)
 }
 
+/// Load the newest valid cumulative token count from a local native Zed Agent
+/// thread. This performs the same bounded, read-only sidebar/session join and
+/// selective thread parse as the workspace adapter, without requiring Zed to
+/// be running and without returning any thread identifier or content.
+pub(crate) fn load_zed_usage_from_environment(now_ms: i64) -> Option<ZedUsageObservation> {
+    let roots = environment_data_roots();
+    load_zed_usage_from_data_roots(&roots, now_ms)
+}
+
 /// Lightweight production loader for resolving an open target. It reads only
 /// workspace/session metadata and deliberately skips sidebar and thread blobs.
 pub(crate) fn load_zed_workspace_snapshot_from_environment(now_ms: i64) -> ZedSnapshot {
@@ -301,6 +322,70 @@ pub(crate) fn load_zed_snapshot_from_data_roots(
         process_is_live,
         SnapshotDetail::WithAgentMetadata,
     )
+}
+
+fn load_zed_usage_from_data_roots(
+    data_roots: &[PathBuf],
+    now_ms: i64,
+) -> Option<ZedUsageObservation> {
+    let bounded_roots = &data_roots[..data_roots.len().min(MAX_DATA_ROOTS)];
+    let mut diagnostics = ZedDiagnostics::default();
+    let databases = discover_channel_databases(bounded_roots, &mut diagnostics);
+    let mut newest_by_thread = BTreeMap::new();
+    for candidate in databases {
+        let Ok(connection) = open_bounded_read_only_database(&candidate.database) else {
+            continue;
+        };
+        let Ok(join_ids) = read_native_thread_join_ids(&connection, now_ms) else {
+            continue;
+        };
+        let thread_database = candidate.data_root.join("threads").join("threads.db");
+        for (join_id, updated_at_ms) in join_ids {
+            newest_by_thread
+                .entry((thread_database.clone(), join_id))
+                .and_modify(|existing: &mut i64| *existing = (*existing).max(updated_at_ms))
+                .or_insert(updated_at_ms);
+        }
+    }
+    let mut candidates: Vec<_> = newest_by_thread.into_iter().collect();
+    candidates.sort_by(
+        |((left_database, left_id), left_timestamp),
+         ((right_database, right_id), right_timestamp)| {
+            right_timestamp
+                .cmp(left_timestamp)
+                .then_with(|| left_database.cmp(right_database))
+                .then_with(|| left_id.cmp(right_id))
+        },
+    );
+
+    // The blob-read limit is global, so choose candidates globally before any
+    // channel can consume the four-row budget merely because it sorts first.
+    let mut budget = ModelReadBudget::default();
+    let mut newest = None;
+    for ((thread_database, join_id), sidebar_updated_at_ms) in candidates {
+        if budget.rows_remaining == 0 || budget.decompressed_bytes_remaining == 0 {
+            break;
+        }
+        let (signals, _) = read_thread_signals(
+            &thread_database,
+            vec![(join_id.clone(), sidebar_updated_at_ms)],
+            &mut budget,
+            now_ms,
+        );
+        if let Some(observation) = signals
+            .get(&join_id)
+            .and_then(|(signal, updated_at_ms)| usage_observation(signal, *updated_at_ms))
+        {
+            if newest.is_none_or(|current: ZedUsageObservation| {
+                observation.updated_at_ms > current.updated_at_ms
+                    || (observation.updated_at_ms == current.updated_at_ms
+                        && observation.total_tokens > current.total_tokens)
+            }) {
+                newest = Some(observation);
+            }
+        }
+    }
+    newest
 }
 
 fn load_zed_snapshot_from_data_roots_with_detail(
@@ -930,6 +1015,80 @@ type AgentActivityLoad = (
     bool,
 );
 
+/// Read only the bounded native-session join keys needed to select candidate
+/// thread blobs. Titles, paths, request IDs, and content never enter memory.
+fn read_native_thread_join_ids(
+    connection: &Connection,
+    now_ms: i64,
+) -> Result<Vec<(String, i64)>, String> {
+    if !table_has_columns(
+        connection,
+        "sidebar_threads",
+        &[
+            "session_id",
+            "agent_id",
+            "updated_at",
+            "archived",
+            "remote_connection",
+        ],
+    )? {
+        return Ok(Vec::new());
+    }
+    let mut statement = connection
+        .prepare(
+            "SELECT session_id, \
+                    CAST(strftime('%s', updated_at) AS INTEGER) * 1000 \
+                         + CAST(substr(strftime('%f', updated_at), 4, 3) AS INTEGER) \
+             FROM sidebar_threads \
+             WHERE agent_id IS NULL \
+               AND COALESCE(archived, 0) = 0 \
+               AND remote_connection IS NULL \
+               AND typeof(session_id) = 'text' \
+               AND length(CAST(session_id AS BLOB)) BETWEEN 1 AND ?1 \
+               AND typeof(updated_at) = 'text' \
+               AND length(CAST(updated_at AS BLOB)) BETWEEN 1 AND ?2 \
+             ORDER BY updated_at DESC \
+             LIMIT ?3",
+        )
+        .map_err(|error| format!("could not prepare the Zed native usage query: {error}"))?;
+    let mut rows = statement
+        .query(rusqlite::params![
+            MAX_THREAD_JOIN_ID_BYTES as i64,
+            MAX_TIMESTAMP_BYTES as i64,
+            MAX_MODEL_ROWS_PER_REFRESH as i64,
+        ])
+        .map_err(|error| format!("could not query Zed native usage metadata: {error}"))?;
+    let mut newest_by_join_id = BTreeMap::new();
+    while let Some(row) = rows
+        .next()
+        .map_err(|error| format!("could not read Zed native usage metadata: {error}"))?
+    {
+        let (Ok(join_id), Ok(updated_at_ms)) =
+            (row.get::<_, String>(0), row.get::<_, Option<i64>>(1))
+        else {
+            continue;
+        };
+        let Some(updated_at_ms) = updated_at_ms.and_then(|value| bounded_timestamp(value, now_ms))
+        else {
+            continue;
+        };
+        if !valid_opaque_value(&join_id, MAX_THREAD_JOIN_ID_BYTES) {
+            continue;
+        }
+        newest_by_join_id
+            .entry(join_id)
+            .and_modify(|existing: &mut i64| *existing = (*existing).max(updated_at_ms))
+            .or_insert(updated_at_ms);
+    }
+    let mut join_ids: Vec<_> = newest_by_join_id.into_iter().collect();
+    join_ids.sort_by(|(left_id, left_timestamp), (right_id, right_timestamp)| {
+        right_timestamp
+            .cmp(left_timestamp)
+            .then_with(|| left_id.cmp(right_id))
+    });
+    Ok(join_ids)
+}
+
 fn read_agent_activities(
     connection: &Connection,
     now_ms: i64,
@@ -1122,6 +1281,26 @@ enum ThreadTail {
 struct ThreadSignal {
     model: Option<ThreadModel>,
     tail: ThreadTail,
+    cumulative_token_usage: Option<ThreadTokenUsage>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ThreadTokenUsage {
+    input_tokens: u64,
+    output_tokens: u64,
+    cache_creation_input_tokens: u64,
+    cache_read_input_tokens: u64,
+}
+
+impl ThreadTokenUsage {
+    /// Match Zed's upstream `TokenUsage::total_tokens()` definition, but reject
+    /// corrupt values that cannot be represented instead of wrapping a `u64`.
+    fn checked_total_tokens(self) -> Option<u64> {
+        self.input_tokens
+            .checked_add(self.output_tokens)?
+            .checked_add(self.cache_read_input_tokens)?
+            .checked_add(self.cache_creation_input_tokens)
+    }
 }
 
 fn enrich_agent_signals(
@@ -1151,13 +1330,47 @@ fn enrich_agent_signals(
             .cmp(left_timestamp)
             .then_with(|| left_id.cmp(right_id))
     });
+    let (signals, diagnostics) = read_thread_signals(database, join_ids, budget, now_ms);
+
+    for activity in activities.values_mut() {
+        let Some((signal, thread_updated_at_ms)) = activity
+            .thread_join_id
+            .as_ref()
+            .and_then(|join_id| signals.get(join_id))
+        else {
+            continue;
+        };
+        if let Some(model) = &signal.model {
+            activity.view.model_provider = Some(model.provider.clone());
+            activity.view.model_name = Some(model.name.clone());
+        }
+        if let Some((lifecycle, changed_at_ms)) = derive_native_lifecycle(
+            activity.view.interacted_at_ms,
+            *thread_updated_at_ms,
+            signal.tail,
+        ) {
+            activity.view.lifecycle = Some(lifecycle);
+            activity.view.lifecycle_changed_at_ms = Some(changed_at_ms);
+        }
+    }
+    diagnostics
+}
+
+type JoinedThreadSignals = BTreeMap<String, (ThreadSignal, Option<i64>)>;
+
+fn read_thread_signals(
+    database: &Path,
+    join_ids: Vec<(String, i64)>,
+    budget: &mut ModelReadBudget,
+    now_ms: i64,
+) -> (JoinedThreadSignals, ModelDiagnostics) {
     if join_ids.is_empty() {
-        return ModelDiagnostics::default();
+        return (BTreeMap::new(), ModelDiagnostics::default());
     }
     let Ok(connection) =
         open_bounded_read_only_database_with_limit(database, MAX_THREAD_DATABASE_BYTES)
     else {
-        return ModelDiagnostics::default();
+        return (BTreeMap::new(), ModelDiagnostics::default());
     };
     if !table_has_columns(
         &connection,
@@ -1166,7 +1379,7 @@ fn enrich_agent_signals(
     )
     .unwrap_or(false)
     {
-        return ModelDiagnostics::default();
+        return (BTreeMap::new(), ModelDiagnostics::default());
     }
     let Ok(mut statement) = connection.prepare(
         "SELECT CASE WHEN typeof(data_type) = 'text' \
@@ -1186,7 +1399,7 @@ fn enrich_agent_signals(
            AND length(CAST(id AS BLOB)) BETWEEN 1 AND ?4 \
          LIMIT 1",
     ) else {
-        return ModelDiagnostics::default();
+        return (BTreeMap::new(), ModelDiagnostics::default());
     };
 
     let mut diagnostics = ModelDiagnostics::default();
@@ -1257,28 +1470,22 @@ fn enrich_agent_signals(
         }
     }
 
-    for activity in activities.values_mut() {
-        let Some((signal, thread_updated_at_ms)) = activity
-            .thread_join_id
-            .as_ref()
-            .and_then(|join_id| signals.get(join_id))
-        else {
-            continue;
-        };
-        if let Some(model) = &signal.model {
-            activity.view.model_provider = Some(model.provider.clone());
-            activity.view.model_name = Some(model.name.clone());
-        }
-        if let Some((lifecycle, changed_at_ms)) = derive_native_lifecycle(
-            activity.view.interacted_at_ms,
-            *thread_updated_at_ms,
-            signal.tail,
-        ) {
-            activity.view.lifecycle = Some(lifecycle);
-            activity.view.lifecycle_changed_at_ms = Some(changed_at_ms);
-        }
-    }
-    diagnostics
+    (signals, diagnostics)
+}
+
+fn usage_observation(
+    signal: &ThreadSignal,
+    thread_updated_at_ms: Option<i64>,
+) -> Option<ZedUsageObservation> {
+    signal
+        .cumulative_token_usage
+        .and_then(ThreadTokenUsage::checked_total_tokens)
+        .filter(|total_tokens| *total_tokens > 0)
+        .zip(thread_updated_at_ms)
+        .map(|(total_tokens, updated_at_ms)| ZedUsageObservation {
+            total_tokens,
+            updated_at_ms,
+        })
 }
 
 fn derive_native_lifecycle(
@@ -1391,16 +1598,93 @@ impl<'de> Visitor<'de> for ThreadSignalVisitor {
     {
         let mut model = None;
         let mut tail = ThreadTail::Unknown;
+        let mut cumulative_token_usage = None;
         while let Some(key) = map.next_key::<String>()? {
             match key.as_str() {
                 "model" => model = map.next_value_seed(OptionalModelSeed)?,
                 "messages" => tail = map.next_value_seed(MessagesTailSeed)?,
+                "cumulative_token_usage" => {
+                    cumulative_token_usage = map.next_value_seed(ThreadTokenUsageSeed)?;
+                }
                 _ => {
                     map.next_value::<IgnoredAny>()?;
                 }
             }
         }
-        Ok(ThreadSignal { model, tail })
+        Ok(ThreadSignal {
+            model,
+            tail,
+            cumulative_token_usage,
+        })
+    }
+}
+
+struct ThreadTokenUsageSeed;
+
+impl<'de> DeserializeSeed<'de> for ThreadTokenUsageSeed {
+    type Value = Option<ThreadTokenUsage>;
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_map(ThreadTokenUsageVisitor)
+    }
+}
+
+struct ThreadTokenUsageVisitor;
+
+impl<'de> Visitor<'de> for ThreadTokenUsageVisitor {
+    type Value = Option<ThreadTokenUsage>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("Zed cumulative token counters")
+    }
+
+    fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+    where
+        M: MapAccess<'de>,
+    {
+        let mut input_tokens = None;
+        let mut output_tokens = None;
+        let mut cache_creation_input_tokens = None;
+        let mut cache_read_input_tokens = None;
+        let mut saw_counter = false;
+        while let Some(key) = map.next_key::<String>()? {
+            let slot = match key.as_str() {
+                "input_tokens" => Some(&mut input_tokens),
+                "output_tokens" => Some(&mut output_tokens),
+                "cache_creation_input_tokens" => Some(&mut cache_creation_input_tokens),
+                "cache_read_input_tokens" => Some(&mut cache_read_input_tokens),
+                _ => None,
+            };
+            if let Some(slot) = slot {
+                if slot.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "duplicate Zed cumulative token counter",
+                    ));
+                }
+                *slot = Some(map.next_value::<u64>()?);
+                saw_counter = true;
+            } else {
+                map.next_value::<IgnoredAny>()?;
+            }
+        }
+        if !saw_counter {
+            return Ok(None);
+        }
+        let usage = ThreadTokenUsage {
+            input_tokens: input_tokens.unwrap_or(0),
+            output_tokens: output_tokens.unwrap_or(0),
+            cache_creation_input_tokens: cache_creation_input_tokens.unwrap_or(0),
+            cache_read_input_tokens: cache_read_input_tokens.unwrap_or(0),
+        };
+        if usage.checked_total_tokens().is_none() {
+            return Err(serde::de::Error::custom(
+                "Zed cumulative token counters overflow",
+            ));
+        }
+        Ok(Some(usage))
     }
 }
 
@@ -2485,6 +2769,283 @@ mod tests {
         let serialized = serde_json::to_string(&snapshot).unwrap();
         assert!(!serialized.contains(private_prompt));
         assert!(!serialized.contains("join-only-thread-id"));
+    }
+
+    #[test]
+    fn native_cumulative_usage_is_summed_and_kept_out_of_workspace_json() {
+        let temp = tempfile::tempdir().unwrap();
+        let native_workspace = temp.path().join("native-project");
+        let external_workspace = temp.path().join("external-project");
+        let database = create_channel_database(temp.path(), "0-stable");
+        let (native_paths, native_order) = encoded_paths(&[native_workspace.as_path()]);
+        let (external_paths, external_order) = encoded_paths(&[external_workspace.as_path()]);
+        insert_workspace(
+            &database,
+            1,
+            &native_paths,
+            &native_order,
+            None,
+            None,
+            None,
+            "2026-01-02 03:04:05",
+        );
+        insert_workspace(
+            &database,
+            2,
+            &external_paths,
+            &external_order,
+            None,
+            None,
+            None,
+            "2026-01-02 03:04:06",
+        );
+        insert_thread(
+            &database,
+            ThreadFixture {
+                id: 1,
+                paths: &native_paths,
+                order: &native_order,
+                agent_id: None,
+                updated_at: "2026-01-02 05:00:00",
+                archived: false,
+                remote: None,
+                title: "private native title",
+                session: "native-usage-join",
+                main_paths: None,
+                main_order: None,
+            },
+        );
+        // A still newer native row with corrupt counters is ignored in favor
+        // of the newest valid native observation.
+        insert_thread(
+            &database,
+            ThreadFixture {
+                id: 3,
+                paths: &native_paths,
+                order: &native_order,
+                agent_id: None,
+                updated_at: "2026-01-02 07:00:00",
+                archived: false,
+                remote: None,
+                title: "private corrupt title",
+                session: "corrupt-usage-join",
+                main_paths: None,
+                main_order: None,
+            },
+        );
+        // A newer external ACP row must not displace native Zed usage.
+        insert_thread(
+            &database,
+            ThreadFixture {
+                id: 2,
+                paths: &external_paths,
+                order: &external_order,
+                agent_id: Some("registry:cursor"),
+                updated_at: "2026-01-02 06:00:00",
+                archived: false,
+                remote: None,
+                title: "private external title",
+                session: "external-usage-join",
+                main_paths: None,
+                main_order: None,
+            },
+        );
+        let threads = create_threads_database(temp.path());
+        let private_content = "PRIVATE TOKEN-USAGE THREAD CONTENT";
+        let native_body = serde_json::to_vec(&serde_json::json!({
+            "messages": [{"User": {
+                "id": "private-request-id",
+                "content": [{"Text": private_content}]
+            }}],
+            "cumulative_token_usage": {
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "cache_creation_input_tokens": 5,
+                "cache_read_input_tokens": 7,
+                "future_counter": 999_999
+            }
+        }))
+        .unwrap();
+        insert_thread_blob_at(
+            &threads,
+            "native-usage-join",
+            "2026-01-02T05:00:03Z",
+            "json",
+            &native_body,
+        );
+        let external_body = serde_json::to_vec(&serde_json::json!({
+            "cumulative_token_usage": {"input_tokens": 999_999}
+        }))
+        .unwrap();
+        insert_thread_blob_at(
+            &threads,
+            "external-usage-join",
+            "2026-01-02T06:00:00Z",
+            "json",
+            &external_body,
+        );
+        let overflow_body = format!(
+            "{{\"cumulative_token_usage\":{{\"input_tokens\":{},\"output_tokens\":1}}}}",
+            u64::MAX
+        );
+        insert_thread_blob_at(
+            &threads,
+            "corrupt-usage-join",
+            "2026-01-02T07:00:00Z",
+            "json",
+            overflow_body.as_bytes(),
+        );
+
+        assert_eq!(
+            load_zed_usage_from_data_roots(&[temp.path().to_path_buf()], NOW_MS),
+            Some(ZedUsageObservation {
+                total_tokens: 132,
+                updated_at_ms: 1_767_330_003_000,
+            })
+        );
+        let snapshot =
+            load_zed_snapshot_from_data_roots(&[temp.path().to_path_buf()], NOW_MS, false);
+        let serialized = serde_json::to_string(&snapshot).unwrap();
+        assert!(!serialized.contains("cumulativeTokenUsage"));
+        assert!(!serialized.contains("totalTokens"));
+        assert!(!serialized.contains(private_content));
+        assert!(!serialized.contains("private-request-id"));
+    }
+
+    #[test]
+    fn cumulative_usage_budget_selects_newest_candidates_across_channels() {
+        let temp = tempfile::tempdir().unwrap();
+        let stable = create_channel_database(temp.path(), "0-stable");
+        let preview = create_channel_database(temp.path(), "0-preview");
+        let nightly = create_channel_database(temp.path(), "0-nightly");
+        let workspace = temp.path().join("project");
+        let (paths, order) = encoded_paths(&[workspace.as_path()]);
+
+        for index in 0..MAX_MODEL_ROWS_PER_REFRESH {
+            let session = format!("stable-usage-{index}");
+            let updated_at = format!("2026-01-02 05:00:{index:02}");
+            insert_thread(
+                &stable,
+                ThreadFixture {
+                    id: index as u8,
+                    paths: &paths,
+                    order: &order,
+                    agent_id: None,
+                    updated_at: &updated_at,
+                    archived: false,
+                    remote: None,
+                    title: "private stable title",
+                    session: &session,
+                    main_paths: None,
+                    main_order: None,
+                },
+            );
+        }
+        for (database, id, updated_at, session) in [
+            (&preview, 10, "2026-01-02 06:00:00", "preview-usage"),
+            (&nightly, 11, "2026-01-02 07:00:00", "nightly-usage"),
+        ] {
+            insert_thread(
+                database,
+                ThreadFixture {
+                    id,
+                    paths: &paths,
+                    order: &order,
+                    agent_id: None,
+                    updated_at,
+                    archived: false,
+                    remote: None,
+                    title: "private non-stable title",
+                    session,
+                    main_paths: None,
+                    main_order: None,
+                },
+            );
+        }
+
+        let threads = create_threads_database(temp.path());
+        for index in 0..MAX_MODEL_ROWS_PER_REFRESH {
+            let session = format!("stable-usage-{index}");
+            let updated_at = format!("2026-01-02T05:00:{index:02}Z");
+            let body = serde_json::to_vec(&serde_json::json!({
+                "cumulative_token_usage": {"input_tokens": 100 + index}
+            }))
+            .unwrap();
+            insert_thread_blob_at(&threads, &session, &updated_at, "json", &body);
+        }
+        for (session, updated_at, total_tokens) in [
+            ("preview-usage", "2026-01-02T06:00:00Z", 600_u64),
+            ("nightly-usage", "2026-01-02T07:00:00Z", 700_u64),
+        ] {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "cumulative_token_usage": {"input_tokens": total_tokens}
+            }))
+            .unwrap();
+            insert_thread_blob_at(&threads, session, updated_at, "json", &body);
+        }
+
+        let usage = load_zed_usage_from_data_roots(&[temp.path().to_path_buf()], NOW_MS).unwrap();
+        assert_eq!(usage.total_tokens, 700);
+        assert_eq!(usage.updated_at_ms, 1_767_337_200_000);
+    }
+
+    #[test]
+    fn cumulative_usage_parser_handles_json_zstd_empty_malformed_and_overflow() {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "cumulative_token_usage": {
+                "input_tokens": 11,
+                "output_tokens": 13,
+                "cache_creation_input_tokens": 17,
+                "cache_read_input_tokens": 19
+            },
+            "request_token_usage": {"private-request-id": {"input_tokens": 999_999}},
+            "messages": [{"User": {"content": "private"}}]
+        }))
+        .unwrap();
+        let mut json_budget = MAX_MODEL_DECOMPRESSED_BYTES_PER_REFRESH;
+        let json = extract_thread_signal_with_budget("json", &body, &mut json_budget).unwrap();
+        assert_eq!(
+            json.cumulative_token_usage
+                .and_then(ThreadTokenUsage::checked_total_tokens),
+            Some(60)
+        );
+
+        let compressed = zstd::stream::encode_all(body.as_slice(), 1).unwrap();
+        let mut zstd_budget = MAX_MODEL_DECOMPRESSED_BYTES_PER_REFRESH;
+        let zstd =
+            extract_thread_signal_with_budget("zstd", &compressed, &mut zstd_budget).unwrap();
+        assert_eq!(zstd.cumulative_token_usage, json.cumulative_token_usage);
+
+        for empty in [
+            br#"{}"#.as_slice(),
+            br#"{"cumulative_token_usage":{}}"#.as_slice(),
+        ] {
+            let mut budget = MAX_MODEL_DECOMPRESSED_BYTES_PER_REFRESH;
+            assert_eq!(
+                extract_thread_signal_with_budget("json", empty, &mut budget)
+                    .unwrap()
+                    .cumulative_token_usage,
+                None
+            );
+        }
+
+        let malformed = br#"{"cumulative_token_usage":{"input_tokens":"private"}}"#;
+        let mut malformed_budget = MAX_MODEL_DECOMPRESSED_BYTES_PER_REFRESH;
+        assert!(
+            extract_thread_signal_with_budget("json", malformed, &mut malformed_budget).is_err()
+        );
+
+        let overflow = format!(
+            "{{\"cumulative_token_usage\":{{\"input_tokens\":{},\"output_tokens\":1}}}}",
+            u64::MAX
+        );
+        let mut overflow_budget = MAX_MODEL_DECOMPRESSED_BYTES_PER_REFRESH;
+        assert!(extract_thread_signal_with_budget(
+            "json",
+            overflow.as_bytes(),
+            &mut overflow_budget
+        )
+        .is_err());
     }
 
     #[test]

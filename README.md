@@ -3,8 +3,9 @@
 VSParallel is a local-first desktop companion for developers working across
 multiple VS Code, Cursor, Antigravity IDE, and Zed windows. It brings every
 workspace into one clear overview, showing open and recent workspaces,
-companion-reported focus where available, and coarse Cursor Agent,
-Antigravity, Zed Agent, Codex, and Claude Code activity at a glance. Zed
+companion-reported focus where available, coarse Cursor Agent, Antigravity, Zed
+Agent, Codex, and Claude Code activity, and six-provider quota, token, or
+context usage at a glance. Zed
 workspaces are discovered automatically through a read-only local adapter;
 they do not install or use the VSParallel companion. Cursor IDE is fully
 supported. Cursor's separate Agents Window has an
@@ -17,17 +18,24 @@ Switch between projects instantly, return to the workspace that needs your
 attention, and access active workspaces directly from the native system tray—all
 without interrupting your flow.
 
-![VSParallel showing workspace activity and Codex and Claude Code usage at a glance](assets/demo.gif)
+![VSParallel showing workspace activity and provider usage at a glance](assets/demo.gif)
 
 VSParallel has no account system, telemetry, analytics, or advertising. Its
 workspace and provider monitoring remain local. VSParallel asks the user's
 installed Codex `app-server` and signed-in Claude CLI for live rate-limit
-percentages and reset times. Each provider subprocess owns its authentication
-and any network connection. VSParallel does not read or store either
-credential, and it does not persist the live usage responses.
+percentages and reset times, and invokes Antigravity's official read-only
+`agy -p "/usage" --output-format json` command for model quota. Each provider
+subprocess owns its authentication and any network connection. VSParallel does
+not read or store provider credentials, and it does not persist those live
+quota responses. The other usage cards are explicitly local signals rather
+than account quota: an opt-in Gemini CLI hook captures the latest model-call
+token count, Zed's read-only adapter derives cumulative tokens for the latest
+native thread, and Cursor reports either the latest local agent turn's input
+and output tokens across IDE Composer or Cursor Agent CLI, or, when available,
+Cursor Agent CLI's richer context-window percentage remaining.
 
 VSParallel does not extract, log, retain, or transmit prompts, responses,
-source code, terminal contents, transcripts, or Git data. Optional hook
+source code, terminal contents, transcripts, or Git data. Optional lifecycle-hook
 integrations receive documented provider event payloads and construct new,
 privacy-minimal records containing only a one-way key, local workspace path,
 coarse state, and timestamp. Cursor `workspaceOpen` records use a deterministic
@@ -50,9 +58,14 @@ metadata where available. A bounded thread blob may be read selectively to
 inspect only its last message variant, tool-use presence, and model
 provider/name, then discarded. Thread titles, prompts, responses, tool
 payloads, and source code are not retained or copied into VSParallel state.
-Live provider usage handling and Claude Code's local status-line fallback
-similarly retain only rate-limit percentages and reset times. Antigravity also
-writes a path- and model-free hook-health receipt containing fixed
+Usage handling similarly narrows provider data to the fields needed for each
+card: quota percentages and reset times for Codex, Claude, and Antigravity; one
+token count for Gemini, Zed, or the latest local Cursor agent turn across IDE
+Composer and Cursor Agent CLI; or one context percentage for Cursor Agent CLI.
+Gemini's documented `AfterModel` payload can contain prompts and responses, but
+the opt-in receiver ignores that content and persists only the timestamp and
+`totalTokenCount`. Antigravity also writes a path- and model-free hook-health
+receipt containing fixed
 event/surface/outcome values, a timestamp, and validated workspace count so Setup can
 distinguish configured from observed execution. See
 [PRIVACY.md](PRIVACY.md) for the complete local-data and cleanup policy.
@@ -98,9 +111,13 @@ affected integration.
    hooks as one integration. The VS Code row manages its companion. Zed is
    detected automatically and needs no companion or hook installation.
 3. Optionally install **Codex lifecycle hooks**, **Claude Code lifecycle
-   hooks**, or both.
-4. Reload editor windows that were already open and restart affected provider
-   sessions.
+   hooks**, and the **Gemini usage hook** for the integrations you use. Gemini
+   token capture is off until its hook is installed. Cursor setup captures the
+   latest local Cursor agent-turn tokens across IDE Composer and Cursor Agent
+   CLI, and also installs richer CLI context capture when no custom status line
+   already occupies that setting.
+4. Reload editor windows that were already open, restart affected provider
+   sessions, and start a new turn so the local captures can run.
 5. Cursor IDE windows report live heartbeats after reload. Cursor exposes its
    experimental Desktop Bridge only to a limited server-controlled rollout. If
    Cursor shows **Settings > Beta > Desktop Bridge > Allow CLI to access desktop
@@ -121,9 +138,12 @@ affected integration.
 All workspace and usage displays are enabled by default. In **Visibility**, each
 editor can be hidden independently; the preference filters both the main
 workspace list and native tray without uninstalling or disabling monitoring.
-Antigravity covers both Antigravity IDE and Antigravity 2.0 rows. The usage
-percentage preference similarly hides the global usage percentages without
-changing Codex or Claude integrations.
+Antigravity covers both Antigravity IDE and Antigravity 2.0 rows. The legacy
+usage-percentage preference hides the complete global usage dashboard without
+reconfiguring any provider integration. While the dashboard is hidden, its
+periodic live provider and Zed refreshes pause; installed Gemini, Claude
+status-line, and Cursor hook receivers remain able to update their minimal
+local records.
 
 The final Codex review is an intentional security boundary. VSParallel reads
 Codex's resulting user-level trust status but never attempts to approve user
@@ -196,8 +216,10 @@ owns the observation and the generic duplicate is suppressed; when multiple
 windows cover it, the generic row avoids guessing. Parallel sessions are
 reduced independently, so one session finishing does not conceal another
 session's newer unresolved activity marker.
-Prompts, responses, email fields, transcripts, token data, and all other
-unselected hook payload fields are discarded. When Cursor launches a hook with
+Prompts, responses, email fields, transcripts, cache-token breakdowns, and all
+other unselected hook payload fields are discarded. A terminal `stop` payload
+may contribute only its checked `input_tokens + output_tokens` total and capture
+time to the separate local Cursor-turn usage record. When Cursor launches a hook with
 the exact, case-sensitive environment value `CURSOR_CODE_REMOTE=true`, the
 handler persists no Cursor activity record; it still returns `{}` and exits
 successfully so monitoring remains fail-open. User-level hooks do not cover
@@ -276,21 +298,46 @@ activity only: it is never marked live or focused and cannot be opened by
 VSParallel. If the same IDE path has a companion heartbeat, the activity is
 associated with that exact window.
 
-The global usage cards refresh every 60 seconds and when **Refresh** is selected.
-Codex usage is available when a signed-in local `codex` executable—on `PATH`
-or bundled with a locally installed Codex editor extension—supports
-`app-server`. It does not depend on the Codex lifecycle hooks.
-Claude Code usage is available when a signed-in `claude` executable—on `PATH`
-or bundled with the installed Claude editor extension—supports the CLI/SDK
-control-channel usage getter. This is an evolving Claude CLI compatibility
-interface, not a documented stable standalone command. VSParallel actively asks
-it for the five-hour and seven-day windows, so usage works for graphical Claude
-sessions in VS Code-compatible editors that do not run `statusLine`. Lifecycle
-hooks and status-line installation are not required for the active query. The
-managed `statusLine` cache remains a local fallback for terminal Claude and older versions. If the
-user already has a custom status line, VSParallel preserves it; only that
-cache's managed refresh is unavailable, and any existing record may remain
-visible as stale.
+The global usage dashboard has cards for Codex, Claude Code, Gemini CLI,
+Antigravity, Zed Agent, and Cursor. It refreshes every 60 seconds and when
+**Refresh** is selected. The cards deliberately label three different kinds of
+information instead of presenting every value as plan quota:
+
+- **Codex** quota is available when a signed-in local `codex` executable—on
+  `PATH` or bundled with a locally installed Codex editor extension—supports
+  `app-server`. It does not depend on the Codex lifecycle hooks.
+- **Claude Code** quota is available when a signed-in `claude` executable—on
+  `PATH` or bundled with the installed Claude extension—supports the CLI/SDK
+  control-channel usage getter. VSParallel asks it for the five-hour and
+  seven-day windows. This is an evolving compatibility interface, not a
+  documented stable standalone command. The managed `statusLine` cache remains
+  a fallback for terminal Claude and older versions; a custom status line is
+  preserved, so only that fallback refresh becomes unavailable.
+- **Antigravity** quota comes only from its official read-only
+  `agy -p "/usage" --output-format json` command. VSParallel keeps the bounded
+  bucket name, window, remaining fraction, and reset time and discards the rest.
+  Antigravity CLI 1.1.11 or newer is required for this command.
+- **Gemini CLI** displays the latest model-call token count captured by an
+  opt-in documented global `AfterModel` hook. The hook payload can contain the
+  request and response; VSParallel ignores that content and keeps only
+  `usageMetadata.totalTokenCount` and a local timestamp. This is local activity
+  telemetry, not Gemini subscription quota; use `/stats model` inside Gemini
+  CLI for its live quota view.
+- **Zed Agent** displays cumulative tokens from the newest valid native thread
+  found by the existing bounded, read-only Zed adapter. The value is not copied
+  into VSParallel's state directory and is not Zed billing or plan quota.
+- **Cursor** displays the latest Cursor Agent CLI context-window percentage
+  remaining when its optional custom status-line capture is available.
+  Otherwise, the card displays the input and output token total from the latest
+  local Cursor agent turn across IDE Composer or Cursor Agent CLI. Cursor setup
+  installs or repairs both sources while preserving an existing custom CLI
+  status line. Neither value is Cursor plan or billing quota.
+
+Graphical Claude sessions in VS Code-compatible editors do not run
+`statusLine`; the active query supplies their quota independently of lifecycle
+hooks or fallback installation. Gemini token, Zed token, and both Cursor
+observations are marked stale after 15 minutes and become unavailable after 24
+hours rather than being presented as current indefinitely.
 
 Claude's current full-usage getter also calculates local attribution summaries.
 VSParallel prevents it from seeing real session history by running the query
@@ -344,10 +391,11 @@ together. The experimental Cursor Agents Window bridge is configured
 separately, is excluded from normal editor setup, and stays off until explicitly
 enabled.
 
-The Cursor, Antigravity, Codex, and Claude Code integrations merge VSParallel-owned
-handlers into their user configuration. Existing unrelated settings and hooks
-are preserved, writes are atomic, and a one-time backup is created before the
-first change. Removing an integration removes only its recognized
+The Cursor, Antigravity, Codex, Claude Code, and Gemini integrations merge
+VSParallel-owned handlers into their user configuration. Existing unrelated
+settings, hooks, and status lines are preserved, writes are atomic, and a
+one-time backup is created before the first change. Removing an integration
+removes only its recognized
 VSParallel-owned handlers and purges its app-owned workspace or activity
 records after removal is verified. A local suppression marker prevents a still-running
 editor or provider process from making those records visible again; reinstalling
@@ -357,8 +405,10 @@ unavailable editor CLI prevents physical removal, and reports physical removal
 as unverified whenever the required CLI cannot be used. That condition is a
 warning rather than a failure of the completed local cleanup.
 Configuration backups and unrelated settings remain untouched. Cursor preserves
-`~/.cursor/hooks.json.vsparallel.bak`, and Antigravity preserves
-`~/.gemini/config/hooks.json.vsparallel.bak`, for manual cleanup.
+`~/.cursor/hooks.json.vsparallel.bak` and
+`~/.cursor/cli-config.json.vsparallel.bak`; Antigravity preserves
+`~/.gemini/config/hooks.json.vsparallel.bak`; and Gemini CLI preserves
+`~/.gemini/settings.json.vsparallel.bak`, for manual cleanup.
 
 When no `statusLine` is configured, the Claude Code integration also installs a
 privacy-minimal fallback usage capture command with a 60-second refresh
@@ -366,6 +416,20 @@ interval. An existing custom `statusLine` is unrelated user configuration and
 is left unchanged. Lifecycle monitoring and the active Claude usage query can
 still work; only VSParallel's managed refresh of the status-line fallback is
 disabled.
+
+Cursor setup applies the same conflict-preserving rule to
+`~/.cursor/cli-config.json`: when its `statusLine` setting is unoccupied,
+VSParallel installs a command that receives Cursor Agent CLI's documented
+context-window percentages. A custom status line is never replaced or wrapped,
+so local Cursor agent-turn token capture continues to work while the richer CLI
+context capture remains unavailable. Reload Cursor IDE after setup and start a
+new turn in IDE Composer or Cursor Agent CLI; open a new CLI session for context
+capture.
+
+The Gemini usage hook is installed in the documented global
+`~/.gemini/settings.json`, or under the user-home root selected by
+`GEMINI_CLI_HOME`. VSParallel preserves `hooksConfig` and reports when hooks are
+globally disabled or `vsparallel-usage` appears in its disabled-name list.
 
 To use VS Code Insiders or another installation, set
 `VSPARALLEL_CODE_COMMAND` to its absolute executable path before launching
@@ -404,33 +468,46 @@ other source if the first query fails. To select another signed-in executable,
 set
 `VSPARALLEL_CLAUDE_COMMAND` to its absolute path before launching VSParallel.
 
+Antigravity quota uses `agy` on `PATH`. To select another Antigravity CLI, set
+`VSPARALLEL_ANTIGRAVITY_COMMAND` to its absolute path before launching
+VSParallel. The value is invoked directly and is never interpreted as shell
+syntax.
+
 ## How it works
 
 ```text
 VS Code / Cursor IDE / Antigravity IDE companion ─ live workspace heartbeat ──────┐
-Zed read-only SQLite + process adapter ─ open/recent + saved agent metadata ───────┤
-Cursor native user hooks ───── recent workspace-open/lifecycle metadata ──────────┤
+Zed read-only SQLite + process adapter ─ workspaces + agent metadata/tokens ───────┤
+Cursor native user hooks ───── lifecycle metadata + latest Cursor turn tokens ───┤
+Cursor Agent statusLine ─────── optional richer CLI context remaining ────────────┤
 Cursor Desktop Bridge (opt-in) ─ matched thread status, memory only ───────────────┤
 Antigravity agent hooks ────── recent product/path lifecycle marker ──────────────┤
 Codex hooks ─────────────────── coarse lifecycle marker ──────────────────────────┤─ local state ─┐
 Claude Code hooks ───────────── coarse lifecycle marker ──────────────────────────┤               │
-Claude Code statusLine ───────── fallback usage cache ────────────────────────────┘               │
-Claude CLI control ───────────── live usage percentages/reset times ──────────────────────────────┤─ Rust core ─ Tauri UI
-Codex app-server ─────────────── hook trust + live usage percentages/reset times ─────────────────┘             └─ native tray
+Gemini CLI AfterModel hook ───── latest model-call tokens ────────────────────────┤               │
+Claude Code statusLine ───────── fallback quota cache ────────────────────────────┘               │
+Antigravity `agy /usage` ─────── live model quota ────────────────────────────────────────────────┤
+Claude CLI control ───────────── live quota percentages/reset times ──────────────────────────────┤─ Rust core ─ Tauri UI
+Codex app-server ─────────────── hook trust + live quota percentages/reset times ─────────────────┘             └─ native tray
 ```
 
 The desktop application uses Tauri 2, a Rust backend, and a framework-free
 HTML/CSS/TypeScript UI compiled to static JavaScript. The dependency-free
 companion extension writes local workspace heartbeats. Optional provider hooks
-write only coarse lifecycle records. The separate Zed adapter reads Zed-owned
-SQLite and process metadata without writing a heartbeat or lifecycle record.
-Claude and Codex limits are fetched live
-through their provider-owned processes and are not written to the state
-directory. The Claude Code status-line fallback writes a separate global
-`usage/claude.json` record containing only captured percentages, reset times,
-and a capture timestamp. The Rust backend validates these records and serves
-UI-safe snapshots to the main window; the workspace snapshot also feeds the
-native tray menu.
+write privacy-minimal lifecycle records; Cursor's terminal hook separately
+writes only its latest local agent-turn token total, and the Gemini usage hook
+writes only its minimal token record. The separate Zed adapter reads Zed-owned
+SQLite and process metadata, including the latest valid native thread's
+cumulative token counters, without writing a heartbeat, lifecycle, or usage
+record. Codex and Claude limits and Antigravity quota are fetched live through
+provider-owned processes and are not written to the state directory. The
+Claude Code status-line fallback writes `usage/claude.json`; the opt-in Gemini
+hook writes `usage/gemini.json`; Cursor's terminal hook writes
+`usage/cursor-turn.json`; and its managed Cursor Agent CLI status line writes
+`usage/cursor.json`. Each record contains only its bounded display metric and a
+capture timestamp. The Rust backend validates these records and
+serves UI-safe snapshots to the main window; the workspace snapshot also feeds
+the native tray menu.
 
 Lifecycle state is normally hook-derived rather than an internal provider
 progress feed. When the experimental Cursor Desktop Bridge is enabled, its
@@ -480,8 +557,9 @@ VSParallel stores only the metadata required for the workspace overview:
 - for Zed, validated local workspace paths and timestamps, current
   session/window correlation, and the latest persisted associated agent ID,
   activity timestamp, structural user/assistant turn boundary, tool-use
-  presence, and native model provider/name when available; these are read from
-  Zed-owned databases and are not copied to the VSParallel state directory;
+  presence, native model provider/name, and cumulative token count when
+  available; these are read from Zed-owned databases and are not copied to the
+  VSParallel state directory;
 - whether the configured Codex and Claude Code extensions are installed and
   active in a VS Code, Cursor, or Antigravity IDE window/profile and, when known,
   whether they run in the local or remote extension host;
@@ -504,17 +582,26 @@ VSParallel stores only the metadata required for the workspace overview:
   used only to avoid merging duplicate live observations; raw thread IDs,
   titles, bridge credentials and paths, prompts, and responses are not retained;
 - Antigravity hook execution health containing fixed event, surface, and
-  outcome values plus timestamp and validated workspace count, but no model; and
+  outcome values plus timestamp and validated workspace count, but no model;
 - Claude Code five-hour and weekly usage percentages, their optional reset
   times, and the local capture timestamp only when the managed status-line
-  fallback cache is available.
+  fallback cache is available;
+- Gemini CLI's latest model-call `totalTokenCount` and a capture timestamp only
+  when the opt-in `AfterModel` hook is installed;
+- Cursor Agent CLI's latest context percentage remaining and capture timestamp
+  in `usage/cursor.json`; and
+- the latest local Cursor agent turn's input and output token total and capture
+  timestamp in `usage/cursor-turn.json`.
 
-Live Codex and Claude usage is held only in memory while VSParallel is running.
-VSParallel does not write live usage or provider account details to the state
-directory. The provider cards show the lowest remaining percentage among the
-available windows so the compact summary does not overstate capacity. A recent,
-unexpired value may remain visible with a **Stale** badge for up to 15 minutes
-if a refresh temporarily fails.
+Live Codex and Claude quota and Antigravity's official `/usage` result are held
+only in memory while VSParallel is running. VSParallel does not write those
+responses or provider account details to the state directory. Quota cards show
+the lowest remaining percentage among available windows so the compact summary
+does not overstate capacity. Gemini and Zed cards show token counts without a
+percentage gauge; Cursor shows CLI context remaining when available and latest
+local Cursor turn tokens otherwise. Neither is presented as Cursor quota. A recent,
+unexpired live quota value may remain visible with a
+**Stale** badge for up to 15 minutes if a refresh temporarily fails.
 
 | Platform | Default state directory |
 | --- | --- |
@@ -523,9 +610,10 @@ if a refresh temporarily fails.
 | Windows | `%LOCALAPPDATA%\VSParallel` |
 
 Set `VSPARALLEL_STATE_DIR` to the same absolute path for VSParallel, its
-companion-backed editors, Cursor hooks, Codex, Claude Code, and Antigravity only
-when overriding these defaults. Zed is read from its own data root; override
-that separately with `VSPARALLEL_ZED_DATA_DIR`.
+companion-backed editors, Cursor hooks and status line, Codex, Claude Code,
+Antigravity, and the Gemini usage hook only when overriding these defaults. Zed
+is read from its own data root; override that separately with
+`VSPARALLEL_ZED_DATA_DIR`.
 
 Stale heartbeats are hidden after 60 seconds, and lifecycle state older than 24
 hours is shown as **Unknown**. During normal monitoring, VSParallel bounds
@@ -705,9 +793,10 @@ the Rust backend.
 ## Uninstall and remove local data
 
 1. Open **Setup & diagnostics** in VSParallel.
-2. Use **Uninstall** on the VS Code, Cursor, Antigravity, Codex, and Claude Code
-   rows you want to remove, or choose **Uninstall all**. Cursor and Antigravity
-   each remove their companion and hooks together.
+2. Use **Uninstall** on the VS Code, Cursor, Antigravity, Codex, Claude Code,
+   and Gemini rows you want to remove, or choose **Uninstall all**. Cursor and
+   Antigravity each remove their companion and hooks together; Cursor also
+   removes only its recognized CLI context status line.
 3. Reload open editor windows and provider sessions.
 4. Uninstall the desktop package with the operating system's package manager.
 
@@ -724,8 +813,9 @@ external component cannot be removed or its absence cannot be verified; that
 physical-removal problem is reported.
 Per-editor uninstall does not change the separate experimental Cursor Agents
 Window preference; **Uninstall all** turns that option off. Integration removal
-does not disable automatic read-only Zed discovery or live provider usage
-checks. It intentionally preserves unrelated provider configuration, one-time
+does not disable automatic read-only Zed discovery or the provider-owned live
+quota checks for Codex, Claude, and Antigravity. It intentionally preserves
+unrelated provider configuration, one-time
 configuration backups, display preferences, and the state-directory container.
 To erase every remaining VSParallel file, quit VSParallel and the supported
 editors, then follow the cleanup instructions in [PRIVACY.md](PRIVACY.md).

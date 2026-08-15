@@ -10,13 +10,14 @@
     | "antigravityIde"
     | "cursor"
     | "antigravity"
+    | "gemini"
     | "codex"
     | "claude";
   type EditorIntegrationKind = Extract<
     IntegrationKind,
     "companion" | "cursorCompanion" | "antigravityIde"
   >;
-  type VisibleIntegrationKind = EditorIntegrationKind | "codex" | "claude";
+  type VisibleIntegrationKind = EditorIntegrationKind | "gemini" | "codex" | "claude";
   type EditorVisibilityKind = "vscode" | "cursor" | "antigravity" | "zed";
   type IntegrationActionKind = IntegrationKind | "all";
   type IntegrationOperation = "install" | "uninstall";
@@ -44,8 +45,9 @@
     | "gpt_oss"
     | "gpt_oss_120b"
     | "gpt_oss_120b_medium";
-  type UsageKind = "codex" | "claude";
+  type UsageKind = "codex" | "claude" | "gemini" | "antigravity" | "zed" | "cursor";
   type UsageState = "available" | "stale" | "unavailable";
+  type UsageMetricKind = "quota" | "context" | "tokens" | "none";
   type NoticeKind = "error" | "warning";
   type IntegrationMessageKind = "neutral" | "warning" | "error" | "success";
   type UpdatePhase =
@@ -77,6 +79,7 @@
     | "install_antigravity_hooks"
     | "install_antigravity_ide_companion"
     | "install_antigravity_monitoring"
+    | "install_gemini_usage"
     | "is_release_build"
     | "open_workspace"
     | "restore_full_window"
@@ -93,6 +96,7 @@
     | "uninstall_antigravity_hooks"
     | "uninstall_antigravity_ide_companion"
     | "uninstall_antigravity_monitoring"
+    | "uninstall_gemini_usage"
     | "uninstall_all_integrations";
 
   interface ActivityView {
@@ -153,7 +157,10 @@
   interface UsageProvider {
     providerName: string;
     state: UsageState;
+    metricKind: UsageMetricKind;
     remainingPercent: number | null;
+    tokenCount: number | null;
+    metricLabel: string;
     windowLabel: string;
     resetsAtMs: number | null;
     updatedAtMs: number | null;
@@ -166,6 +173,10 @@
     generatedAtMs: number;
     codex: UsageProvider;
     claude: UsageProvider;
+    gemini: UsageProvider;
+    antigravity: UsageProvider;
+    zed: UsageProvider;
+    cursor: UsageProvider;
   }
 
   interface IntegrationComponent {
@@ -190,6 +201,7 @@
     antigravityIde: IntegrationComponent;
     cursor: IntegrationComponent;
     antigravity: IntegrationComponent;
+    gemini: IntegrationComponent;
     codex: IntegrationComponent;
     claude: IntegrationComponent;
     requiresRestart: boolean;
@@ -220,6 +232,14 @@
     meta: HTMLParagraphElement;
     installButton: HTMLButtonElement;
     uninstallButton: HTMLButtonElement;
+  }
+
+  interface UsageElements {
+    card: HTMLElement;
+    value: HTMLElement;
+    stateLabel: HTMLSpanElement;
+    meter: HTMLDivElement;
+    detail: HTMLSpanElement;
   }
 
   interface VisibilityPreferences {
@@ -273,6 +293,8 @@
   interface AppState {
     refreshPending: boolean;
     usagePending: boolean;
+    usageRefreshPromise: Promise<void> | null;
+    usageRefreshGeneration: number;
     diagnosticsPending: boolean;
     diagnosticsLoaded: boolean;
     diagnosticsUnavailable: boolean;
@@ -350,6 +372,7 @@
     "antigravityIde",
     "cursor",
     "antigravity",
+    "gemini",
     "codex",
     "claude",
   ] as const;
@@ -357,6 +380,7 @@
     "companion",
     "cursorCompanion",
     "antigravityIde",
+    "gemini",
     "codex",
     "claude",
   ] as const satisfies readonly VisibleIntegrationKind[];
@@ -460,6 +484,26 @@
     claudeUsageState: requiredElement<HTMLSpanElement>("#claudeUsageState"),
     claudeUsageMeter: requiredElement<HTMLDivElement>("#claudeUsageMeter"),
     claudeUsageDetail: requiredElement<HTMLSpanElement>("#claudeUsageDetail"),
+    geminiUsage: requiredElement<HTMLElement>("#geminiUsage"),
+    geminiUsageValue: requiredElement<HTMLElement>("#geminiUsageValue"),
+    geminiUsageState: requiredElement<HTMLSpanElement>("#geminiUsageState"),
+    geminiUsageMeter: requiredElement<HTMLDivElement>("#geminiUsageMeter"),
+    geminiUsageDetail: requiredElement<HTMLSpanElement>("#geminiUsageDetail"),
+    antigravityUsage: requiredElement<HTMLElement>("#antigravityUsage"),
+    antigravityUsageValue: requiredElement<HTMLElement>("#antigravityUsageValue"),
+    antigravityUsageState: requiredElement<HTMLSpanElement>("#antigravityUsageState"),
+    antigravityUsageMeter: requiredElement<HTMLDivElement>("#antigravityUsageMeter"),
+    antigravityUsageDetail: requiredElement<HTMLSpanElement>("#antigravityUsageDetail"),
+    zedUsage: requiredElement<HTMLElement>("#zedUsage"),
+    zedUsageValue: requiredElement<HTMLElement>("#zedUsageValue"),
+    zedUsageState: requiredElement<HTMLSpanElement>("#zedUsageState"),
+    zedUsageMeter: requiredElement<HTMLDivElement>("#zedUsageMeter"),
+    zedUsageDetail: requiredElement<HTMLSpanElement>("#zedUsageDetail"),
+    cursorUsage: requiredElement<HTMLElement>("#cursorUsage"),
+    cursorUsageValue: requiredElement<HTMLElement>("#cursorUsageValue"),
+    cursorUsageState: requiredElement<HTMLSpanElement>("#cursorUsageState"),
+    cursorUsageMeter: requiredElement<HTMLDivElement>("#cursorUsageMeter"),
+    cursorUsageDetail: requiredElement<HTMLSpanElement>("#cursorUsageDetail"),
     workspaceList: requiredElement<HTMLDivElement>("#workspaceList"),
     errorBanner: requiredElement<HTMLDivElement>("#errorBanner"),
     errorText: requiredElement<HTMLSpanElement>("#errorText"),
@@ -536,6 +580,13 @@
     antigravityIdeUninstallButton: requiredElement<HTMLButtonElement>(
       "#antigravityIdeUninstallButton",
     ),
+    geminiCard: requiredElement<HTMLElement>("#geminiCard"),
+    geminiStatus: requiredElement<HTMLSpanElement>("#geminiStatus"),
+    geminiDetail: requiredElement<HTMLParagraphElement>("#geminiDetail"),
+    geminiUsageHelpStatus: requiredElement<HTMLSpanElement>("#geminiUsageHelpStatus"),
+    geminiMeta: requiredElement<HTMLParagraphElement>("#geminiMeta"),
+    geminiInstallButton: requiredElement<HTMLButtonElement>("#geminiInstallButton"),
+    geminiUninstallButton: requiredElement<HTMLButtonElement>("#geminiUninstallButton"),
     codexCard: requiredElement<HTMLElement>("#codexCard"),
     codexStatus: requiredElement<HTMLSpanElement>("#codexStatus"),
     codexDetail: requiredElement<HTMLParagraphElement>("#codexDetail"),
@@ -577,6 +628,8 @@
   const state: AppState = {
     refreshPending: false,
     usagePending: false,
+    usageRefreshPromise: null,
+    usageRefreshGeneration: 0,
     diagnosticsPending: false,
     diagnosticsLoaded: false,
     diagnosticsUnavailable: false,
@@ -846,6 +899,7 @@
       "needs_repair",
       "modified",
       "partial",
+      "manual_action_required",
     ]);
     const errorStates = new Set(["error", "failed", "unavailable", "unsupported"]);
     const installedVersion = asString(raw.installedVersion);
@@ -900,11 +954,13 @@
               ? "Antigravity IDE companion status details are unavailable."
               : kind === "cursor"
                 ? "Cursor hooks-only status details are unavailable."
-              : kind === "antigravity"
+                : kind === "antigravity"
                   ? "Antigravity activity hook status details are unavailable."
-                  : kind === "codex"
-                    ? "Codex lifecycle hook status details are unavailable."
-                    : "Claude Code lifecycle hook status details are unavailable.",
+                  : kind === "gemini"
+                    ? "Gemini usage hook status details are unavailable."
+                    : kind === "codex"
+                      ? "Codex lifecycle hook status details are unavailable."
+                      : "Claude Code lifecycle hook status details are unavailable.",
       ),
       installedVersion,
       targetVersion: asString(raw.targetVersion),
@@ -929,6 +985,7 @@
       antigravityIde: normalizeIntegrationComponent(raw.antigravityIde, "antigravityIde"),
       cursor: normalizeIntegrationComponent(raw.cursor, "cursor"),
       antigravity: normalizeIntegrationComponent(raw.antigravity, "antigravity"),
+      gemini: normalizeIntegrationComponent(raw.gemini, "gemini"),
       codex: normalizeIntegrationComponent(raw.codex, "codex"),
       claude: normalizeIntegrationComponent(raw.claude, "claude"),
       requiresRestart: raw.requiresRestart === true,
@@ -1256,6 +1313,29 @@
     };
   }
 
+  function normalizeUsageMetricKind(
+    value: unknown,
+    remainingPercent: number | null,
+    tokenCount: number | null,
+    hasWindows: boolean,
+  ): UsageMetricKind {
+    const token = normalizeStateToken(value);
+    if (["quota", "context", "tokens", "none"].includes(token)) {
+      return token as UsageMetricKind;
+    }
+    if (value !== undefined && value !== null && asString(value)) {
+      return "none";
+    }
+    if (tokenCount !== null) {
+      return "tokens";
+    }
+    if (remainingPercent !== null || hasWindows) {
+      // Snapshots from versions before metricKind represented Codex and Claude quotas.
+      return "quota";
+    }
+    return "none";
+  }
+
   function normalizeUsageProvider(rawValue: unknown, providerName: string): UsageProvider {
     const raw = isObject(rawValue) ? rawValue : {};
     const windows = isUnknownArray(raw.windows)
@@ -1273,17 +1353,41 @@
       raw.summaryRemainingPercent ?? raw.remainingPercent,
     );
     const remainingPercent = suppliedRemaining ?? limitingWindow?.remainingPercent ?? null;
+    const suppliedTokenCount = asFiniteNumber(raw.tokenCount);
+    const tokenCount = suppliedTokenCount !== null
+        && Number.isSafeInteger(suppliedTokenCount)
+        && suppliedTokenCount >= 0
+      ? suppliedTokenCount
+      : null;
+    const metricKind = normalizeUsageMetricKind(
+      raw.metricKind,
+      remainingPercent,
+      tokenCount,
+      windows.length > 0,
+    );
     const rawState = normalizeStateToken(raw.state);
-    const available = remainingPercent !== null
-      && !["unavailable", "unsupported", "not_authenticated", "unknown"].includes(rawState);
+    const metricAvailable = metricKind === "tokens"
+      ? tokenCount !== null
+      : ["quota", "context"].includes(metricKind) && remainingPercent !== null;
+    const available = metricAvailable && ["available", "stale"].includes(rawState);
+    const metricLabel = asString(
+      raw.metricLabel,
+      asString(
+        raw.summaryWindowLabel ?? raw.windowLabel,
+        limitingWindow?.label || "",
+      ),
+    );
 
     return {
       providerName,
       state: available ? (rawState === "stale" ? "stale" : "available") : "unavailable",
-      remainingPercent: available ? remainingPercent : null,
+      metricKind,
+      remainingPercent: available && metricKind !== "tokens" ? remainingPercent : null,
+      tokenCount: available && metricKind === "tokens" ? tokenCount : null,
+      metricLabel,
       windowLabel: asString(
         raw.summaryWindowLabel ?? raw.windowLabel,
-        limitingWindow?.label || "Usage limit",
+        limitingWindow?.label || metricLabel || "Usage limit",
       ),
       resetsAtMs: asTimestamp(
         raw.summaryResetsAtMs ?? raw.resetsAtMs,
@@ -1306,7 +1410,18 @@
       generatedAtMs: asTimestamp(raw.generatedAtMs) ?? Date.now(),
       codex: normalizeUsageProvider(raw.codex, "Codex"),
       claude: normalizeUsageProvider(raw.claude, "Claude"),
+      gemini: normalizeUsageProvider(raw.gemini, "Gemini"),
+      antigravity: normalizeUsageProvider(raw.antigravity, "Antigravity"),
+      zed: normalizeUsageProvider(raw.zed, "Zed Agent"),
+      cursor: normalizeUsageProvider(raw.cursor, "Cursor"),
     };
+  }
+
+  function usageProviderHasMetric(provider: UsageProvider): boolean {
+    return provider.metricKind === "tokens"
+      ? provider.tokenCount !== null
+      : ["quota", "context"].includes(provider.metricKind)
+        && provider.remainingPercent !== null;
   }
 
   function usageProviderWithFallback(
@@ -1314,7 +1429,20 @@
     previous: UsageProvider | null,
     nowMs: number,
   ): UsageProvider {
-    if (!previous || current.remainingPercent !== null || previous.remainingPercent === null) {
+    const normalizedDetail = current.detail.toLowerCase();
+    const captureNeedsSetup = [
+      "capture is disabled",
+      "disable hooks",
+      "not installed",
+      "repair",
+      "conflict",
+    ].some((marker) => normalizedDetail.includes(marker));
+    if (
+      captureNeedsSetup
+      || !previous
+      || usageProviderHasMetric(current)
+      || !usageProviderHasMetric(previous)
+    ) {
       return current;
     }
 
@@ -1343,7 +1471,9 @@
     return {
       ...previous,
       state: "stale",
-      remainingPercent: limitingWindow?.remainingPercent ?? previous.remainingPercent,
+      remainingPercent: previous.metricKind === "tokens"
+        ? null
+        : limitingWindow?.remainingPercent ?? previous.remainingPercent,
       windowLabel: limitingWindow?.label || previous.windowLabel,
       resetsAtMs: limitingWindow ? limitingWindow.resetsAtMs : previous.resetsAtMs,
       detail: current.detail || "Provider refresh failed; showing the last known value.",
@@ -1363,6 +1493,14 @@
       ...current,
       codex: usageProviderWithFallback(current.codex, previous.codex, nowMs),
       claude: usageProviderWithFallback(current.claude, previous.claude, nowMs),
+      gemini: usageProviderWithFallback(current.gemini, previous.gemini, nowMs),
+      antigravity: usageProviderWithFallback(
+        current.antigravity,
+        previous.antigravity,
+        nowMs,
+      ),
+      zed: usageProviderWithFallback(current.zed, previous.zed, nowMs),
+      cursor: usageProviderWithFallback(current.cursor, previous.cursor, nowMs),
     };
   }
 
@@ -1373,6 +1511,10 @@
       generatedAtMs: Date.now(),
       codex: { ...unavailable, providerName: "Codex" },
       claude: { ...unavailable, providerName: "Claude" },
+      gemini: { ...unavailable, providerName: "Gemini" },
+      antigravity: { ...unavailable, providerName: "Antigravity" },
+      zed: { ...unavailable, providerName: "Zed Agent" },
+      cursor: { ...unavailable, providerName: "Cursor" },
     };
   }
 
@@ -1906,22 +2048,52 @@
     }
   }
 
-  function usageElements(kind: UsageKind) {
-    return kind === "codex"
-      ? {
-          card: elements.codexUsage,
-          value: elements.codexUsageValue,
-          stateLabel: elements.codexUsageState,
-          meter: elements.codexUsageMeter,
-          detail: elements.codexUsageDetail,
-        }
-      : {
-          card: elements.claudeUsage,
-          value: elements.claudeUsageValue,
-          stateLabel: elements.claudeUsageState,
-          meter: elements.claudeUsageMeter,
-          detail: elements.claudeUsageDetail,
-        };
+  function usageElements(kind: UsageKind): UsageElements {
+    const targets: Record<UsageKind, UsageElements> = {
+      codex: {
+        card: elements.codexUsage,
+        value: elements.codexUsageValue,
+        stateLabel: elements.codexUsageState,
+        meter: elements.codexUsageMeter,
+        detail: elements.codexUsageDetail,
+      },
+      claude: {
+        card: elements.claudeUsage,
+        value: elements.claudeUsageValue,
+        stateLabel: elements.claudeUsageState,
+        meter: elements.claudeUsageMeter,
+        detail: elements.claudeUsageDetail,
+      },
+      gemini: {
+        card: elements.geminiUsage,
+        value: elements.geminiUsageValue,
+        stateLabel: elements.geminiUsageState,
+        meter: elements.geminiUsageMeter,
+        detail: elements.geminiUsageDetail,
+      },
+      antigravity: {
+        card: elements.antigravityUsage,
+        value: elements.antigravityUsageValue,
+        stateLabel: elements.antigravityUsageState,
+        meter: elements.antigravityUsageMeter,
+        detail: elements.antigravityUsageDetail,
+      },
+      zed: {
+        card: elements.zedUsage,
+        value: elements.zedUsageValue,
+        stateLabel: elements.zedUsageState,
+        meter: elements.zedUsageMeter,
+        detail: elements.zedUsageDetail,
+      },
+      cursor: {
+        card: elements.cursorUsage,
+        value: elements.cursorUsageValue,
+        stateLabel: elements.cursorUsageState,
+        meter: elements.cursorUsageMeter,
+        detail: elements.cursorUsageDetail,
+      },
+    };
+    return targets[kind];
   }
 
   function usageLevel(remainingPercent: number): "critical" | "warning" | "normal" {
@@ -1934,12 +2106,28 @@
     return "normal";
   }
 
+  function resetUsageMeter(meter: HTMLDivElement, hidden: boolean): void {
+    meter.hidden = hidden;
+    meter.removeAttribute("role");
+    meter.removeAttribute("aria-label");
+    meter.removeAttribute("aria-valuemin");
+    meter.removeAttribute("aria-valuemax");
+    meter.removeAttribute("aria-valuenow");
+    meter.removeAttribute("aria-valuetext");
+    meter.setAttribute("aria-hidden", "true");
+  }
+
+  function formatTokenCount(tokenCount: number): string {
+    return new Intl.NumberFormat(undefined, { maximumFractionDigits: 0 }).format(tokenCount);
+  }
+
   function renderUsageProvider(kind: UsageKind, provider: UsageProvider): string {
     const target = usageElements(kind);
     const remainingPercent = provider.remainingPercent;
-    const available = remainingPercent !== null;
+    const available = usageProviderHasMetric(provider);
     const stale = available && provider.state === "stale";
     target.card.dataset.state = available ? (stale ? "stale" : "available") : "unavailable";
+    target.card.dataset.metricKind = available ? provider.metricKind : "none";
     target.stateLabel.hidden = !stale;
 
     if (!available) {
@@ -1947,17 +2135,42 @@
       target.card.style.setProperty("--usage-remaining", "0");
       target.value.textContent = "—";
       target.detail.textContent = provider.detail || "Usage unavailable";
-      target.meter.removeAttribute("role");
-      target.meter.removeAttribute("aria-label");
-      target.meter.removeAttribute("aria-valuemin");
-      target.meter.removeAttribute("aria-valuemax");
-      target.meter.removeAttribute("aria-valuenow");
-      target.meter.removeAttribute("aria-valuetext");
-      target.meter.setAttribute("aria-hidden", "true");
+      resetUsageMeter(target.meter, false);
       target.card.title = provider.detail || `${provider.providerName} usage is unavailable.`;
       return provider.detail
         ? `${provider.providerName} usage unavailable: ${provider.detail}`
         : `${provider.providerName} usage unavailable`;
+    }
+
+    if (provider.metricKind === "tokens" && provider.tokenCount !== null) {
+      delete target.card.dataset.level;
+      target.card.style.setProperty("--usage-remaining", "0");
+      const formattedTokens = formatTokenCount(provider.tokenCount);
+      const updateLabel = provider.updatedAtMs !== null
+          && Number.isFinite(provider.updatedAtMs)
+        ? formatRelativeTime(provider.updatedAtMs).toLowerCase()
+        : "";
+      const detailParts = [provider.metricLabel || "Local token usage", updateLabel];
+      if (stale) {
+        detailParts.push("last known value");
+      }
+      target.value.textContent = `${formattedTokens} tokens`;
+      target.detail.textContent = detailParts.filter(Boolean).join(" · ");
+      resetUsageMeter(target.meter, true);
+      target.card.title = [
+        `${provider.providerName}: ${formattedTokens} tokens`,
+        provider.metricLabel,
+        updateLabel,
+        stale ? "last known value" : "",
+        provider.detail,
+      ].filter(Boolean).join(" · ");
+      return `${provider.providerName} ${formattedTokens} tokens${stale ? " (last known)" : ""}`;
+    }
+
+    if (remainingPercent === null) {
+      // usageProviderHasMetric keeps this unreachable, but retain a closed rendering fallback.
+      resetUsageMeter(target.meter, false);
+      return `${provider.providerName} usage unavailable`;
     }
 
     const roundedRemaining = Math.round(remainingPercent);
@@ -1965,25 +2178,36 @@
     const updateLabel = provider.updatedAtMs !== null && Number.isFinite(provider.updatedAtMs)
       ? formatRelativeTime(provider.updatedAtMs).toLowerCase()
       : "";
-    const detailParts = [provider.windowLabel, resetLabel];
+    const isContext = provider.metricKind === "context";
+    const detailParts = isContext
+      ? [provider.metricLabel || provider.windowLabel, updateLabel]
+      : [provider.windowLabel, resetLabel];
     if (stale) {
       detailParts.push("last known value");
     }
     target.card.dataset.level = usageLevel(remainingPercent);
     target.card.style.setProperty("--usage-remaining", remainingPercent.toFixed(2));
-    target.value.textContent = `${roundedRemaining}% left`;
-    target.detail.textContent = detailParts.join(" · ");
+    target.value.textContent = isContext
+      ? `${roundedRemaining}% context left`
+      : `${roundedRemaining}% left`;
+    target.detail.textContent = detailParts.filter(Boolean).join(" · ");
+    target.meter.hidden = false;
     target.meter.removeAttribute("aria-hidden");
     target.meter.setAttribute("role", "meter");
-    target.meter.setAttribute("aria-label", `${provider.providerName} usage remaining`);
+    target.meter.setAttribute(
+      "aria-label",
+      `${provider.providerName} ${isContext ? "context" : "quota"} remaining`,
+    );
     target.meter.setAttribute("aria-valuemin", "0");
     target.meter.setAttribute("aria-valuemax", "100");
     target.meter.setAttribute("aria-valuenow", remainingPercent.toFixed(1));
     target.meter.setAttribute(
       "aria-valuetext",
       [
-        `${roundedRemaining}% remaining on the ${provider.windowLabel.toLowerCase()}`,
-        resetLabel,
+        isContext
+          ? `${roundedRemaining}% of the latest context window remaining`
+          : `${roundedRemaining}% remaining on the ${provider.windowLabel.toLowerCase()}`,
+        isContext ? "" : resetLabel,
         stale ? "last known value" : "",
         stale ? provider.detail : "",
       ].filter(Boolean).join("; "),
@@ -1993,19 +2217,25 @@
       return `${window.label}: ${remaining}% remaining, ${formatResetTime(window.resetsAtMs)}`;
     });
     target.card.title = [
-      `${provider.providerName}: ${roundedRemaining}% remaining on the ${provider.windowLabel.toLowerCase()}`,
-      resetLabel,
-      ...windowDescriptions,
+      isContext
+        ? `${provider.providerName}: ${roundedRemaining}% of context remaining`
+        : `${provider.providerName}: ${roundedRemaining}% remaining on the ${provider.windowLabel.toLowerCase()}`,
+      isContext ? provider.metricLabel : resetLabel,
+      ...(isContext ? [] : windowDescriptions),
       updateLabel,
       provider.detail,
     ].filter(Boolean).join(" · ");
-    return `${provider.providerName} ${roundedRemaining}% remaining${stale ? " (last known)" : ""}`;
+    return `${provider.providerName} ${roundedRemaining}% ${isContext ? "context " : ""}remaining${stale ? " (last known)" : ""}`;
   }
 
   function renderUsageSnapshot(snapshot: UsageSnapshot): void {
     const summaries = [
       renderUsageProvider("codex", snapshot.codex),
       renderUsageProvider("claude", snapshot.claude),
+      renderUsageProvider("gemini", snapshot.gemini),
+      renderUsageProvider("antigravity", snapshot.antigravity),
+      renderUsageProvider("zed", snapshot.zed),
+      renderUsageProvider("cursor", snapshot.cursor),
     ];
     const summary = summaries.join(". ");
     if (elements.usageStatus.textContent !== summary) {
@@ -2596,7 +2826,7 @@
       elements.usageVisibilityInput.disabled = false;
     }
     if (state.usageVisible) {
-      void refreshUsage();
+      void refreshUsage(true);
     }
   }
 
@@ -2658,29 +2888,50 @@
     }
   }
 
-  async function refreshUsage(): Promise<void> {
-    if (state.usagePending || !state.usageVisible) {
+  async function refreshUsage(forceAfterPending = false): Promise<void> {
+    if (forceAfterPending) {
+      // Invalidate any response that began before an integration mutation.
+      state.usageRefreshGeneration += 1;
+    }
+    if (!state.usageVisible) {
+      return;
+    }
+    if (state.usageRefreshPromise) {
+      const pending = state.usageRefreshPromise;
+      await pending;
+      if (forceAfterPending && state.usageVisible) {
+        await refreshUsage();
+      }
       return;
     }
 
+    const generation = state.usageRefreshGeneration;
     state.usagePending = true;
     state.lastUsageAttemptAtMs = Date.now();
     updateRefreshControl();
-    try {
-      let current: UsageSnapshot;
+    const operation = (async () => {
       try {
-        const raw = await invoke("get_usage", {});
-        current = normalizeUsageSnapshot(raw);
-      } catch (_error) {
-        current = unavailableUsageSnapshot("Could not refresh provider usage.");
+        let current: UsageSnapshot;
+        try {
+          const raw = await invoke("get_usage", {});
+          current = normalizeUsageSnapshot(raw);
+        } catch (_error) {
+          current = unavailableUsageSnapshot("Could not refresh provider usage.");
+        }
+        if (generation !== state.usageRefreshGeneration) {
+          return;
+        }
+        const usage = resolveUsageSnapshot(current, state.lastUsage);
+        state.lastUsage = usage;
+        renderUsageSnapshot(usage);
+      } finally {
+        state.usagePending = false;
+        state.usageRefreshPromise = null;
+        updateRefreshControl();
       }
-      const usage = resolveUsageSnapshot(current, state.lastUsage);
-      state.lastUsage = usage;
-      renderUsageSnapshot(usage);
-    } finally {
-      state.usagePending = false;
-      updateRefreshControl();
-    }
+    })();
+    state.usageRefreshPromise = operation;
+    await operation;
   }
 
   function refreshUsageIfDue(): void {
@@ -2791,6 +3042,18 @@
       throw new Error(`${integrationComponentName(kind)} has no separate visible row.`);
     }
 
+    if (kind === "gemini") {
+      return {
+        card: elements.geminiCard,
+        status: elements.geminiStatus,
+        detail: elements.geminiDetail,
+        helpDetail: elements.geminiUsageHelpStatus,
+        meta: elements.geminiMeta,
+        installButton: elements.geminiInstallButton,
+        uninstallButton: elements.geminiUninstallButton,
+      };
+    }
+
     if (kind === "claude") {
       return {
         card: elements.claudeCard,
@@ -2822,7 +3085,8 @@
     componentElements.detail.textContent = integrationPurpose(component.kind);
     const installButtonLabel = integrationInstallButtonLabel(component);
     componentElements.installButton.textContent = installButtonLabel;
-    componentElements.installButton.hidden = component.visualState === "ready";
+    componentElements.installButton.hidden = component.visualState === "ready"
+      || component.token === "manual_action_required";
     const componentName = component.kind === "companion"
       ? "VS Code"
       : component.kind === "cursorCompanion"
@@ -2833,9 +3097,11 @@
             ? "Cursor hooks only"
             : component.kind === "antigravity"
               ? "Antigravity activity hooks"
-              : component.kind === "codex"
-                ? "Codex activity hooks"
-                : "Claude Code activity hooks";
+              : component.kind === "gemini"
+                ? "Gemini usage hook"
+                : component.kind === "codex"
+                  ? "Codex activity hooks"
+                  : "Claude Code activity hooks";
     componentElements.installButton.setAttribute(
       "aria-label",
       installButtonLabel === component.actionLabel
@@ -2876,6 +3142,8 @@
         return "Cursor activity hooks";
       case "antigravity":
         return "Antigravity activity hooks";
+      case "gemini":
+        return "Gemini usage hook";
       case "codex":
         return "Codex activity hooks";
       case "claude":
@@ -2887,6 +3155,12 @@
     kind: "cursorCompanion" | "antigravityIde",
     components: readonly IntegrationComponent[],
   ): IntegrationComponent {
+    const manualComponent = components.find(
+      (component) => component.token === "manual_action_required",
+    );
+    const manualActionOnly = Boolean(manualComponent) && components.every(
+      (component) => component.token === "manual_action_required" || component.visualState === "ready",
+    );
     const allReady = components.every((component) => component.visualState === "ready");
     const allMissing = components.every((component) => component.visualState === "missing");
     const installed = components.some((component) => component.installed);
@@ -2913,16 +3187,19 @@
       ...components[0],
       kind,
       optional: false,
+      token: manualActionOnly ? "manual_action_required" : components[0].token,
       visualState,
       installed,
       actionLabel,
-      label: visualState === "ready"
-        ? "Installed"
-        : visualState === "missing"
-          ? "Not installed"
-          : visualState === "error"
-            ? "Unavailable"
-            : "Needs attention",
+      label: manualActionOnly
+        ? manualComponent?.label ?? "Manual action required"
+        : visualState === "ready"
+          ? "Installed"
+          : visualState === "missing"
+            ? "Not installed"
+            : visualState === "error"
+              ? "Unavailable"
+              : "Needs attention",
       detail,
       installedVersion: "",
       targetVersion: "",
@@ -2955,6 +3232,8 @@
         return "Recent workspace and agent activity";
       case "antigravity":
         return "Recent agent activity · start a turn";
+      case "gemini":
+        return "Local model-call token totals";
       case "codex":
       case "claude":
         return "Lifecycle hooks · CLI usage";
@@ -3064,7 +3343,7 @@
     }
 
     const editorSummary = summarizeEditorCompanions(status);
-    const optionalComponents = [status.codex, status.claude];
+    const optionalComponents = [status.gemini, status.codex, status.claude];
     const optionalMissing = optionalComponents.some(
       (component) => component.visualState === "missing",
     );
@@ -3127,6 +3406,7 @@
           kind: "antigravityIde",
           components: [state.integrationStatus.antigravityIde, state.integrationStatus.antigravity],
         },
+        { name: "Gemini", kind: "gemini", components: [state.integrationStatus.gemini] },
         { name: "Codex", kind: "codex", components: [state.integrationStatus.codex] },
         {
           name: "Claude Code",
@@ -3160,7 +3440,7 @@
       : summary === "Local only"
         ? "Setup status checks have not completed yet."
         : summary === "Optional setup"
-          ? "Editor monitoring is ready. Codex or Claude activity hooks can be added if wanted."
+          ? "Editor monitoring is ready. Optional provider hooks can be added if wanted."
           : "Editor monitoring and local diagnostics are ready.";
     elements.settingsButton.dataset.attention = String(attention);
     elements.settingsButton.setAttribute(
@@ -3176,6 +3456,7 @@
     renderIntegrationComponent(status.companion);
     renderIntegrationComponent(status.cursorCompanion);
     renderIntegrationComponent(status.antigravityIde);
+    renderIntegrationComponent(status.gemini);
     renderIntegrationComponent(status.codex);
     renderIntegrationComponent(status.claude);
     renderIntegrationComponent(visibleIntegrationComponent(status, "cursorCompanion"));
@@ -3363,6 +3644,7 @@
           antigravityIde: { state: "error", label: "Check failed", detail: message },
           cursor: { state: "error", label: "Check failed", detail: message },
           antigravity: { state: "error", label: "Check failed", detail: message },
+          gemini: { state: "error", label: "Check failed", detail: message },
           codex: { state: "error", label: "Check failed", detail: message },
           claude: { state: "error", label: "Check failed", detail: message },
           requiresRestart: false,
@@ -3391,6 +3673,9 @@
       if (kind === "antigravityIde") {
         return "Antigravity integration uninstalled.";
       }
+      if (kind === "gemini") {
+        return "Gemini usage hook uninstalled.";
+      }
       const provider = kind === "cursor"
         ? "Cursor"
         : kind === "antigravity"
@@ -3404,7 +3689,7 @@
       return "VS Code companion installed. Reload open VS Code windows.";
     }
     if (kind === "cursorCompanion") {
-      return "Cursor monitoring installed. Reload open Cursor IDE windows.";
+      return "Cursor monitoring installed. Reload open Cursor IDE windows or open a new Cursor Agent CLI session, then start a turn.";
     }
     if (kind === "antigravityIde") {
       return "Antigravity integration installed. Reload open Antigravity IDE windows and start a new agent turn.";
@@ -3415,9 +3700,30 @@
     if (kind === "cursor") {
       return "Cursor hooks installed. Open a workspace or start a new turn.";
     }
+    if (kind === "gemini") {
+      return "Gemini usage hook installed. Open a new Gemini CLI session and start a turn.";
+    }
     return kind === "codex"
       ? "Codex hooks installed. Review /hooks in Codex."
       : "Claude Code hooks installed. Restart active sessions.";
+  }
+
+  function integrationActionComponent(
+    status: IntegrationStatus,
+    kind: IntegrationKind,
+  ): IntegrationComponent {
+    if (kind === "cursorCompanion" || kind === "antigravityIde") {
+      return visibleIntegrationComponent(status, kind);
+    }
+    return status[kind];
+  }
+
+  function integrationManualActionSummary(
+    name: string,
+    component: IntegrationComponent,
+  ): string {
+    const detail = trimTerminalPunctuation(component.detail || component.label);
+    return `${name}: ${detail || "manual action is required"}`;
   }
 
   async function runIntegrationAction(
@@ -3457,6 +3763,11 @@
         uninstall: "uninstall_cursor_hooks",
         name: "Cursor hooks only",
       },
+      gemini: {
+        install: "install_gemini_usage",
+        uninstall: "uninstall_gemini_usage",
+        name: "Gemini usage hook",
+      },
       codex: {
         install: "install_codex_hooks",
         uninstall: "uninstall_codex_hooks",
@@ -3479,10 +3790,19 @@
 
     try {
       const raw = await invoke(command, {});
-      renderIntegrationStatus(normalizeIntegrationStatus(raw));
-      setIntegrationMessage(integrationActionSuccess(kind, operation), "success");
+      const status = normalizeIntegrationStatus(raw);
+      const resultComponent = integrationActionComponent(status, kind);
+      renderIntegrationStatus(status);
+      if (operation === "install" && resultComponent.token === "manual_action_required") {
+        setIntegrationMessage(
+          `Setup needs attention. ${integrationManualActionSummary(componentName, resultComponent)}.`,
+          "warning",
+        );
+      } else {
+        setIntegrationMessage(integrationActionSuccess(kind, operation), "success");
+      }
       if (operation === "uninstall") {
-        await refreshSnapshot();
+        await Promise.all([refreshSnapshot(), refreshUsage(true)]);
       }
     } catch (error) {
       const message = readableError(error, `Could not ${operation} ${componentName}.`);
@@ -3497,6 +3817,9 @@
         message,
         "error",
       );
+      if (operation === "uninstall") {
+        await Promise.all([refreshSnapshot(), refreshUsage(true)]);
+      }
     } finally {
       state.integrationAction = null;
       updateIntegrationControls();
@@ -3569,6 +3892,11 @@
     }> = [
       ...editorSteps,
       {
+        kind: "gemini",
+        name: "Gemini usage hook",
+        command: "install_gemini_usage",
+      },
+      {
         kind: "codex",
         name: "Codex activity hooks",
         command: "install_codex_hooks",
@@ -3580,6 +3908,7 @@
       },
     ];
     const completed: string[] = [];
+    const manualActions: string[] = [];
     const unconfirmed: Array<{ name: string; error: string }> = [];
 
     state.integrationAction = { kind: "all", operation: "install" };
@@ -3593,8 +3922,14 @@
 
       try {
         const raw = await invoke(step.command, {});
-        renderIntegrationStatus(normalizeIntegrationStatus(raw));
-        completed.push(step.name);
+        const status = normalizeIntegrationStatus(raw);
+        const resultComponent = integrationActionComponent(status, step.kind);
+        renderIntegrationStatus(status);
+        if (resultComponent.token === "manual_action_required") {
+          manualActions.push(integrationManualActionSummary(step.name, resultComponent));
+        } else {
+          completed.push(step.name);
+        }
       } catch (error) {
         unconfirmed.push({
           name: step.name,
@@ -3603,7 +3938,7 @@
       }
     }
 
-    if (unconfirmed.length === 0) {
+    if (unconfirmed.length === 0 && manualActions.length === 0) {
       const editorNames = editorSteps.map((step) => step.editorName);
       const successMessage = editorNames.length
         ? "Monitoring installed. Reload affected editors, restart provider sessions, and review /hooks in Codex."
@@ -3612,13 +3947,26 @@
         successMessage,
         "success",
       );
-    } else if (completed.length) {
-      const completedNames = formatNaturalList(completed);
+    } else if (unconfirmed.length === 0) {
+      const completedSummary = completed.length
+        ? `${formatNaturalList(completed)} completed. `
+        : "";
+      setIntegrationMessage(
+        `Setup needs attention. ${completedSummary}Manual action remains: ${manualActions.join(" · ")}.`,
+        "warning",
+      );
+    } else if (completed.length || manualActions.length) {
+      const completedSummary = completed.length
+        ? `${formatNaturalList(completed)} completed. `
+        : "";
+      const manualSummary = manualActions.length
+        ? `Manual action remains: ${manualActions.join(" · ")}. `
+        : "";
       const failureDetails = unconfirmed
         .map((failure) => `${failure.name}: ${trimTerminalPunctuation(failure.error)}`)
         .join(" · ");
       setIntegrationMessage(
-        `Partial setup: ${completedNames} completed. The following could not be completed or verified: ${failureDetails}. Successful changes were kept; retry to finish setup.`,
+        `Partial setup: ${completedSummary}${manualSummary}The following could not be completed or verified: ${failureDetails}. Successful changes were kept; retry to finish setup.`,
         "error",
       );
     } else {
@@ -3657,16 +4005,20 @@
         .map(({ name }) => name);
       if (unverifiedEditors.length) {
         setIntegrationMessage(
-          `Integration-backed editor monitoring was disabled and its saved observations were cleared. Physical companion removal could not be verified for ${formatNaturalList(unverifiedEditors)} because ${unverifiedEditors.length === 1 ? "its editor CLI was" : "their editor CLIs were"} unavailable. Make the affected CLI available and run Uninstall all again, or remove the VSParallel companion manually. Automatic Zed discovery and usage-limit checks were unchanged.`,
+          `Integration-backed editor monitoring was disabled and its saved observations were cleared. Physical companion removal could not be verified for ${formatNaturalList(unverifiedEditors)} because ${unverifiedEditors.length === 1 ? "its editor CLI was" : "their editor CLIs were"} unavailable. Make the affected CLI available and run Uninstall all again, or remove the VSParallel companion manually. Automatic Zed discovery and supported provider quota checks remain available.`,
           "warning",
         );
       } else {
         setIntegrationMessage(
-          "Integration-backed editor monitoring was disabled and its saved observations were cleared. VSParallel removed or verified the absence of each companion and activity hook. Automatic Zed discovery and usage-limit checks were unchanged.",
+          "Integration-backed editor monitoring was disabled and its saved observations were cleared. VSParallel removed or verified the absence of each companion, activity hook, and local usage hook. Automatic Zed discovery and supported provider quota checks remain available.",
           "success",
         );
       }
-      await Promise.all([refreshSnapshot(), refreshCursorAgentsBridgeStatus()]);
+      await Promise.all([
+        refreshSnapshot(),
+        refreshUsage(true),
+        refreshCursorAgentsBridgeStatus(),
+      ]);
     } catch (error) {
       const message = readableError(error, "Could not uninstall all integrations.");
       try {
@@ -3679,7 +4031,11 @@
       // The backend still applies its integration-source suppression markers
       // and purges retained observations when physical removal is only partial.
       // Reflect that fail-safe immediately while preserving the actionable error.
-      await Promise.all([refreshSnapshot(), refreshCursorAgentsBridgeStatus()]);
+      await Promise.all([
+        refreshSnapshot(),
+        refreshUsage(true),
+        refreshCursorAgentsBridgeStatus(),
+      ]);
     } finally {
       state.integrationAction = null;
       updateIntegrationControls();
@@ -3708,6 +4064,7 @@
       antigravityIde: "Antigravity integration",
       cursor: "Cursor hooks only",
       antigravity: "Antigravity activity hooks",
+      gemini: "Gemini usage hook",
       codex: "Codex activity hooks",
       claude: "Claude Code activity hooks",
       all: "all integrations",
@@ -3717,7 +4074,7 @@
       ? "Uninstall all integrations?"
       : `Uninstall ${componentNames[kind]}?`;
     if (kind === "all") {
-      elements.uninstallDescription.textContent = "VSParallel will stop integration-backed editor monitoring, clear its saved observations, disable its experimental bridge preference, and attempt to remove its editor companions and activity hooks. Automatic Zed discovery and usage-limit checks are unchanged. Project files and unrelated hooks are not changed.";
+      elements.uninstallDescription.textContent = "VSParallel will stop integration-backed editor monitoring, clear its saved observations, disable its experimental bridge preference, and attempt to remove its editor companions, activity hooks, and local usage hooks. Automatic Zed discovery and supported provider quota checks remain available. Project files and unrelated hooks are not changed.";
     } else if (["companion", "cursorCompanion", "antigravityIde"].includes(kind)) {
       const editorName = kind === "companion"
         ? "VS Code"
@@ -3725,14 +4082,16 @@
           ? "Cursor"
           : "Antigravity IDE";
       elements.uninstallDescription.textContent = `VSParallel will stop displaying and accepting ${editorName} monitoring immediately. Reload open ${editorName} windows to stop their old extension host. No project files are removed.`;
+    } else if (kind === "gemini") {
+      elements.uninstallDescription.textContent = "VSParallel will remove only its Gemini token-usage hook. Other Gemini hooks and project files remain unchanged.";
     } else {
       const provider = kind === "cursor"
         ? "Cursor"
         : kind === "antigravity"
           ? "Antigravity"
-        : kind === "codex"
-          ? "Codex"
-          : "Claude Code";
+          : kind === "codex"
+            ? "Codex"
+            : "Claude Code";
       elements.uninstallDescription.textContent = `VSParallel will remove only its own ${provider} handlers. Other hooks remain unchanged, and no project files are removed.`;
     }
     elements.uninstallConfirmButton.disabled = false;
@@ -4245,6 +4604,9 @@
   elements.antigravityIdeInstallButton.addEventListener("click", () =>
     runIntegrationAction("antigravityIde", "install"),
   );
+  elements.geminiInstallButton.addEventListener("click", () =>
+    runIntegrationAction("gemini", "install"),
+  );
   elements.codexInstallButton.addEventListener("click", () =>
     runIntegrationAction("codex", "install"),
   );
@@ -4260,6 +4622,7 @@
   elements.antigravityIdeUninstallButton.addEventListener("click", () =>
     requestUninstall("antigravityIde"),
   );
+  elements.geminiUninstallButton.addEventListener("click", () => requestUninstall("gemini"));
   elements.codexUninstallButton.addEventListener("click", () => requestUninstall("codex"));
   elements.claudeUninstallButton.addEventListener("click", () => requestUninstall("claude"));
   elements.uninstallConfirmButton.addEventListener("click", confirmUninstall);
