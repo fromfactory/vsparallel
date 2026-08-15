@@ -86,6 +86,7 @@
     | "set_cursor_agents_monitoring_enabled"
     | "set_editor_visibility"
     | "set_usage_limit_percentage_visible"
+    | "set_usage_provider_visibility"
     | "set_window_chrome_theme"
     | "toggle_window_maximize"
     | "uninstall_claude_hooks"
@@ -244,12 +245,13 @@
 
   interface VisibilityPreferences {
     editors: Record<EditorVisibilityKind, boolean>;
-    usage: boolean;
+    usageProviders: Record<UsageKind, boolean>;
   }
 
   interface DisplayPreferencesResponse {
-    schemaVersion: 1;
+    schemaVersion: 2;
     editors: Record<EditorVisibilityKind, boolean>;
+    usageProviders: Record<UsageKind, boolean>;
     usageLimitPercentage: boolean;
   }
 
@@ -318,6 +320,7 @@
     windowChromeRefreshTimer: number | null;
     themePreference: ThemePreference;
     editorVisibility: Record<EditorVisibilityKind, boolean>;
+    usageProviderVisibility: Record<UsageKind, boolean>;
     usageVisible: boolean;
     updatePhase: UpdatePhase;
     availableUpdate: AvailableUpdate | null;
@@ -356,6 +359,7 @@
   }
 
   const SCHEMA_VERSION = 1;
+  const DISPLAY_PREFERENCES_SCHEMA_VERSION = 2;
   const REFRESH_INTERVAL_MS = 3_000;
   const USAGE_REFRESH_INTERVAL_MS = 60_000;
   const USAGE_LAST_KNOWN_MAX_AGE_MS = 15 * 60_000;
@@ -390,6 +394,14 @@
     "antigravity",
     "zed",
   ] as const satisfies readonly EditorVisibilityKind[];
+  const USAGE_KINDS = [
+    "codex",
+    "claude",
+    "gemini",
+    "antigravity",
+    "zed",
+    "cursor",
+  ] as const satisfies readonly UsageKind[];
   const MAX_JAVASCRIPT_TIMESTAMP_MS = 8_640_000_000_000_000;
   const tauriApi = (window as TauriWindow).__TAURI__;
   const tauriInvoke = tauriApi?.core?.invoke;
@@ -405,8 +417,21 @@
         antigravity: true,
         zed: true,
       },
-      usage: true,
+      usageProviders: {
+        codex: true,
+        claude: true,
+        gemini: true,
+        antigravity: true,
+        zed: true,
+        cursor: true,
+      },
     };
+  }
+
+  function anyUsageProviderVisible(
+    providers: Record<UsageKind, boolean>,
+  ): boolean {
+    return USAGE_KINDS.some((kind) => providers[kind]);
   }
 
   function loadVisibilityPreferences(): VisibilityPreferences {
@@ -426,8 +451,19 @@
           preferences.editors[kind] = rawEditors[kind];
         }
       });
-      if (typeof raw.usage === "boolean") {
-        preferences.usage = raw.usage;
+      const rawUsageProviders = raw.usageProviders;
+      if (isObject(rawUsageProviders)) {
+        USAGE_KINDS.forEach((kind) => {
+          const visible = rawUsageProviders[kind];
+          if (typeof visible === "boolean") {
+            preferences.usageProviders[kind] = visible;
+          }
+        });
+      } else if (typeof raw.usage === "boolean") {
+        const visible = raw.usage;
+        USAGE_KINDS.forEach((kind) => {
+          preferences.usageProviders[kind] = visible;
+        });
       }
     } catch (_error) {
       // Visibility defaults remain enabled when a stored preference is unreadable.
@@ -437,7 +473,11 @@
 
   function normalizeDisplayPreferences(rawValue: unknown): DisplayPreferencesResponse {
     const raw = parseBridgeValue(rawValue);
-    if (!isObject(raw) || raw.schemaVersion !== SCHEMA_VERSION || !isObject(raw.editors)) {
+    if (
+      !isObject(raw)
+      || (raw.schemaVersion !== 1 && raw.schemaVersion !== DISPLAY_PREFERENCES_SCHEMA_VERSION)
+      || !isObject(raw.editors)
+    ) {
       throw new Error("VSParallel returned invalid display preferences.");
     }
     const rawEditors = raw.editors;
@@ -451,10 +491,30 @@
     if (typeof raw.usageLimitPercentage !== "boolean") {
       throw new Error("VSParallel returned an invalid usage visibility preference.");
     }
+    const usageProviders = defaultVisibilityPreferences().usageProviders;
+    if (raw.schemaVersion === DISPLAY_PREFERENCES_SCHEMA_VERSION) {
+      const rawUsageProviders = raw.usageProviders;
+      if (!isObject(rawUsageProviders)) {
+        throw new Error("VSParallel returned incomplete provider usage preferences.");
+      }
+      USAGE_KINDS.forEach((kind) => {
+        const visible = rawUsageProviders[kind];
+        if (typeof visible !== "boolean") {
+          throw new Error("VSParallel returned incomplete provider usage preferences.");
+        }
+        usageProviders[kind] = visible;
+      });
+    } else {
+      const visible = raw.usageLimitPercentage;
+      USAGE_KINDS.forEach((kind) => {
+        usageProviders[kind] = visible;
+      });
+    }
     return {
-      schemaVersion: SCHEMA_VERSION,
+      schemaVersion: DISPLAY_PREFERENCES_SCHEMA_VERSION,
       editors,
-      usageLimitPercentage: raw.usageLimitPercentage,
+      usageProviders,
+      usageLimitPercentage: anyUsageProviderVisible(usageProviders),
     };
   }
 
@@ -614,7 +674,9 @@
     editorVisibilityInputs: Array.from(
       document.querySelectorAll<HTMLInputElement>("[data-editor-visibility]"),
     ),
-    usageVisibilityInput: requiredElement<HTMLInputElement>("#usageVisibilityInput"),
+    usageVisibilityInputs: Array.from(
+      document.querySelectorAll<HTMLInputElement>("[data-usage-visibility]"),
+    ),
     visibilityStatus: requiredElement<HTMLParagraphElement>("#visibilityStatus"),
   };
 
@@ -653,7 +715,8 @@
     windowChromeRefreshTimer: null,
     themePreference: initialThemePreference,
     editorVisibility: initialVisibilityPreferences.editors,
-    usageVisible: initialVisibilityPreferences.usage,
+    usageProviderVisibility: initialVisibilityPreferences.usageProviders,
+    usageVisible: anyUsageProviderVisible(initialVisibilityPreferences.usageProviders),
     updatePhase: "idle",
     availableUpdate: null,
     dismissedUpdateVersion: null,
@@ -663,6 +726,9 @@
     updateError: "",
     updateChecksEnabled: null,
   };
+
+  let displayPreferencesQueue: Promise<void> = Promise.resolve();
+  let pendingDisplayPreferenceOperations = 0;
 
   const dialogReturnFocus = new WeakMap<HTMLDialogElement, HTMLElement>();
   const HELP_POPOVER_GAP_PX = 7;
@@ -2229,15 +2295,10 @@
   }
 
   function renderUsageSnapshot(snapshot: UsageSnapshot): void {
-    const summaries = [
-      renderUsageProvider("codex", snapshot.codex),
-      renderUsageProvider("claude", snapshot.claude),
-      renderUsageProvider("gemini", snapshot.gemini),
-      renderUsageProvider("antigravity", snapshot.antigravity),
-      renderUsageProvider("zed", snapshot.zed),
-      renderUsageProvider("cursor", snapshot.cursor),
-    ];
-    const summary = summaries.join(". ");
+    const summaries = USAGE_KINDS
+      .filter((kind) => state.usageProviderVisibility[kind])
+      .map((kind) => renderUsageProvider(kind, snapshot[kind]));
+    const summary = summaries.length ? summaries.join(". ") : "Provider usage hidden.";
     if (elements.usageStatus.textContent !== summary) {
       elements.usageStatus.textContent = summary;
     }
@@ -2737,7 +2798,13 @@
     try {
       window.localStorage.setItem(
         VISIBILITY_STORAGE_KEY,
-        JSON.stringify({ editors: state.editorVisibility, usage: state.usageVisible }),
+        JSON.stringify({
+          editors: state.editorVisibility,
+          // Retain the aggregate value so an older UI fallback still shows the
+          // dashboard whenever at least one provider card is enabled.
+          usage: state.usageVisible,
+          usageProviders: state.usageProviderVisibility,
+        }),
       );
     } catch (_error) {
       // The selected visibility still applies for this session when storage is unavailable.
@@ -2751,13 +2818,25 @@
         input.checked = state.editorVisibility[kind];
       }
     });
-    elements.usageVisibilityInput.checked = state.usageVisible;
+    elements.usageVisibilityInputs.forEach((input) => {
+      const kind = input.dataset.usageVisibility as UsageKind | undefined;
+      if (kind && USAGE_KINDS.includes(kind)) {
+        input.checked = state.usageProviderVisibility[kind];
+      }
+    });
+    USAGE_KINDS.forEach((kind) => {
+      usageElements(kind).card.hidden = !state.usageProviderVisibility[kind];
+    });
+    state.usageVisible = anyUsageProviderVisible(state.usageProviderVisibility);
     elements.usageOverview.hidden = !state.usageVisible;
     if (persist) {
       storeVisibilityPreferences();
     }
     if (state.lastGoodSnapshot) {
       renderSnapshot(state.lastGoodSnapshot);
+    }
+    if (state.lastUsage) {
+      renderUsageSnapshot(state.lastUsage);
     }
   }
 
@@ -2766,7 +2845,8 @@
     persist = true,
   ): void {
     state.editorVisibility = { ...preferences.editors };
-    state.usageVisible = preferences.usageLimitPercentage;
+    state.usageProviderVisibility = { ...preferences.usageProviders };
+    state.usageVisible = anyUsageProviderVisible(state.usageProviderVisibility);
     applyVisibilityPreferences(persist);
   }
 
@@ -2776,15 +2856,39 @@
     elements.visibilityStatus.classList.toggle("has-error", error);
   }
 
-  async function refreshDisplayPreferences(): Promise<void> {
+  function setVisibilityControlsDisabled(disabled: boolean): void {
+    elements.editorVisibilityInputs.forEach((input) => {
+      input.disabled = disabled;
+    });
+    elements.usageVisibilityInputs.forEach((input) => {
+      input.disabled = disabled;
+    });
+  }
+
+  async function runDisplayPreferencesOperation(operation: () => Promise<void>): Promise<void> {
+    pendingDisplayPreferenceOperations += 1;
+    setVisibilityControlsDisabled(true);
+    const queued = displayPreferencesQueue.then(operation, operation);
+    displayPreferencesQueue = queued.catch(() => undefined);
     try {
-      const raw = await invoke("get_display_preferences", {});
-      commitDisplayPreferences(normalizeDisplayPreferences(raw));
-      setVisibilityStatus("");
-    } catch (_error) {
-      applyVisibilityPreferences(false);
-      setVisibilityStatus("Using visibility saved for this window; app-wide sync is unavailable.", true);
+      await queued;
+    } finally {
+      pendingDisplayPreferenceOperations -= 1;
+      setVisibilityControlsDisabled(pendingDisplayPreferenceOperations > 0);
     }
+  }
+
+  async function refreshDisplayPreferences(): Promise<void> {
+    await runDisplayPreferencesOperation(async () => {
+      try {
+        const raw = await invoke("get_display_preferences", {});
+        commitDisplayPreferences(normalizeDisplayPreferences(raw));
+        setVisibilityStatus("");
+      } catch (_error) {
+        applyVisibilityPreferences(false);
+        setVisibilityStatus("Using visibility saved for this window; app-wide sync is unavailable.", true);
+      }
+    });
   }
 
   async function updateEditorVisibility(input: HTMLInputElement): Promise<void> {
@@ -2792,40 +2896,48 @@
     if (!kind || !EDITOR_VISIBILITY_KINDS.includes(kind)) {
       return;
     }
-    state.editorVisibility[kind] = input.checked;
+    const visible = input.checked;
+    state.editorVisibility[kind] = visible;
     applyVisibilityPreferences();
-    input.disabled = true;
-    setVisibilityStatus("Saving visibility…");
-    try {
-      const raw = await invoke("set_editor_visibility", {
-        editor: kind,
-        visible: input.checked,
-      });
-      commitDisplayPreferences(normalizeDisplayPreferences(raw));
-      setVisibilityStatus("");
-      await refreshSnapshot();
-    } catch (_error) {
-      setVisibilityStatus("Saved for this window; app-wide sync is unavailable.", true);
-    } finally {
-      input.disabled = false;
-    }
+    await runDisplayPreferencesOperation(async () => {
+      setVisibilityStatus("Saving visibility…");
+      try {
+        const raw = await invoke("set_editor_visibility", {
+          editor: kind,
+          visible,
+        });
+        commitDisplayPreferences(normalizeDisplayPreferences(raw));
+        setVisibilityStatus("");
+        await refreshSnapshot();
+      } catch (_error) {
+        setVisibilityStatus("Saved for this window; app-wide sync is unavailable.", true);
+      }
+    });
   }
 
-  async function updateUsageVisibility(visible: boolean): Promise<void> {
-    state.usageVisible = visible;
-    applyVisibilityPreferences();
-    elements.usageVisibilityInput.disabled = true;
-    setVisibilityStatus("Saving visibility…");
-    try {
-      const raw = await invoke("set_usage_limit_percentage_visible", { visible });
-      commitDisplayPreferences(normalizeDisplayPreferences(raw));
-      setVisibilityStatus("");
-    } catch (_error) {
-      setVisibilityStatus("Saved for this window; app-wide sync is unavailable.", true);
-    } finally {
-      elements.usageVisibilityInput.disabled = false;
+  async function updateUsageProviderVisibility(input: HTMLInputElement): Promise<void> {
+    const kind = input.dataset.usageVisibility as UsageKind | undefined;
+    if (!kind || !USAGE_KINDS.includes(kind)) {
+      return;
     }
-    if (state.usageVisible) {
+    const visible = input.checked;
+    state.usageProviderVisibility[kind] = visible;
+    state.usageVisible = anyUsageProviderVisible(state.usageProviderVisibility);
+    applyVisibilityPreferences();
+    await runDisplayPreferencesOperation(async () => {
+      setVisibilityStatus("Saving visibility…");
+      try {
+        const raw = await invoke("set_usage_provider_visibility", {
+          provider: kind,
+          visible,
+        });
+        commitDisplayPreferences(normalizeDisplayPreferences(raw));
+        setVisibilityStatus("");
+      } catch (_error) {
+        setVisibilityStatus("Saved for this window; app-wide sync is unavailable.", true);
+      }
+    });
+    if (state.usageProviderVisibility[kind]) {
       void refreshUsage(true);
     }
   }
@@ -4586,8 +4698,10 @@
       void updateEditorVisibility(input);
     });
   });
-  elements.usageVisibilityInput.addEventListener("change", () => {
-    void updateUsageVisibility(elements.usageVisibilityInput.checked);
+  elements.usageVisibilityInputs.forEach((input) => {
+    input.addEventListener("change", () => {
+      void updateUsageProviderVisibility(input);
+    });
   });
   elements.cursorAgentsMonitoringEnabled.addEventListener("change", () => {
     void setCursorAgentsMonitoringEnabled(elements.cursorAgentsMonitoringEnabled.checked);

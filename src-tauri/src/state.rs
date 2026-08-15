@@ -44,7 +44,8 @@ const MAX_CURSOR_METADATA_BYTES: usize = 128;
 const MAX_ZED_WORKSPACES_DISPLAYED: usize = 64;
 const INTEGRATION_DISABLE_DIRECTORY: &str = "integration-disabled";
 const DISPLAY_PREFERENCES_FILENAME: &str = "display-preferences.json";
-const DISPLAY_PREFERENCES_SCHEMA_VERSION: u32 = 1;
+const LEGACY_DISPLAY_PREFERENCES_SCHEMA_VERSION: u32 = 1;
+const DISPLAY_PREFERENCES_SCHEMA_VERSION: u32 = 2;
 const MAX_DISPLAY_PREFERENCES_BYTES: u64 = 16 * 1024;
 
 static DISPLAY_PREFERENCES_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -109,9 +110,46 @@ impl EditorVisibility {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct UsageProviderVisibility {
+    pub(crate) codex: bool,
+    pub(crate) claude: bool,
+    pub(crate) gemini: bool,
+    pub(crate) antigravity: bool,
+    pub(crate) zed: bool,
+    pub(crate) cursor: bool,
+}
+
+impl Default for UsageProviderVisibility {
+    fn default() -> Self {
+        Self::all(true)
+    }
+}
+
+impl UsageProviderVisibility {
+    fn all(visible: bool) -> Self {
+        Self {
+            codex: visible,
+            claude: visible,
+            gemini: visible,
+            antigravity: visible,
+            zed: visible,
+            cursor: visible,
+        }
+    }
+
+    fn any_enabled(&self) -> bool {
+        self.codex || self.claude || self.gemini || self.antigravity || self.zed || self.cursor
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct DisplayPreferences {
     pub(crate) schema_version: u32,
     pub(crate) editors: EditorVisibility,
+    pub(crate) usage_providers: UsageProviderVisibility,
+    /// Compatibility mirror for the original all-or-nothing usage switch.
+    /// New writes keep it equal to `usage_providers.any_enabled()`.
     pub(crate) usage_limit_percentage: bool,
 }
 
@@ -120,9 +158,24 @@ impl Default for DisplayPreferences {
         Self {
             schema_version: DISPLAY_PREFERENCES_SCHEMA_VERSION,
             editors: EditorVisibility::default(),
+            usage_providers: UsageProviderVisibility::default(),
             usage_limit_percentage: true,
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LegacyDisplayPreferences {
+    schema_version: u32,
+    editors: EditorVisibility,
+    usage_limit_percentage: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DisplayPreferencesVersion {
+    schema_version: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2047,9 +2100,46 @@ pub(crate) fn set_usage_limit_percentage_visible_from_environment(
     visible: bool,
 ) -> Result<DisplayPreferences, String> {
     update_display_preferences_from_environment(|preferences| {
-        preferences.usage_limit_percentage = visible;
+        apply_all_usage_provider_visibility(preferences, visible);
         Ok(())
     })
+}
+
+fn apply_all_usage_provider_visibility(preferences: &mut DisplayPreferences, visible: bool) {
+    preferences.usage_providers = UsageProviderVisibility::all(visible);
+    preferences.usage_limit_percentage = visible;
+}
+
+pub(crate) fn set_usage_provider_visibility_from_environment(
+    provider: &str,
+    visible: bool,
+) -> Result<DisplayPreferences, String> {
+    update_display_preferences_from_environment(|preferences| {
+        apply_usage_provider_visibility(preferences, provider, visible)
+    })
+}
+
+fn apply_usage_provider_visibility(
+    preferences: &mut DisplayPreferences,
+    provider: &str,
+    visible: bool,
+) -> Result<(), String> {
+    match provider {
+        "codex" => preferences.usage_providers.codex = visible,
+        "claude" => preferences.usage_providers.claude = visible,
+        "gemini" => preferences.usage_providers.gemini = visible,
+        "antigravity" => preferences.usage_providers.antigravity = visible,
+        "zed" => preferences.usage_providers.zed = visible,
+        "cursor" => preferences.usage_providers.cursor = visible,
+        _ => {
+            return Err(
+                "usage provider must be one of codex, claude, gemini, antigravity, zed, or cursor"
+                    .to_string(),
+            )
+        }
+    }
+    preferences.usage_limit_percentage = preferences.usage_providers.any_enabled();
+    Ok(())
 }
 
 fn update_display_preferences_from_environment<F>(update: F) -> Result<DisplayPreferences, String>
@@ -2096,21 +2186,45 @@ fn load_display_preferences_at(root: &Path) -> Result<DisplayPreferences, String
     }
     let bytes =
         fs::read(&path).map_err(|error| format!("could not read {}: {error}", path.display()))?;
-    let preferences: DisplayPreferences = serde_json::from_slice(&bytes)
+    let version: DisplayPreferencesVersion = serde_json::from_slice(&bytes)
         .map_err(|error| format!("could not parse {}: {error}", path.display()))?;
-    if preferences.schema_version != DISPLAY_PREFERENCES_SCHEMA_VERSION {
-        return Err(format!(
+    match version.schema_version {
+        LEGACY_DISPLAY_PREFERENCES_SCHEMA_VERSION => {
+            let legacy: LegacyDisplayPreferences = serde_json::from_slice(&bytes)
+                .map_err(|error| format!("could not parse {}: {error}", path.display()))?;
+            debug_assert_eq!(
+                legacy.schema_version,
+                LEGACY_DISPLAY_PREFERENCES_SCHEMA_VERSION
+            );
+            Ok(DisplayPreferences {
+                schema_version: DISPLAY_PREFERENCES_SCHEMA_VERSION,
+                editors: legacy.editors,
+                usage_providers: UsageProviderVisibility::all(legacy.usage_limit_percentage),
+                usage_limit_percentage: legacy.usage_limit_percentage,
+            })
+        }
+        DISPLAY_PREFERENCES_SCHEMA_VERSION => {
+            let mut preferences: DisplayPreferences = serde_json::from_slice(&bytes)
+                .map_err(|error| format!("could not parse {}: {error}", path.display()))?;
+            preferences.usage_limit_percentage = preferences.usage_providers.any_enabled();
+            Ok(preferences)
+        }
+        _ => Err(format!(
             "{} has an unsupported schema version",
             path.display()
-        ));
+        )),
     }
-    Ok(preferences)
 }
 
 fn save_display_preferences_at(
     root: &Path,
     preferences: &DisplayPreferences,
 ) -> Result<(), String> {
+    if preferences.schema_version != DISPLAY_PREFERENCES_SCHEMA_VERSION
+        || preferences.usage_limit_percentage != preferences.usage_providers.any_enabled()
+    {
+        return Err("display preferences are internally inconsistent".to_string());
+    }
     ensure_state_root(root)?;
     let path = root.join(DISPLAY_PREFERENCES_FILENAME);
     match fs::symlink_metadata(&path) {
@@ -3047,17 +3161,26 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let defaults = load_display_preferences_at(temp.path()).unwrap();
         assert_eq!(defaults, DisplayPreferences::default());
+        assert_eq!(defaults.schema_version, DISPLAY_PREFERENCES_SCHEMA_VERSION);
         assert!(defaults.editors.vscode);
         assert!(defaults.editors.cursor);
         assert!(defaults.editors.antigravity);
         assert!(defaults.editors.zed);
+        assert!(defaults.usage_providers.codex);
+        assert!(defaults.usage_providers.claude);
+        assert!(defaults.usage_providers.gemini);
+        assert!(defaults.usage_providers.antigravity);
+        assert!(defaults.usage_providers.zed);
+        assert!(defaults.usage_providers.cursor);
         assert!(defaults.usage_limit_percentage);
 
         let mut changed = defaults;
         changed.editors.cursor = false;
-        changed.usage_limit_percentage = false;
+        apply_usage_provider_visibility(&mut changed, "gemini", false).unwrap();
         save_display_preferences_at(temp.path(), &changed).unwrap();
         assert_eq!(load_display_preferences_at(temp.path()).unwrap(), changed);
+        assert!(changed.usage_limit_percentage);
+        assert!(!changed.usage_providers.gemini);
 
         changed.editors.vscode = false;
         save_display_preferences_at(temp.path(), &changed).unwrap();
@@ -3071,6 +3194,102 @@ mod tests {
         let before_invalid = changed.clone();
         assert!(apply_editor_visibility(&mut changed, "unknown-editor", false).is_err());
         assert_eq!(changed, before_invalid);
+        assert!(apply_usage_provider_visibility(&mut changed, "unknown-provider", false).is_err());
+        assert_eq!(changed, before_invalid);
+    }
+
+    #[test]
+    fn legacy_display_preferences_expand_the_global_usage_value_to_all_providers() {
+        for visible in [false, true] {
+            let temp = TempDir::new().unwrap();
+            write_json(
+                &temp.path().join(DISPLAY_PREFERENCES_FILENAME),
+                json!({
+                    "schemaVersion": LEGACY_DISPLAY_PREFERENCES_SCHEMA_VERSION,
+                    "editors": {
+                        "vscode": true,
+                        "cursor": false,
+                        "antigravity": true,
+                        "zed": false
+                    },
+                    "usageLimitPercentage": visible
+                }),
+            );
+
+            let migrated = load_display_preferences_at(temp.path()).unwrap();
+            assert_eq!(migrated.schema_version, DISPLAY_PREFERENCES_SCHEMA_VERSION);
+            assert!(!migrated.editors.cursor);
+            assert!(!migrated.editors.zed);
+            assert_eq!(migrated.usage_limit_percentage, visible);
+            assert_eq!(
+                migrated.usage_providers,
+                UsageProviderVisibility::all(visible)
+            );
+        }
+    }
+
+    #[test]
+    fn usage_provider_visibility_keeps_the_legacy_master_as_an_any_enabled_mirror() {
+        let providers = ["codex", "claude", "gemini", "antigravity", "zed", "cursor"];
+        for (expected_hidden, provider) in providers.iter().enumerate() {
+            let mut preferences = DisplayPreferences::default();
+            apply_usage_provider_visibility(&mut preferences, provider, false).unwrap();
+            let values = [
+                preferences.usage_providers.codex,
+                preferences.usage_providers.claude,
+                preferences.usage_providers.gemini,
+                preferences.usage_providers.antigravity,
+                preferences.usage_providers.zed,
+                preferences.usage_providers.cursor,
+            ];
+            assert_eq!(values.iter().filter(|visible| !**visible).count(), 1);
+            assert!(!values[expected_hidden]);
+            assert!(preferences.usage_limit_percentage);
+        }
+
+        let mut preferences = DisplayPreferences::default();
+        apply_all_usage_provider_visibility(&mut preferences, false);
+        assert!(!preferences.usage_providers.any_enabled());
+        assert!(!preferences.usage_limit_percentage);
+
+        apply_all_usage_provider_visibility(&mut preferences, true);
+        assert_eq!(
+            preferences.usage_providers,
+            UsageProviderVisibility::all(true)
+        );
+        assert!(preferences.usage_limit_percentage);
+    }
+
+    #[test]
+    fn current_display_preferences_canonicalize_and_round_trip_the_legacy_mirror() {
+        let temp = TempDir::new().unwrap();
+        write_json(
+            &temp.path().join(DISPLAY_PREFERENCES_FILENAME),
+            json!({
+                "schemaVersion": DISPLAY_PREFERENCES_SCHEMA_VERSION,
+                "editors": {
+                    "vscode": true,
+                    "cursor": true,
+                    "antigravity": true,
+                    "zed": true
+                },
+                "usageProviders": {
+                    "codex": false,
+                    "claude": false,
+                    "gemini": true,
+                    "antigravity": false,
+                    "zed": false,
+                    "cursor": false
+                },
+                "usageLimitPercentage": false
+            }),
+        );
+
+        let canonical = load_display_preferences_at(temp.path()).unwrap();
+        assert!(canonical.usage_providers.gemini);
+        assert!(canonical.usage_limit_percentage);
+        save_display_preferences_at(temp.path(), &canonical).unwrap();
+        assert_eq!(load_display_preferences_at(temp.path()).unwrap(), canonical);
     }
 
     #[test]

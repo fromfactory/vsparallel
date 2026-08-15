@@ -541,11 +541,71 @@
               </label>
               <label class="settings-row settings-row--separated">
                 <span>
-                  <strong>Provider usage</strong>
-                  <small>Show available quota, context, and token information.</small>
+                  <strong>Codex usage</strong>
+                  <small>Show Codex quota and reset information.</small>
                 </span>
                 <span class="setting-switch">
-                  <input id="usageVisibilityInput" type="checkbox" role="switch" checked />
+                  <input type="checkbox" role="switch" data-usage-visibility="codex" checked />
+                  <span class="setting-switch__track" aria-hidden="true">
+                    <span class="setting-switch__thumb"></span>
+                  </span>
+                </span>
+              </label>
+              <label class="settings-row">
+                <span>
+                  <strong>Claude usage</strong>
+                  <small>Show Claude quota and reset information.</small>
+                </span>
+                <span class="setting-switch">
+                  <input type="checkbox" role="switch" data-usage-visibility="claude" checked />
+                  <span class="setting-switch__track" aria-hidden="true">
+                    <span class="setting-switch__thumb"></span>
+                  </span>
+                </span>
+              </label>
+              <label class="settings-row">
+                <span>
+                  <strong>Gemini usage</strong>
+                  <small>Show the latest Gemini model-call token count.</small>
+                </span>
+                <span class="setting-switch">
+                  <input type="checkbox" role="switch" data-usage-visibility="gemini" checked />
+                  <span class="setting-switch__track" aria-hidden="true">
+                    <span class="setting-switch__thumb"></span>
+                  </span>
+                </span>
+              </label>
+              <label class="settings-row">
+                <span>
+                  <strong>Antigravity usage</strong>
+                  <small>Show Antigravity model quota information.</small>
+                </span>
+                <span class="setting-switch">
+                  <input type="checkbox" role="switch" data-usage-visibility="antigravity" checked />
+                  <span class="setting-switch__track" aria-hidden="true">
+                    <span class="setting-switch__thumb"></span>
+                  </span>
+                </span>
+              </label>
+              <label class="settings-row">
+                <span>
+                  <strong>Zed Agent usage</strong>
+                  <small>Show the latest native-thread token count.</small>
+                </span>
+                <span class="setting-switch">
+                  <input type="checkbox" role="switch" data-usage-visibility="zed" checked />
+                  <span class="setting-switch__track" aria-hidden="true">
+                    <span class="setting-switch__thumb"></span>
+                  </span>
+                </span>
+              </label>
+              <label class="settings-row">
+                <span>
+                  <strong>Cursor usage</strong>
+                  <small>Show CLI context or the latest turn's token count.</small>
+                </span>
+                <span class="setting-switch">
+                  <input type="checkbox" role="switch" data-usage-visibility="cursor" checked />
                   <span class="setting-switch__track" aria-hidden="true">
                     <span class="setting-switch__thumb"></span>
                   </span>

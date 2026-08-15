@@ -136,14 +136,14 @@ affected integration.
    VSParallel handlers, and trust them.
 
 All workspace and usage displays are enabled by default. In **Visibility**, each
-editor can be hidden independently; the preference filters both the main
-workspace list and native tray without uninstalling or disabling monitoring.
-Antigravity covers both Antigravity IDE and Antigravity 2.0 rows. The legacy
-usage-percentage preference hides the complete global usage dashboard without
-reconfiguring any provider integration. While the dashboard is hidden, its
-periodic live provider and Zed refreshes pause; installed Gemini, Claude
-status-line, and Cursor hook receivers remain able to update their minimal
-local records.
+editor and each of the six provider usage cards can be hidden independently.
+Editor preferences filter both the main workspace list and native tray without
+uninstalling or disabling monitoring; Antigravity covers both Antigravity IDE
+and Antigravity 2.0 rows. Provider switches affect presentation only. While at
+least one card is visible, the shared usage snapshot still refreshes every
+provider source; hiding all six cards pauses the periodic live Codex, Claude,
+Antigravity, and Zed reads. Installed Gemini, Claude status-line, and Cursor
+hook receivers remain able to update their minimal local records.
 
 The final Codex review is an intentional security boundary. VSParallel reads
 Codex's resulting user-level trust status but never attempts to approve user

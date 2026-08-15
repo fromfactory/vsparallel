@@ -115,8 +115,8 @@ persisted only where stated:
   identity or agent/model label;
 - the local on/off preference for experimental Cursor Agents Window monitoring;
 - local display preferences for VS Code, Cursor, Antigravity, and Zed workspace
-  rows and for the global usage dashboard, stored in the state root with an
-  equivalent webview-local fallback cache; every display is enabled by
+  rows and for each of the six provider usage cards, stored in the state root
+  with an equivalent webview-local fallback cache; every display is enabled by
   default, and these preferences contain no workspace or provider-account data;
 - app-owned integration suppression markers written after verified per-source
   uninstall, and for every installable integration source requested by
@@ -183,11 +183,12 @@ list.
 
 Display preferences do not change provider configuration or install, uninstall,
 or disable an integration. Disabling an editor hides that editor's rows in both
-the main workspace list and native tray. Disabling the legacy usage-percentage
-preference hides the complete global usage dashboard, including token and
-context cards, and pauses its live Codex, Claude, Antigravity, and Zed refreshes.
-Installed Gemini, Claude status-line, and Cursor hook receivers can still update
-their minimal local records. All display preferences are enabled by default.
+the main workspace list and native tray. Each provider-usage switch hides only
+that card. While any card remains visible, the shared snapshot still reads all
+six provider sources; hiding every card pauses live Codex, Claude, Antigravity,
+and Zed refreshes. Installed Gemini, Claude status-line, and Cursor hook
+receivers can still update their minimal local records. All display preferences
+are enabled by default.
 
 Zed data is discovered under `$XDG_DATA_HOME/zed` (or
 `~/.local/share/zed`) and the community Flatpak root

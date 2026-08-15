@@ -203,7 +203,7 @@ test("the six-provider dashboard renders quota, context, and token usage", () =>
   assert.equal(context.asPercentage(42.5), 42.5);
 });
 
-test("visibility settings default on and synchronize editor and usage preferences", () => {
+test("visibility settings default every editor and provider usage card on", () => {
   const html = read("ui/index.html");
   const css = read("ui/styles.css");
   const javascript = read("ui/generated/app.js");
@@ -217,22 +217,37 @@ test("visibility settings default on and synchronize editor and usage preference
       new RegExp(`<input\\b(?=[^>]*data-editor-visibility="${editor}")(?=[^>]*checked)[^>]*>`, "i"),
     );
   }
-  assert.match(
-    visibility,
-    /<input\b(?=[^>]*id="usageVisibilityInput")(?=[^>]*checked)[^>]*>/i,
-  );
-  assert.match(visibility, />\s*Provider usage\s*</i);
-  assert.match(visibility, /available quota, context, and token information/i);
+  for (const provider of ["codex", "claude", "gemini", "antigravity", "zed", "cursor"]) {
+    assert.match(
+      visibility,
+      new RegExp(`<input\\b(?=[^>]*data-usage-visibility="${provider}")(?=[^>]*checked)[^>]*>`, "i"),
+    );
+  }
+  assert.match(visibility, />\s*Codex usage\s*</i);
+  assert.match(visibility, />\s*Claude usage\s*</i);
+  assert.match(visibility, />\s*Gemini usage\s*</i);
+  assert.match(visibility, />\s*Antigravity usage\s*</i);
+  assert.match(visibility, />\s*Zed Agent usage\s*</i);
+  assert.match(visibility, />\s*Cursor usage\s*</i);
   assert.doesNotMatch(visibility, /Show Codex and Claude/i);
   assert.match(javascript, /invoke\("get_display_preferences",\s*\{\}\)/);
-  assert.match(javascript, /invoke\("set_editor_visibility",\s*\{[\s\S]*editor:\s*kind,[\s\S]*visible:/);
-  assert.match(javascript, /invoke\("set_usage_limit_percentage_visible",\s*\{\s*visible\s*\}\)/);
+  assert.match(javascript, /invoke\("set_editor_visibility",\s*\{[\s\S]*?editor:\s*kind,[\s\S]*?visible,/);
+  assert.match(javascript, /invoke\("set_usage_provider_visibility",\s*\{[\s\S]*?provider:\s*kind,[\s\S]*?visible,/);
   assert.match(javascript, /await refreshSnapshot\(\)/);
   assert.match(javascript, /localStorage\.setItem\(\s*VISIBILITY_STORAGE_KEY/);
+  assert.match(javascript, /usageProviders:\s*state\.usageProviderVisibility/);
+  assert.match(javascript, /state\.usageVisible\s*=\s*anyUsageProviderVisible\(state\.usageProviderVisibility\)/);
+  assert.match(javascript, /card\.hidden\s*=\s*!state\.usageProviderVisibility\[kind\]/);
+  assert.match(javascript, /filter\(\(kind\)\s*=>\s*state\.usageProviderVisibility\[kind\]\)/);
+  assert.match(javascript, /let displayPreferencesQueue\s*=\s*Promise\.resolve\(\)/);
+  assert.match(javascript, /function setVisibilityControlsDisabled\(disabled\)/);
+  assert.match(javascript, /displayPreferencesQueue\.then\(operation, operation\)/);
+  assert.match(javascript, /setVisibilityControlsDisabled\(pendingDisplayPreferenceOperations > 0\)/);
   assert.match(javascript, /function visibleWorkspaces\(/);
   assert.match(javascript, /if \(!state\.usageVisible\)/);
   assert.match(javascript, /if \(state\.usageRefreshPromise\)/);
   assert.match(css, /\.usage-overview\[hidden\]\s*\{[^}]*display:\s*none/s);
+  assert.match(css, /\.usage-card\[hidden\]\s*\{[^}]*display:\s*none/s);
 });
 
 test("setup warnings expose specific hover and keyboard-accessible details", () => {

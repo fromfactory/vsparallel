@@ -932,12 +932,20 @@ a fallback when app-wide preference synchronization is unavailable:
 
 ```json
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "editors": {
     "vscode": true,
     "cursor": true,
     "antigravity": true,
     "zed": true
+  },
+  "usageProviders": {
+    "codex": true,
+    "claude": true,
+    "gemini": true,
+    "antigravity": true,
+    "zed": true,
+    "cursor": true
   },
   "usageLimitPercentage": true
 }
@@ -945,14 +953,20 @@ a fallback when app-wide preference synchronization is unavailable:
 
 Every value defaults to `true`. Editor preferences filter workspace rows in the
 main snapshot presentation and native tray; `antigravity` covers both
-Antigravity IDE and Antigravity 2.0. The legacy key
-`usageLimitPercentage` controls whether the complete global usage dashboard is
-displayed, including token and context cards as well as quota percentages.
+Antigravity IDE and Antigravity 2.0. Each `usageProviders` key controls the
+corresponding card. The retained `usageLimitPercentage` key is a compatibility
+mirror that is `true` when any provider card is enabled; its legacy setter
+changes all six provider values together. A schema-version-1 file expands its
+single value to all six provider values during loading, preserving an existing
+all-on or all-off choice.
+
 These are presentation preferences: changing them neither installs nor
-disables an integration and does not alter provider configuration. When the
-usage dashboard is hidden, the UI does not invoke `get_usage`, so live Codex,
-Claude, Antigravity, and Zed usage reads pause. Installed Gemini, Claude
-status-line, and Cursor receivers remain able to update their minimal records.
+disables an integration and does not alter provider configuration. While at
+least one card is visible, the fixed `get_usage` snapshot still reads all six
+provider sources. When every card is hidden, the UI does not invoke `get_usage`,
+so live Codex, Claude, Antigravity, and Zed usage reads pause. Installed Gemini,
+Claude status-line, and Cursor receivers remain able to update their minimal
+records.
 
 During ordinary retention, inactive companion heartbeats disappear from the UI
 after 60 seconds and lifecycle observations older than 24 hours no longer

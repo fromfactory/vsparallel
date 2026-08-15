@@ -208,6 +208,17 @@ async fn set_usage_limit_percentage_visible(visible: bool) -> Result<DisplayPref
         .await
 }
 
+#[tauri::command]
+async fn set_usage_provider_visibility(
+    provider: String,
+    visible: bool,
+) -> Result<DisplayPreferences, String> {
+    run_background(move || {
+        state::set_usage_provider_visibility_from_environment(&provider, visible)
+    })
+    .await
+}
+
 fn current_snapshot() -> Result<Snapshot, String> {
     let now_ms = now_ms();
     let cursor_agents = cursor_agents_bridge::poll(now_ms, false);
@@ -3193,6 +3204,7 @@ pub fn run() {
             get_display_preferences,
             set_editor_visibility,
             set_usage_limit_percentage_visible,
+            set_usage_provider_visibility,
             get_diagnostics,
             get_integration_status,
             get_cursor_agents_bridge_status,
