@@ -1335,6 +1335,7 @@ fn parse_http_head(response: &[u8]) -> Result<Option<HttpResponseHead>, BridgeFa
     }))
 }
 
+#[cfg(any(unix, test))]
 fn http_response_is_complete(response: &[u8]) -> Result<bool, BridgeFailure> {
     if response.len() > MAX_RESPONSE_BYTES {
         return Err(BridgeFailure::new("bridge_response_too_large"));
@@ -1540,6 +1541,7 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::sync::mpsc;
+    #[cfg(unix)]
     use std::thread;
     use tempfile::TempDir;
 

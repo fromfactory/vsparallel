@@ -52,6 +52,7 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const STATUS_CLI_TIMEOUT: Duration = Duration::from_secs(15);
 const CHANGE_CLI_TIMEOUT: Duration = Duration::from_secs(120);
 const CLI_POLL_INTERVAL: Duration = Duration::from_millis(25);
+#[cfg(unix)]
 const POST_EXIT_PIPE_DRAIN_GRACE: Duration = Duration::from_millis(100);
 const CLI_CAPTURE_LIMIT: usize = 256 * 1024;
 
@@ -259,14 +260,17 @@ impl ProcessCodeCliRunner {
                 ));
             }
 
-            let mut sleep_for = limits.poll_interval.min(timeout.saturating_sub(elapsed));
+            let sleep_for = limits.poll_interval.min(timeout.saturating_sub(elapsed));
             #[cfg(unix)]
-            if !process_group_terminated {
+            let sleep_for = if !process_group_terminated {
                 if let Some(observed_at) = child_exit_observed_at {
-                    sleep_for = sleep_for
-                        .min(POST_EXIT_PIPE_DRAIN_GRACE.saturating_sub(observed_at.elapsed()));
+                    sleep_for.min(POST_EXIT_PIPE_DRAIN_GRACE.saturating_sub(observed_at.elapsed()))
+                } else {
+                    sleep_for
                 }
-            }
+            } else {
+                sleep_for
+            };
             thread::sleep(sleep_for);
         }
     }
@@ -430,7 +434,7 @@ fn command_candidates(directory: &Path, executable: &OsStr) -> bool {
         }
         let extensions =
             env::var_os("PATHEXT").unwrap_or_else(|| OsString::from(".COM;.EXE;.BAT;.CMD"));
-        return extensions
+        extensions
             .to_string_lossy()
             .split(';')
             .filter(|extension| !extension.is_empty())
@@ -438,7 +442,7 @@ fn command_candidates(directory: &Path, executable: &OsStr) -> bool {
                 let mut candidate = executable.to_os_string();
                 candidate.push(extension);
                 directory.join(candidate).is_file()
-            });
+            })
     }
     #[cfg(not(windows))]
     {

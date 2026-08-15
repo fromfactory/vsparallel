@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::env;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1017,7 +1017,7 @@ fn set_private_directory_permissions(path: &Path) {
 fn sync_parent(path: &Path) {
     #[cfg(unix)]
     {
-        if let Ok(directory) = File::open(path) {
+        if let Ok(directory) = fs::File::open(path) {
             let _ = directory.sync_all();
         }
     }

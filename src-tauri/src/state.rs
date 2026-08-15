@@ -2577,10 +2577,10 @@ fn path_is_within(path: &Path, root: &Path) -> bool {
     {
         let path = path.to_string_lossy().to_lowercase();
         let root = root.to_string_lossy().to_lowercase();
-        return path == root
+        path == root
             || path
                 .strip_prefix(&root)
-                .is_some_and(|suffix| suffix.starts_with(['/', '\\']));
+                .is_some_and(|suffix| suffix.starts_with(['/', '\\']))
     }
 
     #[cfg(not(target_os = "windows"))]

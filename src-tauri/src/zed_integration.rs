@@ -87,7 +87,9 @@ const MAX_THREAD_DATABASE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_THREAD_BLOB_BYTES: usize = 8 * 1024 * 1024;
 const MAX_MODEL_ROWS_PER_REFRESH: usize = 4;
 const MAX_MODEL_DECOMPRESSED_BYTES_PER_REFRESH: usize = 16 * 1024 * 1024;
+#[cfg(target_os = "linux")]
 const MAX_PROCESS_ENTRIES: usize = 65_536;
+#[cfg(target_os = "linux")]
 const MAX_PROCESS_NAME_BYTES: u64 = 128;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 const MAX_PROCESS_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
@@ -2164,7 +2166,7 @@ fn valid_local_absolute_path(path: &Path) -> bool {
         let Some(Component::Prefix(prefix)) = path.components().next() else {
             return false;
         };
-        return matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_));
+        matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
     }
     #[cfg(not(windows))]
     true
