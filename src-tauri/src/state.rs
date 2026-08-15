@@ -3672,7 +3672,7 @@ mod tests {
         )
         .unwrap();
         for index in 0..=MAX_RECORD_CANDIDATES_PER_DIRECTORY {
-            fs::hard_link(&source, instances.join(format!("{index:04}.json"))).unwrap();
+            fs::copy(&source, instances.join(format!("{index:04}.json"))).unwrap();
         }
 
         let diagnostics = StateStore::new(temp.path().to_path_buf()).diagnostics(
@@ -3844,6 +3844,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let repo = temp.path().join("minimal");
         fs::create_dir_all(&repo).unwrap();
+        let canonical_repo = fs::canonicalize(&repo).unwrap();
         let now = 30_000;
         write_json(
             &temp.path().join("instances/minimal.json"),
@@ -3876,7 +3877,7 @@ mod tests {
         let target = store
             .find_workspace_open_target("51adf7cb-d0ee-42a2-8d5d-dc8ef93d74f8", now)
             .unwrap();
-        assert_eq!(target.paths, vec![repo]);
+        assert_eq!(target.paths, vec![canonical_repo]);
         assert_eq!(
             target.editor, None,
             "legacy records use the configured default"
@@ -3899,6 +3900,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let repo = temp.path().join("antigravity-project");
         fs::create_dir_all(&repo).unwrap();
+        let canonical_repo = fs::canonicalize(&repo).unwrap();
         let now = 30_000;
         let mut heartbeat = instance("antigravity-window", &repo, now, true);
         heartbeat["editor"] = json!("antigravity_ide");
@@ -3919,7 +3921,7 @@ mod tests {
         assert_eq!(
             store.find_workspace_open_target("antigravity-window", now),
             Some(WorkspaceOpenTarget {
-                paths: vec![repo],
+                paths: vec![canonical_repo],
                 editor: Some(EditorKind::AntigravityIde),
                 zed_channel: None,
             })
@@ -3931,6 +3933,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let repo = temp.path().join("cursor-project");
         fs::create_dir_all(&repo).unwrap();
+        let canonical_repo = fs::canonicalize(&repo).unwrap();
         let now = 30_000;
         let mut heartbeat = instance("cursor-window", &repo, now, true);
         heartbeat["editor"] = json!("cursor");
@@ -3947,7 +3950,7 @@ mod tests {
         assert_eq!(
             store.find_workspace_open_target("cursor-window", now),
             Some(WorkspaceOpenTarget {
-                paths: vec![repo],
+                paths: vec![canonical_repo],
                 editor: Some(EditorKind::Cursor),
                 zed_channel: None,
             })
@@ -4007,6 +4010,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let repo = temp.path().join("cursor-project");
         fs::create_dir_all(&repo).unwrap();
+        let canonical_repo = fs::canonicalize(&repo).unwrap();
         let now = 30_000;
         write_json(
             &temp.path().join("cursor/workspace.json"),
@@ -4026,7 +4030,7 @@ mod tests {
         assert!(workspace.instance_id.starts_with("cursor-workspace:"));
         assert_eq!(workspace.editor, EditorKind::Cursor);
         assert_eq!(workspace.editor_name, "Cursor");
-        assert_eq!(workspace.path.as_deref(), repo.to_str());
+        assert_eq!(workspace.path.as_deref(), canonical_repo.to_str());
         assert!(!workspace.openable);
         assert!(!workspace.active);
         assert!(!workspace.focused);
@@ -4775,6 +4779,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let repo = temp.path().join("antigravity-project");
         fs::create_dir_all(&repo).unwrap();
+        let canonical_repo = fs::canonicalize(&repo).unwrap();
         let now = 30_000;
         write_json(
             &temp.path().join("antigravity/conversation-project.json"),
@@ -4796,7 +4801,7 @@ mod tests {
         assert_eq!(workspace.editor_name, "Antigravity 2.0");
         assert_eq!(
             workspace.path.as_deref(),
-            Some(repo.to_string_lossy().as_ref())
+            Some(canonical_repo.to_string_lossy().as_ref())
         );
         assert!(!workspace.openable);
         assert!(!workspace.active);
@@ -5592,6 +5597,7 @@ mod tests {
         let repo = temp.path().join("repo");
         let missing_repo = temp.path().join("missing-repo");
         fs::create_dir_all(&repo).unwrap();
+        let canonical_repo = fs::canonicalize(&repo).unwrap();
         let now = 20_000;
         write_json(
             &temp.path().join("instances/repo.json"),
@@ -5604,7 +5610,7 @@ mod tests {
         assert_eq!(
             StateStore::new(temp.path().to_path_buf()).find_workspace_open_target("repo", now),
             Some(WorkspaceOpenTarget {
-                paths: vec![repo],
+                paths: vec![canonical_repo],
                 editor: None,
                 zed_channel: None,
             })
@@ -5633,6 +5639,8 @@ mod tests {
         let retained_repo = temp.path().join("retained");
         fs::create_dir_all(&active_repo).unwrap();
         fs::create_dir_all(&retained_repo).unwrap();
+        let canonical_active_repo = fs::canonicalize(&active_repo).unwrap();
+        let canonical_retained_repo = fs::canonicalize(&retained_repo).unwrap();
         let now = 2_000_000;
         write_json(
             &temp.path().join("instances/active.json"),
@@ -5647,7 +5655,7 @@ mod tests {
         assert_eq!(
             store.find_active_workspace_open_target("active", now),
             Some(WorkspaceOpenTarget {
-                paths: vec![active_repo],
+                paths: vec![canonical_active_repo],
                 editor: None,
                 zed_channel: None,
             })
@@ -5658,7 +5666,7 @@ mod tests {
         assert_eq!(
             store.find_workspace_open_target("retained", now),
             Some(WorkspaceOpenTarget {
-                paths: vec![retained_repo],
+                paths: vec![canonical_retained_repo],
                 editor: None,
                 zed_channel: None,
             })
@@ -5672,6 +5680,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let project = temp.path().join("zed-project");
         fs::create_dir_all(&project).unwrap();
+        let canonical_project = fs::canonicalize(&project).unwrap();
         let now = 2_000_000_000_000;
         write_json(
             &temp.path().join("codex/zed-session.json"),
@@ -5687,8 +5696,8 @@ mod tests {
             workspaces: vec![ZedWorkspaceObservation {
                 instance_id: "zed:opaque-project".to_string(),
                 channel: "0-stable".to_string(),
-                paths: vec![project.clone()],
-                open_target: Some(vec![project.clone()]),
+                paths: vec![canonical_project.clone()],
+                open_target: Some(vec![canonical_project.clone()]),
                 open: true,
                 last_active_at_ms: Some(now - 1_000),
                 window_stack_index: Some(0),
@@ -5737,7 +5746,7 @@ mod tests {
         assert_eq!(
             store.find_active_workspace_open_target_with_zed("zed:opaque-project", now, &zed,),
             Some(WorkspaceOpenTarget {
-                paths: vec![project],
+                paths: vec![canonical_project],
                 editor: Some(EditorKind::Zed),
                 zed_channel: Some("0-stable".to_string()),
             })

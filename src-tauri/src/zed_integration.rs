@@ -38,7 +38,9 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::ffi::{OsStr, OsString};
+#[cfg(target_os = "macos")]
+use std::ffi::OsStr;
+use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::io::{self, Read};
@@ -2264,14 +2266,34 @@ fn open_bounded_read_only_database_with_limit(
     if !bounded_regular_file(database, maximum_database_bytes, false, false)? {
         return Err("the Zed database is missing or outside its size/type bound".to_string());
     }
-    let Some(filename) = database.file_name().and_then(OsStr::to_str) else {
+    let Some(filename) = database.file_name() else {
         return Err("the Zed database filename is invalid".to_string());
     };
+    let Some(filename_string) = filename.to_str() else {
+        return Err("the Zed database filename is invalid".to_string());
+    };
+    // SQLITE_OPEN_NOFOLLOW rejects a filename when any component traverses a
+    // symbolic link. macOS exposes its real temporary directory through the
+    // standard `/var` -> `/private/var` alias, so otherwise regular databases
+    // below temp_dir() would be rejected. Resolve only parent-directory
+    // aliases, append the original filename, and retain NOFOLLOW for SQLite's
+    // final open. This does not canonicalize the last component, preserving
+    // protection against a database replaced with a link between validation
+    // and open.
+    let parent = database
+        .parent()
+        .ok_or_else(|| "the Zed database has no parent directory".to_string())?;
+    let resolved_parent = fs::canonicalize(parent)
+        .map_err(|error| format!("could not resolve the Zed database parent: {error}"))?;
+    let resolved_database = resolved_parent.join(filename);
+    if !bounded_regular_file(&resolved_database, maximum_database_bytes, false, false)? {
+        return Err("the resolved Zed database is outside its size/type bound".to_string());
+    }
     for (suffix, maximum_bytes) in [
         ("-wal", MAX_DATABASE_WAL_BYTES),
         ("-shm", MAX_DATABASE_SHM_BYTES),
     ] {
-        let auxiliary = database.with_file_name(format!("{filename}{suffix}"));
+        let auxiliary = resolved_database.with_file_name(format!("{filename_string}{suffix}"));
         if !bounded_regular_file(&auxiliary, maximum_bytes, true, true)? {
             return Err("a Zed database auxiliary file is outside its bound".to_string());
         }
@@ -2280,7 +2302,7 @@ fn open_bounded_read_only_database_with_limit(
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
         | OpenFlags::SQLITE_OPEN_NO_MUTEX
         | OpenFlags::SQLITE_OPEN_NOFOLLOW;
-    let connection = Connection::open_with_flags(database, flags)
+    let connection = Connection::open_with_flags(&resolved_database, flags)
         .map_err(|error| format!("could not open the Zed database read-only: {error}"))?;
     connection
         .busy_timeout(DATABASE_BUSY_TIMEOUT)
@@ -4008,6 +4030,25 @@ mod tests {
         let oversized_wal =
             load_zed_snapshot_from_data_roots(&[temp.path().to_path_buf()], NOW_MS, false);
         assert_eq!(oversized_wal.diagnostics.malformed_channels, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_parent_alias_is_resolved_but_database_symlink_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let real_root = temp.path().join("real");
+        let database = create_channel_database(&real_root, "0-stable");
+        let alias = temp.path().join("alias");
+        symlink(&real_root, &alias).unwrap();
+
+        let aliased_database = alias.join("db").join("0-stable").join("db.sqlite");
+        assert!(open_bounded_read_only_database(&aliased_database).is_ok());
+
+        let linked_database = database.with_file_name("linked.sqlite");
+        symlink(&database, &linked_database).unwrap();
+        assert!(open_bounded_read_only_database(&linked_database).is_err());
     }
 
     #[cfg(unix)]

@@ -1666,7 +1666,8 @@ mod tests {
     fn stale_binary_path_is_migrated_by_stable_marker() {
         let temp = TempDir::new().unwrap();
         let home = temp.path().join("codex");
-        let old = managed_handler(Path::new("/old/VSParallel")).unwrap();
+        let old_executable = temp.path().join("old install").join("vsparallel");
+        let old = managed_handler(&old_executable).unwrap();
         write_json(
             &home.join(HOOKS_FILENAME),
             &json!({"hooks": {

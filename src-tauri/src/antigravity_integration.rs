@@ -1951,10 +1951,31 @@ fn bounded_regular_file(
 }
 
 fn open_bounded_read_only_database(database: &Path) -> Result<Connection, String> {
+    // SQLITE_OPEN_NOFOLLOW rejects a filename when any component traverses a
+    // symbolic link. macOS exposes its real temporary directory through the
+    // standard `/var` -> `/private/var` alias, so an otherwise regular,
+    // bounded database below `temp_dir()` cannot be opened through the path
+    // returned by the OS. Resolve only the parent directory aliases, append
+    // the original filename, and retain NOFOLLOW for SQLite's final open. Not
+    // canonicalizing the last component preserves protection against a file
+    // replaced with a link between the bounded metadata check and this open.
+    let parent = database
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", database.display()))?;
+    let filename = database
+        .file_name()
+        .ok_or_else(|| format!("{} has no database filename", database.display()))?;
+    let resolved_parent = fs::canonicalize(parent).map_err(|error| {
+        format!(
+            "could not resolve the parent of {} read-only: {error}",
+            database.display(),
+        )
+    })?;
+    let resolved = resolved_parent.join(filename);
     let flags = OpenFlags::SQLITE_OPEN_READ_ONLY
         | OpenFlags::SQLITE_OPEN_NO_MUTEX
         | OpenFlags::SQLITE_OPEN_NOFOLLOW;
-    let connection = Connection::open_with_flags(database, flags)
+    let connection = Connection::open_with_flags(&resolved, flags)
         .map_err(|error| format!("could not open {} read-only: {error}", database.display()))?;
     connection
         .busy_timeout(IDE_DB_BUSY_TIMEOUT)
@@ -4213,6 +4234,41 @@ mod tests {
             .unwrap();
         assert_eq!(
             read_antigravity_ide_conversation_model_path(&database).unwrap(),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ide_database_reader_resolves_parent_alias_but_rejects_a_database_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let real_root = temp.path().join("real");
+        let conversation_id = "403467f7-041a-420e-84cb-87da2ba51959";
+        let database = real_root
+            .join("conversations")
+            .join(format!("{conversation_id}.db"));
+        write_ide_conversation_model(&database, 0, "claude-sonnet-4-6");
+
+        let alias = temp.path().join("alias");
+        symlink(&real_root, &alias).unwrap();
+        let aliased_database = alias
+            .join("conversations")
+            .join(format!("{conversation_id}.db"));
+        assert_eq!(
+            read_antigravity_ide_conversation_model_path(&aliased_database)
+                .unwrap()
+                .map(|model| model.preference),
+            Some(IdeSelectedModelPreference::Recognized(
+                AntigravityModelKind::ClaudeSonnet46Thinking
+            ))
+        );
+
+        let linked_database = real_root.join("conversations/linked.db");
+        symlink(&database, &linked_database).unwrap();
+        assert_eq!(
+            read_antigravity_ide_conversation_model_path(&linked_database).unwrap(),
             None
         );
     }

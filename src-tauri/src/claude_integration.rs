@@ -1474,15 +1474,17 @@ mod tests {
     fn stale_vsparallel_handlers_are_migrated_conservatively() {
         let temp = TempDir::new().unwrap();
         let home = temp.path().join("claude");
+        let old_executable = temp.path().join("old install").join("vsparallel");
+        let similar_executable = temp.path().join("similar install").join("vsparallel");
         let old = json!({
             "type": "command",
-            "command": "/Volumes/VSParallel/VSParallel.app/Contents/MacOS/vsparallel",
+            "command": old_executable,
             "args": ["claude-hook"],
             "timeout": 5
         });
         let similar_but_not_owned = json!({
             "type": "command",
-            "command": "/old/VSParallel",
+            "command": similar_executable,
             "args": ["different-mode"],
             "timeout": 2
         });
@@ -1505,7 +1507,15 @@ mod tests {
 
         let installed = parse_config(&home);
         let text = installed.to_string();
-        assert!(!text.contains("/Volumes/VSParallel"));
+        let old_command = old_executable.to_string_lossy();
+        for event in EVENTS {
+            assert!(installed["hooks"][event]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|group| group["hooks"].as_array().unwrap())
+                .all(|handler| handler["command"].as_str() != Some(old_command.as_ref())));
+        }
         assert!(!text.contains("\"timeout\":5"));
         assert!(text.contains("different-mode"));
     }
@@ -1548,35 +1558,33 @@ mod tests {
     fn stale_owned_usage_status_line_is_repaired() {
         let temp = TempDir::new().unwrap();
         let home = temp.path().join("claude");
-        write_json(
-            &home.join(SETTINGS_FILENAME),
-            &json!({"statusLine": {
-                "type": "command",
-                "command": "'/old/vsparallel' claude-usage",
-                "padding": 0,
-                "refreshInterval": 30
-            }}),
-        );
+        let old_executable = temp.path().join("old install").join("vsparallel");
+        let mut stale = managed_usage_status_line(&old_executable).unwrap();
+        stale["refreshInterval"] = json!(30);
+        write_json(&home.join(SETTINGS_FILENAME), &json!({"statusLine": stale}));
         let executable = executable(temp.path());
         let result = install_claude_integration(&home, &executable).unwrap();
         assert!(result.changed);
         assert!(result.migrated);
         assert_eq!(result.status.usage_capture_state, "current");
-        assert!(parse_config(&home)["statusLine"]["command"]
-            .as_str()
-            .unwrap()
-            .contains(executable.to_string_lossy().as_ref()));
+        assert_eq!(
+            parse_config(&home)["statusLine"],
+            managed_usage_status_line(&executable).unwrap()
+        );
     }
 
     #[test]
     fn handlers_with_extra_fields_or_non_vsparallel_commands_are_not_owned() {
-        let current = managed_handler(Path::new("/new/vsparallel")).unwrap();
+        let temp = TempDir::new().unwrap();
+        let current = managed_handler(&executable(temp.path())).unwrap();
+        let old_executable = temp.path().join("old install").join("vsparallel");
+        let other_executable = temp.path().join("other install").join("monitor");
         let extra = json!({
-            "type":"command", "command":"/old/vsparallel",
+            "type":"command", "command":old_executable,
             "args":["claude-hook"], "timeout":2, "extra":true
         });
         let other = json!({
-            "type":"command", "command":"/other/monitor",
+            "type":"command", "command":other_executable,
             "args":["claude-hook"], "timeout":2
         });
         assert!(!is_owned_handler(&extra, &current));
