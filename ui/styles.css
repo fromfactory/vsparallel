@@ -337,7 +337,8 @@ dialog:focus-visible {
   opacity: 0.5;
 }
 
-.quiet-button.is-loading > .button-icon:first-child {
+.quiet-button.is-loading > .button-icon:first-child,
+.icon-button.is-loading > .button-icon:first-child {
   animation: spin 700ms linear infinite;
 }
 
@@ -577,18 +578,6 @@ dialog:focus-visible {
   gap: 6px;
 }
 
-.usage-card__icon {
-  width: 16px;
-  height: 16px;
-  flex: 0 0 16px;
-  color: var(--usage-accent);
-  fill: none;
-  stroke: currentColor;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-  stroke-width: 1.35;
-}
-
 .usage-card__name {
   min-width: 0;
   overflow: hidden;
@@ -681,9 +670,7 @@ dialog:focus-visible {
   );
 }
 
-.usage-card[data-state="checking"] .usage-card__icon,
 .usage-card[data-state="checking"] .usage-card__value,
-.usage-card[data-state="unavailable"] .usage-card__icon,
 .usage-card[data-state="unavailable"] .usage-card__value {
   color: var(--text-muted);
 }
@@ -1718,10 +1705,6 @@ html[data-workspace-opening="true"] .app-shell {
   gap: 8px;
 }
 
-.integration-card__icon {
-  display: none;
-}
-
 .integration-card h4 {
   color: var(--text);
   font-size: 13px;
@@ -2517,12 +2500,6 @@ html[data-workspace-opening="true"] .app-shell {
   background: var(--floating-list);
 }
 
-:root[data-window-mode="floating"] .usage-card__icon {
-  width: 14px;
-  height: 14px;
-  flex-basis: 14px;
-}
-
 :root[data-window-mode="floating"] .usage-card__name,
 :root[data-window-mode="floating"] .usage-card__value {
   font-size: 9px;
@@ -2833,7 +2810,6 @@ html[data-workspace-opening="true"] .app-shell {
 }
 
 @media (max-width: 430px) {
-  .quiet-button#refreshButton > span:last-child,
   .connection-bar time {
     display: none;
   }

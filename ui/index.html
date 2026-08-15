@@ -63,16 +63,17 @@
             </svg>
           </button>
           <button
-            class="quiet-button"
+            class="icon-button"
             id="refreshButton"
             type="button"
+            title="Refresh"
+            aria-label="Refresh dashboard"
             data-tauri-drag-region="false"
           >
             <svg class="button-icon" viewBox="0 0 16 16" aria-hidden="true">
               <path d="M13.1 5.15A5.5 5.5 0 1 0 13.38 10" />
               <path d="M13.1 2.8v2.7h-2.7" />
             </svg>
-            <span>Refresh</span>
           </button>
           <button
             class="icon-button"
@@ -209,10 +210,6 @@
             aria-describedby="codexUsageDetail"
           >
             <div class="usage-card__identity">
-              <svg class="usage-card__icon" viewBox="0 0 20 20" aria-hidden="true">
-                <path d="M6.1 2.8h7.8l3.9 7.2-3.9 7.2H6.1L2.2 10l3.9-7.2Z" />
-                <path d="m7.1 10 2 2 4-4.3" />
-              </svg>
               <span class="usage-card__name" id="codexUsageName">Codex</span>
               <span class="usage-card__state" id="codexUsageState" hidden>Stale</span>
             </div>
@@ -236,9 +233,6 @@
             aria-describedby="claudeUsageDetail"
           >
             <div class="usage-card__identity">
-              <svg class="usage-card__icon" viewBox="0 0 20 20" aria-hidden="true">
-                <path d="M10 2.3v15.4M3.3 6.1l13.4 7.8M3.3 13.9l13.4-7.8" />
-              </svg>
               <span class="usage-card__name" id="claudeUsageName">Claude</span>
               <span class="usage-card__state" id="claudeUsageState" hidden>Stale</span>
             </div>
@@ -262,9 +256,6 @@
             aria-describedby="geminiUsageDetail"
           >
             <div class="usage-card__identity">
-              <svg class="usage-card__icon" viewBox="0 0 20 20" aria-hidden="true">
-                <path d="M10 2.2c.5 4.8 2.8 7.1 7.6 7.8-4.8.6-7.1 3-7.6 7.8-.6-4.8-2.9-7.2-7.6-7.8 4.7-.7 7-3 7.6-7.8Z" />
-              </svg>
               <span class="usage-card__name" id="geminiUsageName">Gemini</span>
               <span class="usage-card__state" id="geminiUsageState" hidden>Stale</span>
             </div>
@@ -284,10 +275,6 @@
             aria-describedby="antigravityUsageDetail"
           >
             <div class="usage-card__identity">
-              <svg class="usage-card__icon" viewBox="0 0 20 20" aria-hidden="true">
-                <circle cx="10" cy="10" r="2.1" />
-                <path d="M3 10c1.8-4.8 4.1-7.2 7-7.2s5.2 2.4 7 7.2c-1.8 4.8-4.1 7.2-7 7.2S4.8 14.8 3 10Z" />
-              </svg>
               <span class="usage-card__name" id="antigravityUsageName">Antigravity</span>
               <span class="usage-card__state" id="antigravityUsageState" hidden>Stale</span>
             </div>
@@ -307,9 +294,6 @@
             aria-describedby="zedUsageDetail"
           >
             <div class="usage-card__identity">
-              <svg class="usage-card__icon" viewBox="0 0 20 20" aria-hidden="true">
-                <path d="M4 4h12L5 16h11" />
-              </svg>
               <span class="usage-card__name" id="zedUsageName">Zed Agent</span>
               <span class="usage-card__state" id="zedUsageState" hidden>Stale</span>
             </div>
@@ -329,10 +313,6 @@
             aria-describedby="cursorUsageDetail"
           >
             <div class="usage-card__identity">
-              <svg class="usage-card__icon" viewBox="0 0 20 20" aria-hidden="true">
-                <path d="M4.1 2.8 16.2 10 4.1 17.2V2.8Z" />
-                <path d="m7.2 7.2 4.8 2.8-4.8 2.8V7.2Z" />
-              </svg>
               <span class="usage-card__name" id="cursorUsageName">Cursor</span>
               <span class="usage-card__state" id="cursorUsageState" hidden>Stale</span>
             </div>
@@ -649,8 +629,8 @@
                 <div>
                   <h3 id="integrationHeading">Integrations</h3>
                   <p id="integrationDescription">
-                    Install one complete integration per editor. Zed monitoring is automatic and read-only;
-                    it uses local workspace and agent metadata.
+                    All integrations are optional; set up only the editors and providers you use.
+                    Zed monitoring is automatic and read-only; it uses local workspace and agent metadata.
                   </p>
                 </div>
                 <div class="integration-toolbar">
@@ -677,13 +657,12 @@
                 <article class="integration-card integration-card--wide" id="companionCard">
                   <div class="integration-card__header">
                     <div class="integration-card__identity">
-                      <svg class="integration-card__icon" viewBox="0 0 24 24" aria-hidden="true">
-                        <path d="m16.5 3.5 4 2v13l-4 2-8-7.2-4 3.2-2-1V8.5l2-1 4 3.2 8-7.2Z" />
-                        <path d="m16.5 3.5-8 7.2v2.6l8 7.2v-17Z" />
-                      </svg>
                       <div>
                         <div class="integration-card__title-row">
-                          <h4>VS Code</h4>
+                          <h4>
+                            VS Code
+                            <span class="optional-label">Optional</span>
+                          </h4>
                           <span class="help-popover">
                             <button
                               class="help-popover__trigger"
@@ -739,13 +718,12 @@
                 <article class="integration-card" id="cursorCompanionCard">
                   <div class="integration-card__header">
                     <div class="integration-card__identity">
-                      <svg class="integration-card__icon" viewBox="0 0 24 24" aria-hidden="true">
-                        <path d="M5 4.5 19 12 5 19.5V4.5Z" />
-                        <path d="m8.5 9 5 3-5 3V9Z" />
-                      </svg>
                       <div>
                         <div class="integration-card__title-row">
-                          <h4>Cursor</h4>
+                          <h4>
+                            Cursor
+                            <span class="optional-label">Optional</span>
+                          </h4>
                           <span class="help-popover">
                             <button
                               class="help-popover__trigger"
@@ -816,14 +794,11 @@
                 >
                   <div class="integration-card__header">
                     <div class="integration-card__identity">
-                      <svg class="integration-card__icon" viewBox="0 0 24 24" aria-hidden="true">
-                        <path d="M5 4.5 19 12 5 19.5V4.5Z" />
-                        <path d="M15.5 7.5h4v4M19.5 7.5l-5 5" />
-                      </svg>
                       <div>
                         <div class="integration-card__title-row">
                           <h4>
                             Cursor Agents Window
+                            <span class="optional-label">Optional</span>
                             <span class="optional-label experimental-label">Experimental</span>
                           </h4>
                           <span class="help-popover">
@@ -896,13 +871,12 @@
                 <article class="integration-card" id="antigravityIdeCard">
                   <div class="integration-card__header">
                     <div class="integration-card__identity">
-                      <svg class="integration-card__icon" viewBox="0 0 24 24" aria-hidden="true">
-                        <path d="M4 5.5h16v13H4z" />
-                        <path d="m8 9 3 3-3 3M13 15h4" />
-                      </svg>
                       <div>
                         <div class="integration-card__title-row">
-                          <h4>Antigravity</h4>
+                          <h4>
+                            Antigravity
+                            <span class="optional-label">Optional</span>
+                          </h4>
                           <span class="help-popover">
                             <button
                               class="help-popover__trigger"
@@ -962,9 +936,6 @@
                 <article class="integration-card" id="geminiCard">
                   <div class="integration-card__header">
                     <div class="integration-card__identity">
-                      <svg class="integration-card__icon" viewBox="0 0 24 24" aria-hidden="true">
-                        <path d="M12 2.7c.6 5.6 3.3 8.3 8.8 9.3-5.5.8-8.2 3.6-8.8 9.3-.7-5.7-3.4-8.5-8.8-9.3 5.4-1 8.1-3.7 8.8-9.3Z" />
-                      </svg>
                       <div>
                         <div class="integration-card__title-row">
                           <h4>
@@ -1030,10 +1001,6 @@
                 <article class="integration-card" id="codexCard">
                   <div class="integration-card__header">
                     <div class="integration-card__identity">
-                      <svg class="integration-card__icon" viewBox="0 0 24 24" aria-hidden="true">
-                        <path d="M8 3.5h8l4 7-4 7H8l-4-7 4-7Z" />
-                        <path d="m8 10 2.5 2.5L16 7" />
-                      </svg>
                       <div>
                         <div class="integration-card__title-row">
                           <h4>
@@ -1101,9 +1068,6 @@
                 <article class="integration-card" id="claudeCard">
                   <div class="integration-card__header">
                     <div class="integration-card__identity">
-                      <svg class="integration-card__icon" viewBox="0 0 24 24" aria-hidden="true">
-                        <path d="m8 5-5 7 5 7M16 5l5 7-5 7M14 3l-4 18" />
-                      </svg>
                       <div>
                         <div class="integration-card__title-row">
                           <h4>

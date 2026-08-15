@@ -293,7 +293,8 @@
   }
 
   interface AppState {
-    refreshPending: boolean;
+    snapshotRefreshPromise: Promise<void> | null;
+    manualRefreshPending: boolean;
     usagePending: boolean;
     usageRefreshPromise: Promise<void> | null;
     usageRefreshGeneration: number;
@@ -360,7 +361,7 @@
 
   const SCHEMA_VERSION = 1;
   const DISPLAY_PREFERENCES_SCHEMA_VERSION = 2;
-  const REFRESH_INTERVAL_MS = 3_000;
+  const REFRESH_INTERVAL_MS = 5_000;
   const USAGE_REFRESH_INTERVAL_MS = 60_000;
   const USAGE_LAST_KNOWN_MAX_AGE_MS = 15 * 60_000;
   const LAUNCH_TRANSITION_MIN_MS = 750;
@@ -688,7 +689,8 @@
   const initialVisibilityPreferences = loadVisibilityPreferences();
 
   const state: AppState = {
-    refreshPending: false,
+    snapshotRefreshPromise: null,
+    manualRefreshPending: false,
     usagePending: false,
     usageRefreshPromise: null,
     usageRefreshGeneration: 0,
@@ -1004,7 +1006,7 @@
 
     return {
       kind,
-      optional: !["companion", "cursorCompanion", "antigravityIde"].includes(kind),
+      optional: true,
       token,
       visualState,
       installed,
@@ -2319,10 +2321,9 @@
   }
 
   function updateRefreshControl(): void {
-    const pending = state.refreshPending || state.usagePending;
-    elements.refreshButton.disabled = pending;
-    elements.refreshButton.setAttribute("aria-busy", String(pending));
-    elements.refreshButton.classList.toggle("is-loading", pending);
+    elements.refreshButton.disabled = state.manualRefreshPending;
+    elements.refreshButton.setAttribute("aria-busy", String(state.manualRefreshPending));
+    elements.refreshButton.classList.toggle("is-loading", state.manualRefreshPending);
     elements.usageOverview.setAttribute(
       "aria-busy",
       String(state.usagePending || !state.lastUsage),
@@ -2967,37 +2968,41 @@
   }
 
   async function refreshSnapshot(): Promise<void> {
-    if (state.refreshPending) {
+    if (state.snapshotRefreshPromise) {
+      await state.snapshotRefreshPromise;
       return;
     }
 
-    state.refreshPending = true;
     updateRefreshControl();
     if (!state.lastGoodSnapshot) {
       elements.workspaceList.setAttribute("aria-busy", "true");
     }
 
-    try {
-      const raw = await invoke("get_snapshot", {});
-      const snapshot = normalizeSnapshot(raw);
-      state.lastGoodSnapshot = snapshot;
-      renderSnapshot(snapshot);
-    } catch (error) {
-      const message = readableError(error, "Could not refresh the local workspace snapshot.");
-      elements.connectionBar.dataset.state = "error";
-      elements.connectionText.textContent = state.lastGoodSnapshot
-        ? "Refresh failed · showing the last good snapshot"
-        : "Local monitor unavailable";
-      elements.updatedAt.textContent = "";
-      showNotice(message);
-      elements.workspaceList.setAttribute("aria-busy", "false");
-      if (!state.lastGoodSnapshot) {
-        elements.emptyState.hidden = false;
+    const operation = (async () => {
+      try {
+        const raw = await invoke("get_snapshot", {});
+        const snapshot = normalizeSnapshot(raw);
+        state.lastGoodSnapshot = snapshot;
+        renderSnapshot(snapshot);
+      } catch (error) {
+        const message = readableError(error, "Could not refresh the local workspace snapshot.");
+        elements.connectionBar.dataset.state = "error";
+        elements.connectionText.textContent = state.lastGoodSnapshot
+          ? "Refresh failed · showing the last good snapshot"
+          : "Local monitor unavailable";
+        elements.updatedAt.textContent = "";
+        showNotice(message);
+        elements.workspaceList.setAttribute("aria-busy", "false");
+        if (!state.lastGoodSnapshot) {
+          elements.emptyState.hidden = false;
+        }
+      } finally {
+        state.snapshotRefreshPromise = null;
+        updateRefreshControl();
       }
-    } finally {
-      state.refreshPending = false;
-      updateRefreshControl();
-    }
+    })();
+    state.snapshotRefreshPromise = operation;
+    await operation;
   }
 
   async function refreshUsage(forceAfterPending = false): Promise<void> {
@@ -3053,8 +3058,23 @@
     }
   }
 
-  function refreshAll() {
-    return Promise.allSettled([refreshSnapshot(), refreshUsage()]);
+  async function refreshAll(manual = false): Promise<void> {
+    if (manual) {
+      if (state.manualRefreshPending) {
+        return;
+      }
+      state.manualRefreshPending = true;
+      updateRefreshControl();
+    }
+
+    try {
+      await Promise.allSettled([refreshSnapshot(), refreshUsage()]);
+    } finally {
+      if (manual) {
+        state.manualRefreshPending = false;
+        updateRefreshControl();
+      }
+    }
   }
 
   function updateWorkspaceOpeningState(instanceId: string, opening: boolean): void {
@@ -3298,7 +3318,7 @@
     return {
       ...components[0],
       kind,
-      optional: false,
+      optional: true,
       token: manualActionOnly ? "manual_action_required" : components[0].token,
       visualState,
       installed,
@@ -4646,7 +4666,7 @@
       if (isDialogOpen(elements.settingsDialog)) {
         refreshSetup();
       } else {
-        refreshAll();
+        void refreshAll(true);
       }
       return;
     }
@@ -4673,7 +4693,9 @@
   elements.cursorAgentsBridgeCard.hidden = false;
   initializeHelpPopovers();
 
-  elements.refreshButton.addEventListener("click", refreshAll);
+  elements.refreshButton.addEventListener("click", () => {
+    void refreshAll(true);
+  });
   elements.emptySetupButton.addEventListener("click", openSettingsDialog);
   elements.emptyRefreshButton.addEventListener("click", refreshSnapshot);
   elements.restoreFullButton.addEventListener("click", restoreFullWindow);

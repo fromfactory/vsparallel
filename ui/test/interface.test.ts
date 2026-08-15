@@ -98,6 +98,48 @@ test("the main chrome omits redundant labels while retaining an accessible works
     1,
     "the workspace count should have one canonical location",
   );
+
+  const refreshButton = titlebar.match(
+    /<button\b(?=[^>]*id="refreshButton")[^>]*>[\s\S]*?<\/button>/i,
+  )?.[0];
+  assert.ok(refreshButton, "the titlebar should have a refresh button");
+  assert.match(refreshButton, /\bclass="[^"]*\bicon-button\b[^"]*"/i);
+  assert.match(refreshButton, /\btitle="Refresh"/i);
+  assert.match(refreshButton, /\baria-label="Refresh dashboard"/i);
+  assert.match(refreshButton, /<svg\b(?=[^>]*class="button-icon")(?=[^>]*aria-hidden="true")/i);
+  assert.doesNotMatch(refreshButton, />\s*Refresh\s*</i);
+});
+
+test("only explicit dashboard refreshes animate the titlebar control", () => {
+  const javascript = read("ui/generated/app.js");
+  const refreshControl = appFunction(javascript, "updateRefreshControl");
+  assert.match(
+    refreshControl,
+    /refreshButton\.disabled\s*=\s*state\.manualRefreshPending/,
+  );
+  assert.match(
+    refreshControl,
+    /refreshButton\.classList\.toggle\("is-loading",\s*state\.manualRefreshPending\)/,
+  );
+
+  const refreshAll = sliceBetween(
+    javascript,
+    /async function refreshAll\(manual = false\)/,
+    /function updateWorkspaceOpeningState\(/,
+    "dashboard refresh coordinator",
+  );
+  assert.match(refreshAll, /state\.manualRefreshPending = true/);
+  assert.match(refreshAll, /await Promise\.allSettled\(\[refreshSnapshot\(\), refreshUsage\(\)\]\)/);
+  assert.match(refreshAll, /finally[\s\S]*state\.manualRefreshPending = false/);
+  assert.match(
+    javascript,
+    /refreshButton\.addEventListener\("click",\s*\(\) => \{\s*void refreshAll\(true\)/,
+  );
+  assert.match(javascript, /normalizedKey === "r"[\s\S]*void refreshAll\(true\)/);
+  assert.match(javascript, /void refreshAll\(\);/);
+  assert.match(javascript, /setInterval\(refreshSnapshot, REFRESH_INTERVAL_MS\)/);
+  assert.match(javascript, /setInterval\(refreshUsage, USAGE_REFRESH_INTERVAL_MS\)/);
+  assert.match(javascript, /REFRESH_INTERVAL_MS\s*=\s*5_000/);
 });
 
 test("the workspace empty state stays concise and explains visibility filtering", () => {
@@ -161,6 +203,7 @@ test("the six-provider dashboard renders quota, context, and token usage", () =>
     assert.match(card, /class="usage-card__state"[^>]*hidden[^>]*>\s*Stale\s*</i);
     assert.match(card, /class="usage-meter"[^>]*aria-hidden="true"/i);
     assert.doesNotMatch(card, /\brole="meter"/i);
+    assert.doesNotMatch(card, /<svg\b|usage-card__icon/i);
   }
 
   assert.match(
@@ -173,6 +216,7 @@ test("the six-provider dashboard renders quota, context, and token usage", () =>
   assert.match(css, /\.usage-card\[data-level="critical"\][^{]*\{[^}]*var\(--red\)/s);
   assert.match(css, /\.usage-card\[data-state="stale"\][^{}]*\.usage-meter__fill\s*\{/s);
   assert.match(css, /\.usage-card__state\s*\{[^}]*text-transform:\s*uppercase/s);
+  assert.doesNotMatch(css, /\.usage-card__icon\b/);
   assert.match(javascript, /invoke\("get_usage",\s*\{\}\)/);
   assert.match(javascript, /`\$\{roundedRemaining\}% left`/);
   assert.match(javascript, /`\$\{roundedRemaining\}% context left`/);
@@ -1324,6 +1368,7 @@ test("Cursor agent-thread monitoring is an explicit experimental opt-in", () => 
     /experimentalIntegrations\.append\(elements\.cursorAgentsBridgeCard\)[\s\S]*cursorAgentsBridgeCard\.hidden = false/,
   );
   assert.match(card, /Cursor Agents Window/i);
+  assert.match(card, />\s*Optional\s*</i);
   assert.match(card, />\s*Experimental\s*</i);
   assert.match(card, /id="cursorAgentsBridgeDetail"[^>]*>\s*Optional live thread status/i);
   assert.match(
@@ -1674,7 +1719,8 @@ test("settings keep integration summaries compact and expose details through acc
   const normalMarkup = normalCards.map((match) => match[0]).join("\n");
   const integrationText = normalMarkup.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ");
 
-  assert.match(integrationSection, /Install one complete integration per editor/i);
+  assert.match(integrationSection, /All integrations are optional/i);
+  assert.match(integrationSection, /set up only the editors and providers you use/i);
   assert.match(integrationSection, /Zed monitoring is automatic and read-only/i);
   for (const id of [
     "companionCard",
@@ -1684,9 +1730,17 @@ test("settings keep integration summaries compact and expose details through acc
     "codexCard",
     "claudeCard",
   ]) {
-    assert.match(normalMarkup, new RegExp(`\\bid="${id}"`, "i"));
+    const card = normalCards.find((match) => new RegExp(`\\bid="${id}"`, "i").test(match[0]));
+    assert.ok(card, `${id} should be visible in the normal integration list`);
+    assert.equal(
+      Array.from(card[0].matchAll(/class="optional-label"/gi)).length,
+      1,
+      `${id} should be labeled Optional once`,
+    );
   }
   assert.doesNotMatch(normalMarkup, /Cursor hooks only|Antigravity activity hooks/i);
+  assert.doesNotMatch(integrationSection, /integration-card__icon/i);
+  assert.doesNotMatch(css, /\.integration-card__icon\b/);
 
   const visibleDescriptions = Array.from(normalMarkup.matchAll(
     /<p\b(?=[^>]*class="[^"]*\bintegration-detail\b[^"]*")[^>]*>([\s\S]*?)<\/p>/gi,
@@ -1722,13 +1776,13 @@ test("settings keep integration summaries compact and expose details through acc
     /<article\b(?=[^>]*id="antigravityIdeCard")[^>]*>[\s\S]*?<\/article>/i,
   );
   assert.ok(antigravityIdeCard, "the Antigravity integration row should exist");
-  assert.doesNotMatch(antigravityIdeCard[0], /optional-label|>\s*Optional\s*</i);
+  assert.match(antigravityIdeCard[0], /optional-label|>\s*Optional\s*</i);
   assert.match(antigravityIdeCard[0], /companion and activity hooks\s+together/i);
   const cursorCompanionCard = integrationSection.match(
     /<article\b(?=[^>]*id="cursorCompanionCard")[^>]*>[\s\S]*?<\/article>/i,
   );
   assert.ok(cursorCompanionCard, "the Cursor integration row should exist");
-  assert.doesNotMatch(cursorCompanionCard[0], /optional-label|>\s*Optional\s*</i);
+  assert.match(cursorCompanionCard[0], /optional-label|>\s*Optional\s*</i);
   assert.match(
     cursorCompanionCard[0],
     /reload Cursor IDE or open a new Cursor Agent CLI session[\s\S]*local Cursor agent turn in IDE Composer or the CLI[\s\S]*richer[\s\S]*context-left percentage/i,
