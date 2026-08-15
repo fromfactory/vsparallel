@@ -1,15 +1,20 @@
 # Releases
 
-Pushing a version tag builds the Tauri application on native GitHub hosted
-runners and publishes the packages, signed updater artifacts, updater manifest,
-and VS Code-compatible editor companion VSIX in one GitHub Release. The Release is created only
-after the repository checks and all platform builds succeed.
+Pushing a version tag builds the Tauri application on native GitHub-hosted
+runners. After all checks and platform builds pass, the workflow publishes the
+packages, updater-signed artifacts, update manifest, and companion VSIX in one
+GitHub Release.
 
-## One-time updater signing setup
+## Updater signing
 
-This setup must be completed before the first release. The committed updater
-public key is currently empty, and the release workflow intentionally rejects a
-tag until a real key is configured.
+Released builds already contain the updater public key from
+`src-tauri/tauri.conf.json`. The matching private key and optional password must
+stay in GitHub Actions secrets. Do not generate or commit a replacement key for
+an existing distribution: installed copies trust the public key shipped with
+them and would reject updates signed with a different key.
+
+For a new distribution that has never shipped, configure signing before its
+first release:
 
 1. Generate the updater keypair outside the repository and protect it with a
    strong password:
@@ -32,19 +37,17 @@ tag until a real key is configured.
 The release workflow passes `src-tauri/tauri.release.conf.json` only to release
 builds. That overlay enables Tauri v2 updater artifacts without requiring every
 ordinary local bundle build to have the private signing key. The workflow signs
-each supported installer, rejects a private/public updater key mismatch, collects
-its `.sig` file, and creates `latest.json` with
-`scripts/create-update-manifest.py`.
+the `.deb`, `.AppImage`, universal `.app.tar.gz`, and NSIS updater artifacts,
+rejects a private/public key mismatch, collects their `.sig` sidecars, and
+creates `latest.json` with `scripts/create-update-manifest.py`.
 
 Updater signatures verify update provenance and are separate from macOS
 Developer ID signing/notarization and Windows Authenticode signing.
 
 ## Create a release
 
-1. Confirm that the updater public key and GitHub Actions secrets above are
-   configured. The first shipped build must already contain the final public
-   key; a later release cannot repair update verification for clients shipped
-   without it.
+1. Confirm that the committed updater public key is unchanged and the matching
+   GitHub Actions secrets are configured.
 2. Set the same application version in `src-tauri/tauri.conf.json` and the
    `[package]` section of `src-tauri/Cargo.toml`. Run `cargo check` to update
    `Cargo.lock`.
@@ -55,8 +58,8 @@ Developer ID signing/notarization and Windows Authenticode signing.
 5. Tag that commit with the application version and push the tag:
 
    ```bash
-   git tag v0.1.0
-   git push origin v0.1.0
+   git tag v1.2.3
+   git push origin v1.2.3
    ```
 
 The tag must be `v` followed by the exact configured application version. The
@@ -67,7 +70,7 @@ needed.
 
 | Platform | Build | Download |
 | --- | --- | --- |
-| Ubuntu Linux | Ubuntu 22.04, x86-64 | Use `VSParallel_<version>_amd64.deb` on Debian or Ubuntu. Use `VSParallel_<version>_amd64.AppImage` on other compatible x86-64 distributions. |
+| Linux x86-64 | Built on Ubuntu 22.04 | Use `VSParallel_<version>_amd64.deb` on Debian or Ubuntu. Use `VSParallel_<version>_amd64.AppImage` on other compatible distributions. |
 | macOS 12.3+ | Universal (Apple silicon and Intel) | Use `VSParallel_<version>_universal.dmg`. |
 | Windows | x86-64 | Use the `VSParallel_<version>_x64-setup.exe` NSIS installer. |
 | VS Code-compatible editors 1.85+ | Platform independent | `vsparallel-companion-<companion-version>.vsix` is the optional standalone companion for VS Code, Cursor, and Antigravity IDE. Most users should install it from VSParallel instead. |
@@ -77,12 +80,13 @@ An AppImage downloaded through a browser may need to be made executable with
 
 ## In-app updater assets
 
-The release also contains signed `.deb`, `.AppImage`, macOS `.app.tar.gz`, and
-NSIS updater assets plus `latest.json`. The manifest includes installer-aware
-Tauri 2.10+ platform keys so Debian installations keep using Debian packages,
-AppImage installations keep using AppImages, and the universal macOS archive
-serves both Apple silicon and Intel clients. The manifest embeds each `.sig`
-file's content and points downloads at the tagged GitHub Release.
+The release also contains updater-compatible `.deb`, `.AppImage`, universal
+macOS `.app.tar.gz`, and NSIS assets, each with a Tauri `.sig` sidecar, plus
+`latest.json`. The manifest uses installer-aware Tauri 2.10+ platform keys so
+Debian installations keep using Debian packages, AppImage installations keep
+using AppImages, and the universal macOS archive serves both Apple silicon and
+Intel clients. It embeds each `.sig` file's content and points downloads at the
+tagged GitHub Release.
 
 The configured endpoint is:
 
@@ -102,12 +106,11 @@ an installed signed release and a second, strictly newer SemVer release.
   **System Settings > Privacy & Security**.
 - The Windows installer is not code signed, so Microsoft Defender SmartScreen
   may show an unknown-publisher warning.
-- The Debian package, AppImage, and VSIX are not code- or package-manager signed,
-  and release checksums are not currently generated. The updater's `.sig` files
-  authenticate updater downloads only.
+- The Debian package, AppImage, and VSIX are not signed in their native package
+  formats, and separate release checksums are not currently generated. Tauri
+  `.sig` sidecars authenticate updater downloads only; they do not replace
+  notarization, platform code signing, or package-manager signing.
 - Linux and Windows packages are x86-64 only. macOS uses one universal package.
-- In-app updating is inactive until the public key and GitHub Actions signing
-  secrets described above are configured and the first Release is published.
 
 Native jobs and standard Tauri configuration are kept separate, so production
 macOS notarization and Windows code signing can be added later without changing

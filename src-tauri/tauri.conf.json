@@ -56,8 +56,8 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ],
-    "publisher": "VSParallel contributors",
-    "copyright": "Copyright © 2026 VSParallel contributors",
+    "publisher": "Yuki Furuta",
+    "copyright": "Copyright © 2026 Yuki Furuta",
     "category": "DeveloperTool",
     "license": "MIT",
     "licenseFile": "../LICENSE",

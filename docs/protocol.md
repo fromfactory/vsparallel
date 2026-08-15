@@ -6,6 +6,9 @@ missing, oversized, malformed, from another schema version, or contains an
 invalid required timestamp. Unusable optional paths are ignored for display,
 association, and opening without discarding an otherwise useful heartbeat.
 
+This document is the technical reference for maintainers and integration
+authors. For a shorter user-facing explanation, see [Privacy](../PRIVACY.md).
+
 The shared root is selected in this order:
 
 1. Absolute `VSPARALLEL_STATE_DIR`
@@ -296,7 +299,7 @@ normalizes the last three failure states to **Failed/interrupted**, and derives
 yet** and reserves **Unknown** for a previous lifecycle signal that has become
 stale.
 
-The adapters map only documented hook events:
+The adapters recognize only the events listed below:
 
 | Provider | Event | Recorded state |
 | --- | --- | --- |
@@ -393,14 +396,16 @@ agents, and remote hook executions are suppressed as described above.
 ### Cursor Desktop Bridge observation (experimental; memory only)
 
 This integration is disabled by default and has no public or stable Cursor
-protocol guarantee. Cursor renders **Settings > Beta > Desktop Bridge > Allow
-CLI to access desktop agents** only for installations included in its limited,
-server-controlled `desktop_bridge` rollout. If present, the user can enable it,
-restart Cursor, and then enable the separate experimental option in VSParallel.
-If absent, VSParallel cannot activate or bypass the rollout and remains on the
-recent, hook-only fallback. Bridge discovery absence is not treated as proof
-that Cursor or its Agents Window is closed: the private feature may be gated,
-the visible user setting may be disabled, or the bridge may not have started.
+protocol guarantee. It uses Cursor's private in-app Desktop Bridge, not the
+separately documented Cursor SDK Bridge. Cursor renders **Settings > Beta >
+Desktop Bridge > Allow CLI to access desktop agents** only for installations
+included in its limited, server-controlled `desktop_bridge` rollout. If
+present, the user can enable it, restart Cursor, and then enable the separate
+experimental option in VSParallel. If absent, VSParallel cannot activate or
+bypass the rollout and remains on the recent, hook-only fallback. Bridge
+discovery absence is not treated as proof that Cursor or its Agents Window is
+closed: the private feature may be gated, the visible user setting may be
+disabled, or the bridge may not have started.
 
 When enabled, VSParallel reads Cursor's private local Desktop Bridge discovery
 files and uses the discovered local IPC endpoint to send this read-only request:
@@ -727,11 +732,12 @@ recognized managed handler and retains the backup.
 
 ## Cursor local usage records (schema version 1)
 
-Cursor's terminal `stop` hook supplies the local token fallback across IDE
-Composer and Cursor Agent CLI. VSParallel adds its `input_tokens` and
-`output_tokens` with checked arithmetic. The usage record does not copy response
-text, cache-token breakdowns, conversation identity, workspace, model, or any
-other hook field. When `~/.cursor/cli-config.json` has no custom
+When a Cursor terminal `stop` payload supplies numeric `input_tokens` or
+`output_tokens`, VSParallel uses their checked sum as a best-effort local token
+fallback across IDE Composer and Cursor Agent CLI. These fields are not assumed
+to exist in every Cursor version or surface. The usage record does not copy
+response text, cache-token breakdowns, conversation identity, workspace, model,
+or any other hook field. When `~/.cursor/cli-config.json` has no custom
 `statusLine`, Cursor setup also adds a VSParallel-owned command with a 1,000-ms
 update interval and 2,000-ms timeout. Cursor Agent CLI sends its documented
 custom-status-line payload on standard input. VSParallel represents only
@@ -779,11 +785,11 @@ terminal hook input is capped at 1 MiB and its status-line input at 2 MiB.
 
 ## Live Claude Code usage (not persisted)
 
-Every 60 seconds, and on an explicit refresh, VSParallel starts the installed
-Claude executable and asks the signed-in account for its five-hour and
-seven-day usage through the CLI/SDK control channel. This usage getter is an
-evolving Claude CLI compatibility interface, not a documented stable standalone
-command.
+While at least one usage card is visible, VSParallel starts the installed
+Claude executable every 60 seconds and on an explicit refresh. It asks the
+signed-in account for five-hour and seven-day usage through the CLI/SDK control
+channel. This usage getter is an evolving Claude CLI compatibility interface,
+not a documented stable standalone command.
 
 Claude Code's current full-usage getter also attempts to compute behavior,
 agent, skill, plugin, and MCP attribution from its configured recent session
@@ -791,17 +797,18 @@ history. VSParallel launches the subprocess with `CLAUDE_CONFIG_DIR` pointing
 to a new empty, owner-private temporary directory and disables session
 persistence, so that calculation cannot enumerate the user's real transcripts.
 The provider's original secure-storage root is passed separately so Claude can
-use its own existing sign-in without VSParallel reading a credential. The
-temporary directory is removed after the query.
+use its own existing sign-in without the usage collector extracting an account
+credential. The temporary directory is removed after the query.
 
 For each valid window, VSParallel keeps only the percentage used, the derived
 percentage remaining, and the optional reset time. The compact card uses the
 lowest remaining percentage so it cannot overstate available capacity. The
 Claude subprocess owns authentication and any provider connection. A narrow
 response type admits only `rate_limits`; account, session, behavior-attribution,
-and other fields are discarded. VSParallel never reads Claude credentials or
-writes the live response to the state directory. It may retain a recent,
-unexpired last-known value in memory for up to 15 minutes and marks it as stale.
+and other fields are discarded. The collector does not select account
+credentials or write the live response to the state directory. It may retain a
+recent, unexpired last-known value in memory for up to 15 minutes and marks it
+as stale.
 
 If the executable is absent, signed out, times out, exposes an incompatible
 control interface, or returns no valid windows, VSParallel falls back to the
@@ -830,20 +837,22 @@ VSParallel never approves a handler.
 
 ## Live Codex usage (not persisted)
 
-Codex usage does not have an on-disk record. Every 60 seconds, and on an
-explicit refresh, VSParallel starts the installed Codex executable's
-`app-server` and requests the signed-in account's documented rate-limit view.
-For each valid primary or secondary window, the UI-safe response contains the
-percentage used, the percentage remaining, the provider-defined window
-duration, and the optional reset time. The compact card uses the lowest
-remaining percentage so it cannot overstate available capacity.
+Codex usage does not have an on-disk record. While at least one usage card is
+visible, VSParallel starts the installed Codex executable's `app-server` every
+60 seconds and on an explicit refresh. It requests the signed-in account's
+rate-limit view through a version-dependent compatibility interface. For each
+valid primary or secondary window, the UI-safe response contains the percentage
+used, the percentage remaining, the provider-defined window duration, and the
+optional reset time. The compact card uses the lowest remaining percentage so
+it cannot overstate available capacity.
 
-The Codex subprocess owns authentication and any provider connection.
-VSParallel never reads Codex credentials or writes the response to the state
-directory. If the executable is not installed, does not support `app-server`,
-is signed out, times out, or returns no valid windows, Codex usage is reported
-as unavailable. The UI may retain a recent, unexpired last-known value in memory
-for up to 15 minutes and marks it as stale; it is never written to disk.
+The Codex subprocess owns authentication and any provider connection. The
+collector does not select account credentials or write the response to the
+state directory. If the executable is not installed, does not support
+`app-server`, is signed out, times out, or returns no valid windows, Codex usage
+is reported as unavailable. The UI may retain a recent, unexpired last-known
+value in memory for up to 15 minutes and marks it as stale; it is never written
+to disk.
 `VSPARALLEL_CODEX_COMMAND` can select a different executable; otherwise
 VSParallel tries `codex` from `PATH` and the executable bundled with a locally
 installed Codex extension in VS Code, Cursor, or Antigravity IDE. An explicit
@@ -852,8 +861,9 @@ bundled-extension fallback.
 
 ## Live Antigravity quota (not persisted)
 
-Every 60 seconds, and on explicit refresh, VSParallel invokes Antigravity CLI
-1.1.11 or newer with the provider's official read-only command:
+While at least one usage card is visible, VSParallel invokes Antigravity CLI
+1.1.11 or newer every 60 seconds and on explicit refresh with the provider's
+official read-only command:
 
 ```text
 agy -p "/usage" --output-format json
@@ -871,7 +881,7 @@ to 512 KiB.
 The UI converts each remaining fraction to a percentage, derives percentage
 used, and uses the lowest remaining bucket as the compact quota summary.
 Expired buckets are omitted. The command owns authentication and any provider
-connection; VSParallel does not read Antigravity credentials, call a private
+connection; the collector does not select account credentials, call a private
 backing-service endpoint, or persist the response. A missing or older CLI is
 reported as unavailable rather than replaced with inferred quota.
 `VSPARALLEL_ANTIGRAVITY_COMMAND` can select a different absolute executable;
@@ -898,9 +908,10 @@ persisted.
 Setup presents one core integration row each for **VS Code**, **Cursor**, and
 **Antigravity**. The VS Code row manages its companion. Cursor and Antigravity
 each treat their companion and native activity hooks as one install, repair, or
-uninstall operation; Cursor's terminal hook supplies local agent-turn tokens and
-it also manages the richer CLI context status line when that setting is not
-occupied by a custom command. Codex and Claude Code lifecycle
+uninstall operation; Cursor's terminal hook can supply best-effort local
+agent-turn tokens when optional numeric fields are present, and it also manages
+the richer CLI context status line when that setting is not occupied by a
+custom command. Codex and Claude Code lifecycle
 hooks remain separate optional rows. The opt-in Gemini usage hook has its own
 row because token capture is not required for workspace or lifecycle
 monitoring. Zed has no installable integration because its adapter is read-only
@@ -981,7 +992,7 @@ No record may contain prompt text, assistant output, source text, terminal
 content, Git diffs, tool inputs/output, transcript paths/content, credentials,
 or machine identifiers. The companion records only the public extension status
 and placement fields shown above; it never reads extension exports or private
-state. The lifecycle-hook adapters receive richer documented payloads but
+state. The lifecycle-hook adapters receive richer provider payloads but
 create new objects with the five core fields and discard the input before
 writing. The Gemini usage hook instead creates only its three-field token record
 and streams past all prompt and response content. Antigravity may add only the
@@ -1016,8 +1027,11 @@ adapters likewise create only the minimal usage records shown above and do not
 represent or persist the accompanying session ID, working directory, model,
 cost, repository data, token
 breakdown, or transcript path. Live Codex and Claude quota and the official
-Antigravity `/usage` response remain in memory only, and VSParallel never reads
-or stores provider credentials. The only persisted usage views are the minimal
-Claude fallback, Gemini token, Cursor context, and Cursor-turn token records;
-Zed usage is snapshot-only.
+Antigravity `/usage` response remain in memory only; those collectors do not
+select or persist account credentials. The optional Cursor Desktop Bridge uses
+its discovery token transiently for local authentication, and full-file
+integration backups may contain unrelated secrets already present in provider
+configuration. Neither enters a metadata record. The only persisted usage
+views are the minimal Claude fallback, Gemini token, Cursor context, and
+Cursor-turn token records; Zed usage is snapshot-only.
 Automated Rust and JavaScript tests assert these boundaries.

@@ -1,83 +1,51 @@
 # Claude Code lifecycle and usage integration
 
-Production Claude hook and usage-capture installation, repair, status,
-execution, and uninstall are implemented in Rust inside the VSParallel Tauri
-application. Use **Setup & diagnostics** in the app. The integration is
-optional, and production users do not run a script or manually edit settings
-from this directory.
+This optional integration adds coarse Claude Code activity and a local usage
+fallback to VSParallel. Install, repair, or remove it from **Setup &
+diagnostics** in the desktop app. Production users should not edit Claude
+settings by hand.
 
-Every 60 seconds, and when **Refresh** is selected, VSParallel actively asks the
-installed signed-in Claude CLI for its five-hour and seven-day usage through the
-CLI/SDK control channel. This usage getter is an evolving Claude CLI
-compatibility interface, not a documented stable standalone command. The Claude
-process owns authentication and any provider connection; VSParallel never reads
-its credentials and never persists the live response. It retains only the
-percentages and optional reset times needed for the card, with a recent value
-kept in memory for up to 15 minutes when a refresh temporarily fails.
+## Activity
 
-Claude's current full-usage getter also calculates attribution from its
-configured recent session history. VSParallel gives the subprocess a new empty,
-owner-private temporary configuration directory and disables session
-persistence, preventing access to real transcripts while Claude continues to
-own authentication through its original secure-storage root. The response
-parser discards account, session, attribution, and every field except the rate
-limits, and the temporary directory is removed after the query.
+VSParallel recognizes these Claude Code events:
 
-The active usage query is independent of lifecycle hooks and `statusLine`.
-This matters for native graphical Claude sessions in VS Code-compatible
-editors, which do not run the terminal status line. VSParallel can use either
-`claude` from `PATH` or the executable bundled with the installed Claude
-extension in VS Code, Cursor, or Antigravity IDE, trying the other source if
-the first query fails. `VSPARALLEL_CLAUDE_COMMAND` can select a different
-signed-in executable.
+- `UserPromptSubmit` → `activity_detected`
+- `Stop` → `turn_finished`
+- `StopFailure` → `failed_or_interrupted`
+- `SessionEnd` → `session_ended`
 
-The app merges its owned handlers into the `hooks` object in the user's Claude
-`settings.json` and preserves unrelated settings and handlers. It maps only
-documented events:
+A user interruption does not always emit `StopFailure`. If no terminal event
+arrives, the saved activity eventually appears as **Unknown** instead of being
+reported as a failure.
 
-- `UserPromptSubmit` to `activity_detected`
-- `Stop` to `turn_finished`
-- `StopFailure` to `failed_or_interrupted`
-- `SessionEnd` to `session_ended`
+Each local record contains five fields: schema version, SHA-256 session key,
+working directory, coarse state, and timestamp. Prompt text, responses, source,
+transcripts, tool data, and raw session IDs are discarded.
 
-`StopFailure` reports a failed turn. A user interruption is not guaranteed to
-emit that event, so a missing terminal event eventually appears as `Unknown`;
-VSParallel does not infer a failure from silence.
+## Usage
 
-Records are five-field JSON objects under the shared state root's `claude/`
-directory: `schemaVersion`, a SHA-256 `sessionKey`, `cwd`, `state`, and
-`changedAtMs`. Prompt text, responses, source, transcripts, tool data, and raw
-session or turn IDs are discarded.
+While at least one usage card is visible, VSParallel periodically asks a
+signed-in local Claude executable for five-hour and seven-day usage. The query
+also runs when you select **Refresh**. This CLI/SDK control interface can change
+between Claude versions, so VSParallel treats incompatible responses as
+unavailable.
 
-When the top-level `statusLine` setting is absent, setup also installs a
-VSParallel-owned fallback command that Claude Code runs every 60 seconds. It is
-useful for terminal Claude and older CLI versions when the active query is
-unavailable. The command extracts only `rate_limits.five_hour` and
-`rate_limits.seven_day` percentage and reset values from Claude Code's local
-status-line input. It atomically writes a single privacy-minimal
-`usage/claude.json` record under the shared state root. That record contains
-`schemaVersion`, `capturedAtMs`, and whichever `fiveHour` or `sevenDay` windows
-Claude supplied; each window contains only `usedPercent` and optional
-`resetsAtMs`.
+Claude's full-usage getter can inspect session history when run normally.
+VSParallel starts it with a new empty, private configuration directory and
+disables session persistence. It keeps only percentages and reset times in
+memory, and removes the temporary directory after the query.
 
-Claude Code can omit rate limits from status-line input, including before the
-first relevant API response. Until a valid window has been captured, that
-fallback is unavailable. Captured values are provider-global, not associated
-with a workspace or raw session identifier.
+If Claude's top-level `statusLine` setting is unused, setup also installs a
+60-second fallback capture. It writes only percentages, reset times, and a
+capture timestamp to `usage/claude.json`. An existing custom status line is
+left unchanged; only this fallback is then unavailable. Graphical Claude
+sessions do not run a terminal status line, so the active query remains the
+primary source.
 
-Claude Code supports one `statusLine` command. If a custom status line already
-exists, VSParallel preserves it exactly instead of replacing or wrapping the
-command. Only VSParallel's managed refresh of the fallback cache is disabled;
-an existing record may remain visible as stale, and the active CLI query and
-lifecycle hooks remain independent. Uninstall removes only a VSParallel-owned
-status line and never removes a custom one.
+Setup preserves unrelated handlers and settings and keeps a private one-time
+backup of the original settings file. Because it is a complete copy, the backup
+may include unrelated secrets already present in that file. See
+[Privacy](../../PRIVACY.md) for storage and deletion details.
 
-Although Claude Code supplies richer status-line data, VSParallel does not
-represent or persist prompts, responses, transcripts, credentials, working
-directories, model details, repository data, or costs in the usage path.
-
-[`settings.example.json`](settings.example.json) is an audit-only example of
-the direct executable configuration generated by the app. Its placeholder path
-is intentionally not runnable. Setup and uninstall should be performed in
-VSParallel so ownership checks, backups, repair, and executable paths are
-handled consistently.
+[`settings.example.json`](settings.example.json) is a reference example, not an
+installer. Its placeholder executable path is intentionally not runnable.
