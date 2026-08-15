@@ -117,10 +117,14 @@ test("Tauri updater configuration targets the GitHub release manifest", () => {
   assert.match(library, /fn is_release_build\(\) -> bool \{\s*!cfg!\(debug_assertions\)/);
 });
 
-test("release builds opt into signed updater artifacts and publish latest.json", () => {
+test("release builds opt into signed updater artifacts and prepare a gated draft", () => {
+  const config = readJson("src-tauri/tauri.conf.json") as {
+    bundle?: { targets?: string[] };
+  };
   const releaseConfig = readJson("src-tauri/tauri.release.conf.json") as {
     bundle?: { createUpdaterArtifacts?: boolean };
   };
+  assert.deepEqual(config.bundle?.targets, ["deb"]);
   assert.equal(releaseConfig.bundle?.createUpdaterArtifacts, true);
 
   const workflow = read(".github/workflows/release.yml");
@@ -130,4 +134,20 @@ test("release builds opt into signed updater artifacts and publish latest.json",
   assert.match(workflow, /create-update-manifest\.py/);
   assert.match(workflow, /\.app\.tar\.gz\.sig/);
   assert.match(workflow, /latest\.json/);
+  assert.match(workflow, /--draft/);
+  assert.match(workflow, /gh release delete-asset/);
+  assert.match(workflow, /Draft release assets do not exactly match/);
+  assert.doesNotMatch(workflow, /--draft=false/);
+  assert.doesNotMatch(workflow, /AppImage/);
+});
+
+test("the public Linux download resolves only the release-supported Debian package", () => {
+  const html = read("website/index.html");
+  const downloads = read("website/src/downloads.ts");
+
+  assert.match(html, /data-download-kind="linux-deb"/);
+  assert.match(html, /Ubuntu and Debian \(\.deb\)/);
+  assert.doesNotMatch(html, /AppImage/i);
+  assert.match(downloads, /linux: \["linux-deb"\]/);
+  assert.doesNotMatch(downloads, /appimage/i);
 });

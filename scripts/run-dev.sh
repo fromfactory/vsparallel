@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-REPOSITORY_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+REPOSITORY_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$REPOSITORY_DIR"
 
 if ! command -v npm >/dev/null 2>&1; then

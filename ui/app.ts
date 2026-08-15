@@ -2967,9 +2967,13 @@
     }
   }
 
-  async function refreshSnapshot(): Promise<void> {
+  async function refreshSnapshot(forceAfterPending = false): Promise<void> {
     if (state.snapshotRefreshPromise) {
-      await state.snapshotRefreshPromise;
+      const pending = state.snapshotRefreshPromise;
+      await pending;
+      if (forceAfterPending) {
+        await refreshSnapshot(true);
+      }
       return;
     }
 
@@ -2980,7 +2984,7 @@
 
     const operation = (async () => {
       try {
-        const raw = await invoke("get_snapshot", {});
+        const raw = await invoke("get_snapshot", { force: forceAfterPending });
         const snapshot = normalizeSnapshot(raw);
         state.lastGoodSnapshot = snapshot;
         renderSnapshot(snapshot);
@@ -3068,7 +3072,7 @@
     }
 
     try {
-      await Promise.allSettled([refreshSnapshot(), refreshUsage()]);
+      await Promise.allSettled([refreshSnapshot(manual), refreshUsage()]);
     } finally {
       if (manual) {
         state.manualRefreshPending = false;
@@ -3724,7 +3728,7 @@
           ? "Experimental Cursor agent-thread monitoring enabled."
           : "Experimental Cursor agent-thread monitoring disabled.",
       );
-      await refreshSnapshot();
+      await refreshSnapshot(true);
     } catch (_error) {
       if (previous) {
         renderCursorAgentsBridgeStatus(previous);
@@ -3934,7 +3938,7 @@
         setIntegrationMessage(integrationActionSuccess(kind, operation), "success");
       }
       if (operation === "uninstall") {
-        await Promise.all([refreshSnapshot(), refreshUsage(true)]);
+        await Promise.all([refreshSnapshot(true), refreshUsage(true)]);
       }
     } catch (error) {
       const message = readableError(error, `Could not ${operation} ${componentName}.`);
@@ -3950,7 +3954,7 @@
         "error",
       );
       if (operation === "uninstall") {
-        await Promise.all([refreshSnapshot(), refreshUsage(true)]);
+        await Promise.all([refreshSnapshot(true), refreshUsage(true)]);
       }
     } finally {
       state.integrationAction = null;
@@ -4147,7 +4151,7 @@
         );
       }
       await Promise.all([
-        refreshSnapshot(),
+        refreshSnapshot(true),
         refreshUsage(true),
         refreshCursorAgentsBridgeStatus(),
       ]);
@@ -4164,7 +4168,7 @@
       // and purges retained observations when physical removal is only partial.
       // Reflect that fail-safe immediately while preserving the actionable error.
       await Promise.all([
-        refreshSnapshot(),
+        refreshSnapshot(true),
         refreshUsage(true),
         refreshCursorAgentsBridgeStatus(),
       ]);
@@ -4697,7 +4701,9 @@
     void refreshAll(true);
   });
   elements.emptySetupButton.addEventListener("click", openSettingsDialog);
-  elements.emptyRefreshButton.addEventListener("click", refreshSnapshot);
+  elements.emptyRefreshButton.addEventListener("click", () => {
+    void refreshSnapshot(true);
+  });
   elements.restoreFullButton.addEventListener("click", restoreFullWindow);
   elements.hidePanelButton.addEventListener("click", hideFloatingPanel);
   elements.hideButton.addEventListener("click", hideWindow);

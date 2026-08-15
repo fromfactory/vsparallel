@@ -33,7 +33,7 @@ use std::path::PathBuf;
 #[cfg(any(target_os = "macos", test))]
 use std::path::{Component, Path};
 use std::sync::{Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::window::{Color, Effect, EffectState, EffectsBuilder};
 use tauri::{LogicalSize, Manager, PhysicalPosition, PhysicalRect, PhysicalSize};
 
@@ -49,6 +49,7 @@ const FLOATING_PANEL_MARGIN: f64 = 16.0;
 const FLOATING_PANEL_READY_ATTEMPTS: usize = 30;
 const FLOATING_PANEL_READY_INTERVAL: Duration = Duration::from_millis(20);
 const FLOATING_PANEL_WATCHDOG_DEADLINES_MS: [u64; 5] = [100, 350, 800, 1_600, 3_000];
+const SNAPSHOT_CACHE_MAX_AGE: Duration = Duration::from_millis(2_500);
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -139,6 +140,54 @@ struct WindowPresentationState {
     inner: Mutex<WindowPresentationInner>,
 }
 
+#[derive(Debug)]
+struct CachedSnapshot {
+    refreshed_at: Instant,
+    snapshot: Snapshot,
+}
+
+#[derive(Debug, Default)]
+struct SnapshotCache {
+    entry: Mutex<Option<CachedSnapshot>>,
+}
+
+impl SnapshotCache {
+    fn get_or_refresh<F>(
+        &self,
+        maximum_age: Duration,
+        force: bool,
+        refresh: F,
+    ) -> Result<Snapshot, String>
+    where
+        F: FnOnce() -> Result<Snapshot, String>,
+    {
+        // Keep the lock while refreshing. Snapshot construction is deliberately
+        // blocking, and serializing it here prevents the tray and WebView timers
+        // from duplicating the same filesystem, bridge, and SQLite work.
+        // A panic during refresh cannot leave this Option partially updated;
+        // retain or replace the last complete value instead of permanently
+        // disabling snapshots because the mutex became poisoned.
+        let mut entry = match self.entry.lock() {
+            Ok(entry) => entry,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if !force {
+            if let Some(cached) = entry.as_ref() {
+                if cached.refreshed_at.elapsed() <= maximum_age {
+                    return Ok(cached.snapshot.clone());
+                }
+            }
+        }
+
+        let snapshot = refresh()?;
+        *entry = Some(CachedSnapshot {
+            refreshed_at: Instant::now(),
+            snapshot: snapshot.clone(),
+        });
+        Ok(snapshot)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 struct CompanionIntegrationView {
@@ -175,8 +224,8 @@ struct IntegrationStatusView {
 }
 
 #[tauri::command]
-async fn get_snapshot() -> Result<Snapshot, String> {
-    run_background(current_snapshot).await
+async fn get_snapshot(app: tauri::AppHandle, force: bool) -> Result<Snapshot, String> {
+    run_background(move || current_snapshot(&app.state::<SnapshotCache>(), force)).await
 }
 
 #[tauri::command]
@@ -219,14 +268,17 @@ async fn set_usage_provider_visibility(
     .await
 }
 
-fn current_snapshot() -> Result<Snapshot, String> {
+fn current_snapshot(cache: &SnapshotCache, force: bool) -> Result<Snapshot, String> {
+    let snapshot = cache.get_or_refresh(SNAPSHOT_CACHE_MAX_AGE, force, load_snapshot)?;
+    filter_snapshot_with_preferences(snapshot, state::display_preferences_from_environment)
+}
+
+fn load_snapshot() -> Result<Snapshot, String> {
     let now_ms = now_ms();
     let cursor_agents = cursor_agents_bridge::poll(now_ms, false);
     let zed = zed_integration::load_zed_snapshot_from_environment(now_ms);
     let store = StateStore::from_environment()?;
-    let snapshot =
-        store.snapshot_with_integrations(now_ms, cursor_agents.snapshot.as_ref(), Some(&zed));
-    filter_snapshot_with_preferences(snapshot, state::display_preferences_from_environment)
+    Ok(store.snapshot_with_integrations(now_ms, cursor_agents.snapshot.as_ref(), Some(&zed)))
 }
 
 fn filter_snapshot_with_preferences<F>(
@@ -3136,6 +3188,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             app.manage(WindowPresentationState::default());
+            app.manage(SnapshotCache::default());
             if let Some(window) = app.get_webview_window("main") {
                 #[cfg(target_os = "macos")]
                 if let Ok(effects) = floating_window_effects("dark") {
@@ -3258,7 +3311,64 @@ pub fn run() {
 mod tests {
     use super::*;
     use companion_integration::{CompanionAction, CompanionStatusState};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    fn empty_snapshot(generated_at_ms: i64) -> Snapshot {
+        Snapshot {
+            schema_version: 1,
+            generated_at_ms,
+            workspaces: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn snapshot_cache_reuses_recent_work_and_honors_forced_refresh() {
+        let cache = SnapshotCache::default();
+        let refreshes = AtomicUsize::new(0);
+        let first = cache
+            .get_or_refresh(Duration::from_secs(60), false, || {
+                refreshes.fetch_add(1, Ordering::SeqCst);
+                Ok(empty_snapshot(10))
+            })
+            .unwrap();
+        let second = cache
+            .get_or_refresh(Duration::from_secs(60), false, || {
+                refreshes.fetch_add(1, Ordering::SeqCst);
+                Ok(empty_snapshot(20))
+            })
+            .unwrap();
+
+        assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+        assert_eq!(first.generated_at_ms, 10);
+        assert_eq!(second.generated_at_ms, 10);
+
+        let forced = cache
+            .get_or_refresh(Duration::from_secs(60), true, || {
+                refreshes.fetch_add(1, Ordering::SeqCst);
+                Ok(empty_snapshot(20))
+            })
+            .unwrap();
+        assert_eq!(refreshes.load(Ordering::SeqCst), 2);
+        assert_eq!(forced.generated_at_ms, 20);
+    }
+
+    #[test]
+    fn failed_snapshot_refresh_preserves_the_last_good_cache_entry() {
+        let cache = SnapshotCache::default();
+        cache
+            .get_or_refresh(Duration::from_secs(60), false, || Ok(empty_snapshot(10)))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(1));
+
+        assert!(cache
+            .get_or_refresh(Duration::ZERO, false, || Err("refresh failed".to_string()))
+            .is_err());
+        let retained = cache
+            .get_or_refresh(Duration::from_secs(60), false, || Ok(empty_snapshot(20)))
+            .unwrap();
+        assert_eq!(retained.generated_at_ms, 10);
+    }
 
     fn companion_status(state: CompanionStatusState) -> CompanionStatus {
         CompanionStatus {

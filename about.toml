@@ -1,0 +1,49 @@
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-3-Clause",
+    "ISC",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+# Generate one notice that covers the Cargo dependency graph for every desktop
+# package published by the release workflow. Development-only crates are not
+# included in those binaries.
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+]
+ignore-dev-dependencies = true
+private = { ignore = true }
+
+# These crates have license layouts that need cargo-about's maintained,
+# checksum-backed clarifications.
+workarounds = ["gtk", "ring", "rustix", "rustls"]
+
+# zstd-sys statically compiles the vendored Zstandard C implementation unless
+# its optional pkg-config feature is enabled. The crate-level MIT/Apache-2.0
+# metadata covers the Rust wrapper, while the native implementation retains its
+# BSD-3-Clause terms. Keep all three source files checksum-pinned so a dependency
+# update cannot silently drop or change the native redistribution notice.
+[zstd-sys.clarify]
+license = "(MIT OR Apache-2.0) AND BSD-3-Clause"
+
+[[zstd-sys.clarify.files]]
+path = "LICENSE.Mit"
+license = "MIT"
+checksum = "129e8edef29e9abcd2ebabe252f4ef1b1289cdca356bf0040284a2fbccfb96c8"
+
+[[zstd-sys.clarify.files]]
+path = "LICENSE.Apache-2.0"
+license = "Apache-2.0"
+checksum = "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594"
+
+[[zstd-sys.clarify.files]]
+path = "zstd/LICENSE"
+license = "BSD-3-Clause"
+checksum = "7055266497633c9025b777c78eb7235af13922117480ed5c674677adc381c9d8"

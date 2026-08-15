@@ -14,6 +14,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -51,6 +52,7 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const STATUS_CLI_TIMEOUT: Duration = Duration::from_secs(15);
 const CHANGE_CLI_TIMEOUT: Duration = Duration::from_secs(120);
 const CLI_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const POST_EXIT_PIPE_DRAIN_GRACE: Duration = Duration::from_millis(100);
 const CLI_CAPTURE_LIMIT: usize = 256 * 1024;
 
 #[cfg(unix)]
@@ -177,46 +179,96 @@ impl ProcessCodeCliRunner {
             }
         };
 
-        let stdout_reader = thread::spawn(move || read_capped(stdout, limits.output_limit));
-        let stderr_reader = thread::spawn(move || read_capped(stderr, limits.output_limit));
+        let mut stdout_capture = CliStreamCapture::spawn(stdout, limits.output_limit);
+        let mut stderr_capture = CliStreamCapture::spawn(stderr, limits.output_limit);
         let started = Instant::now();
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) if started.elapsed() >= timeout => {
-                    let cleanup = terminate_and_reap(&mut child);
-                    let _ = join_reader(stdout_reader, "stdout");
-                    let _ = join_reader(stderr_reader, "stderr");
-                    cleanup?;
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        format!(
-                            "VS Code {operation} command timed out after {}",
-                            duration_label(timeout)
-                        ),
-                    ));
-                }
-                Ok(None) => {
-                    let remaining = timeout.saturating_sub(started.elapsed());
-                    thread::sleep(limits.poll_interval.min(remaining));
-                }
-                Err(error) => {
-                    let _ = terminate_and_reap(&mut child);
-                    let _ = join_reader(stdout_reader, "stdout");
-                    let _ = join_reader(stderr_reader, "stderr");
-                    return Err(error);
+        #[cfg(unix)]
+        let process_group_id = child.id();
+        let mut status = None;
+        #[cfg(unix)]
+        let mut process_group_terminated = false;
+        #[cfg(unix)]
+        let mut child_exit_observed_at = None;
+
+        loop {
+            stdout_capture.poll("stdout");
+            stderr_capture.poll("stderr");
+
+            if status.is_none() {
+                match child.try_wait() {
+                    Ok(Some(exit_status)) => {
+                        status = Some(exit_status);
+                        #[cfg(unix)]
+                        {
+                            child_exit_observed_at = Some(Instant::now());
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        let _ = terminate_and_reap(&mut child);
+                        return Err(error);
+                    }
                 }
             }
-        };
 
-        let stdout_result = join_reader(stdout_reader, "stdout");
-        let stderr_result = join_reader(stderr_reader, "stderr");
-        Ok(CliOutput {
-            success: status.success(),
-            exit_code: status.code(),
-            stdout: stdout_result?,
-            stderr: stderr_result?,
-        })
+            if let Some(exit_status) = status {
+                if stdout_capture.is_finished() && stderr_capture.is_finished() {
+                    return Ok(CliOutput {
+                        success: exit_status.success(),
+                        exit_code: exit_status.code(),
+                        stdout: stdout_capture.into_result("stdout")?,
+                        stderr: stderr_capture.into_result("stderr")?,
+                    });
+                }
+
+                // A CLI wrapper can exit while one of its descendants still
+                // owns an inherited pipe. The child was placed in its own
+                // process group specifically so those writers can be closed
+                // without signalling VSParallel itself. First allow normal EOF
+                // and reader-channel delivery a short grace period so a
+                // persistent descendant that closed its inherited streams is
+                // not killed because of a scheduling race. This remains best
+                // effort: a deliberately detached writer is still bounded by
+                // the original command deadline below.
+                #[cfg(unix)]
+                if !process_group_terminated
+                    && child_exit_observed_at.is_some_and(|observed_at| {
+                        observed_at.elapsed() >= POST_EXIT_PIPE_DRAIN_GRACE
+                    })
+                {
+                    let _ = terminate_process_group(process_group_id);
+                    process_group_terminated = true;
+                }
+            }
+
+            let elapsed = started.elapsed();
+            if elapsed >= timeout {
+                if status.is_none() {
+                    terminate_and_reap(&mut child)?;
+                }
+                #[cfg(unix)]
+                if !process_group_terminated {
+                    let _ = terminate_process_group(process_group_id);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "VS Code {operation} command timed out after {}",
+                        duration_label(timeout)
+                    ),
+                ));
+            }
+
+            let mut sleep_for = limits.poll_interval.min(timeout.saturating_sub(elapsed));
+            #[cfg(unix)]
+            if !process_group_terminated {
+                if let Some(observed_at) = child_exit_observed_at {
+                    sleep_for = sleep_for
+                        .min(POST_EXIT_PIPE_DRAIN_GRACE.saturating_sub(observed_at.elapsed()));
+                }
+            }
+            thread::sleep(sleep_for);
+        }
     }
 }
 
@@ -243,13 +295,49 @@ fn read_capped(mut reader: impl Read, limit: usize) -> io::Result<Vec<u8>> {
     }
 }
 
-fn join_reader(
-    reader: thread::JoinHandle<io::Result<Vec<u8>>>,
-    stream: &str,
-) -> io::Result<Vec<u8>> {
-    reader
-        .join()
-        .map_err(|_| io::Error::other(format!("VS Code {stream} reader stopped unexpectedly")))?
+struct CliStreamCapture {
+    receiver: Receiver<io::Result<Vec<u8>>>,
+    result: Option<io::Result<Vec<u8>>>,
+}
+
+impl CliStreamCapture {
+    fn spawn(reader: impl Read + Send + 'static, limit: usize) -> Self {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let _ = sender.send(read_capped(reader, limit));
+        });
+        Self {
+            receiver,
+            result: None,
+        }
+    }
+
+    fn poll(&mut self, stream: &str) {
+        if self.result.is_some() {
+            return;
+        }
+        match self.receiver.try_recv() {
+            Ok(result) => self.result = Some(result),
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => {
+                self.result = Some(Err(io::Error::other(format!(
+                    "VS Code {stream} reader stopped unexpectedly"
+                ))));
+            }
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.result.is_some()
+    }
+
+    fn into_result(self, stream: &str) -> io::Result<Vec<u8>> {
+        self.result.unwrap_or_else(|| {
+            Err(io::Error::other(format!(
+                "VS Code {stream} reader did not finish"
+            )))
+        })
+    }
 }
 
 fn duration_label(duration: Duration) -> String {
@@ -271,17 +359,22 @@ fn terminate_and_reap(child: &mut Child) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn terminate_child(child: &mut Child) -> io::Result<()> {
+fn terminate_process_group(process_group_id: u32) -> io::Result<()> {
     const SIGKILL: i32 = 9;
-    let process_group = i32::try_from(child.id())
+    let process_group = i32::try_from(process_group_id)
         .map_err(|_| io::Error::other("VS Code process identifier was out of range"))?;
     // SAFETY: the child was spawned into a process group whose ID is its PID.
     // A negative PID asks POSIX `kill` to signal only that process group.
     if unsafe { kill_process_group(-process_group, SIGKILL) } == 0 {
         Ok(())
     } else {
-        child.kill()
+        Err(io::Error::last_os_error())
     }
+}
+
+#[cfg(unix)]
+fn terminate_child(child: &mut Child) -> io::Result<()> {
+    terminate_process_group(child.id()).or_else(|_| child.kill())
 }
 
 #[cfg(not(unix))]
@@ -1065,6 +1158,137 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn exited_process_does_not_wait_for_descendant_inherited_pipes() {
+        let temporary_directory = TempDir::new().unwrap();
+        let pid_file = temporary_directory.path().join("descendant-pid");
+        let arguments = vec![
+            OsString::from("-c"),
+            OsString::from(
+                "sleep 30 & descendant=$!; printf '%s\n' \"$descendant\" > \"$1\"; printf 'direct stdout\n'; printf 'direct stderr\n' >&2; exit 0",
+            ),
+            OsString::from("vsparallel-inherited-pipe-test"),
+            pid_file.as_os_str().to_owned(),
+        ];
+        let limits = CliRunLimits {
+            status_timeout: Duration::from_secs(2),
+            change_timeout: Duration::from_secs(2),
+            poll_interval: Duration::from_millis(5),
+            output_limit: 1024,
+        };
+        let started = Instant::now();
+
+        let output = ProcessCodeCliRunner
+            .run_with_limits(OsStr::new("/bin/sh"), &arguments, limits)
+            .unwrap();
+
+        assert!(output.success);
+        assert_eq!(output.stdout, b"direct stdout\n");
+        assert_eq!(output.stderr, b"direct stderr\n");
+        assert!(started.elapsed() >= POST_EXIT_PIPE_DRAIN_GRACE);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let descendant_pid: u32 = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        for _ in 0..50 {
+            if !Path::new(&format!("/proc/{descendant_pid}")).exists() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("descendant retaining VS Code output pipes was not terminated");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn post_exit_grace_preserves_a_descendant_that_closed_inherited_pipes() {
+        let temporary_directory = TempDir::new().unwrap();
+        let pid_file = temporary_directory
+            .path()
+            .join("persistent-descendant-pids");
+        let arguments = vec![
+            OsString::from("-c"),
+            OsString::from(
+                "sleep 30 >/dev/null 2>&1 & descendant=$!; printf '%s %s\n' \"$$\" \"$descendant\" > \"$1\"; printf 'complete\n'; exit 0",
+            ),
+            OsString::from("vsparallel-persistent-descendant-test"),
+            pid_file.as_os_str().to_owned(),
+        ];
+        let limits = CliRunLimits {
+            status_timeout: Duration::from_secs(2),
+            change_timeout: Duration::from_secs(2),
+            poll_interval: Duration::from_millis(5),
+            output_limit: 1024,
+        };
+
+        let output = ProcessCodeCliRunner
+            .run_with_limits(OsStr::new("/bin/sh"), &arguments, limits)
+            .unwrap();
+        let process_ids: Vec<u32> = fs::read_to_string(&pid_file)
+            .unwrap()
+            .split_whitespace()
+            .map(|value| value.parse().unwrap())
+            .collect();
+        assert_eq!(process_ids.len(), 2);
+        let process_group_id = process_ids[0];
+        let descendant_pid = process_ids[1];
+        let descendant_survived = Path::new(&format!("/proc/{descendant_pid}")).exists();
+        let cleanup = terminate_process_group(process_group_id);
+
+        assert!(output.success);
+        assert_eq!(output.stdout, b"complete\n");
+        assert!(output.stderr.is_empty());
+        assert!(
+            descendant_survived,
+            "a persistent descendant with closed output pipes should not be terminated"
+        );
+        cleanup.expect("the persistent test descendant should be terminated");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pipe_drain_respects_the_process_deadline_for_a_detached_writer() {
+        let setsid = Path::new("/usr/bin/setsid");
+        assert!(setsid.is_file(), "the Linux timeout test requires setsid");
+        let temporary_directory = TempDir::new().unwrap();
+        let pid_file = temporary_directory.path().join("detached-pid");
+        let arguments = vec![
+            OsString::from("-c"),
+            OsString::from(
+                "/usr/bin/setsid /bin/sh -c 'printf \"%s\\n\" \"$$\" > \"$1\"; sleep 30' vsparallel-detached \"$1\" & while [ ! -s \"$1\" ]; do sleep 0.01; done; exit 0",
+            ),
+            OsString::from("vsparallel-drain-timeout-test"),
+            pid_file.as_os_str().to_owned(),
+        ];
+        let limits = CliRunLimits {
+            status_timeout: Duration::from_millis(500),
+            change_timeout: Duration::from_millis(500),
+            poll_interval: Duration::from_millis(5),
+            output_limit: 1024,
+        };
+        let started = Instant::now();
+
+        let result =
+            ProcessCodeCliRunner.run_with_limits(OsStr::new("/bin/sh"), &arguments, limits);
+        let elapsed = started.elapsed();
+        let detached_pid: u32 = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let cleanup = terminate_process_group(detached_pid);
+
+        let error = result.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("status command timed out"));
+        assert!(elapsed >= limits.status_timeout);
+        assert!(elapsed < Duration::from_secs(3));
+        cleanup.expect("the detached test writer should be terminated");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn timed_out_process_is_killed_with_its_children_and_reaped() {
         let temporary_directory = TempDir::new().unwrap();
         let pid_file = temporary_directory.path().join("pids");
@@ -1111,7 +1335,7 @@ mod tests {
 
     #[test]
     fn embedded_identity_and_version_come_from_package_json() {
-        assert_eq!(bundled_companion_version().unwrap(), "0.4.1");
+        assert_eq!(bundled_companion_version().unwrap(), "0.4.2");
         let value: serde_json::Value = serde_json::from_slice(PACKAGE_JSON).unwrap();
         assert_eq!(
             format!(
@@ -1121,7 +1345,7 @@ mod tests {
             ),
             EXTENSION_ID
         );
-        assert!(validate_vsix_manifest_identity(VSIX_MANIFEST, "0.4.1").is_ok());
+        assert!(validate_vsix_manifest_identity(VSIX_MANIFEST, "0.4.2").is_ok());
         assert!(validate_vsix_manifest_identity(VSIX_MANIFEST, "9.9.9").is_err());
     }
 
@@ -1159,12 +1383,12 @@ mod tests {
     #[test]
     fn status_reports_current_version_and_uses_exact_cli_arguments() {
         let runner = ScriptedRunner::new(vec![successful(
-            b"unrelated.extension@9.0.0\nvsparallel.vsparallel-companion@0.4.1\n".to_vec(),
+            b"unrelated.extension@9.0.0\nvsparallel.vsparallel-companion@0.4.2\n".to_vec(),
         )]);
         let status = companion_status_with(&runner, OsStr::new("/opt/code with spaces"), None);
 
         assert_eq!(status.state, CompanionStatusState::Current);
-        assert_eq!(status.installed_version.as_deref(), Some("0.4.1"));
+        assert_eq!(status.installed_version.as_deref(), Some("0.4.2"));
         assert_eq!(
             runner.calls(),
             vec![RecordedCall {
@@ -1181,7 +1405,7 @@ mod tests {
     fn named_profile_is_applied_to_status_install_and_verification() {
         let runner = ScriptedRunner::new(vec![
             successful(b"installed\n".to_vec()),
-            successful(b"vsparallel.vsparallel-companion@0.4.1\n".to_vec()),
+            successful(b"vsparallel.vsparallel-companion@0.4.2\n".to_vec()),
         ]);
         let temporary_directory = TempDir::new().unwrap();
         let result = install_companion_with(
@@ -1209,7 +1433,7 @@ mod tests {
     #[test]
     fn named_profile_is_applied_to_uninstall_and_verification() {
         let runner = ScriptedRunner::new(vec![
-            successful(b"vsparallel.vsparallel-companion@0.4.1\n".to_vec()),
+            successful(b"vsparallel.vsparallel-companion@0.4.2\n".to_vec()),
             successful(b"uninstalled\n".to_vec()),
             successful(b"other.extension@1.0.0\n".to_vec()),
         ]);
@@ -1276,7 +1500,7 @@ mod tests {
         let status = CompanionStatus {
             state: CompanionStatusState::Unavailable,
             extension_id: EXTENSION_ID.to_string(),
-            bundled_version: Some("0.4.1".to_string()),
+            bundled_version: Some("0.4.2".to_string()),
             installed_version: None,
             detail: Some("could not run the VS Code command".to_string()),
         };
@@ -1303,7 +1527,7 @@ mod tests {
     fn install_passes_a_real_embedded_vsix_as_one_argument_and_removes_it() {
         let runner = ScriptedRunner::new(vec![
             successful(b"installed\n".to_vec()),
-            successful(b"vsparallel.vsparallel-companion@0.4.1\n".to_vec()),
+            successful(b"vsparallel.vsparallel-companion@0.4.2\n".to_vec()),
         ]);
         let root = TempDir::new().unwrap();
         let temporary_directory = root.path().join("temporary packages with spaces");
@@ -1384,7 +1608,7 @@ mod tests {
     #[test]
     fn uninstall_uses_the_exact_extension_id_and_verifies_removal() {
         let runner = ScriptedRunner::new(vec![
-            successful(b"vsparallel.vsparallel-companion@0.4.1\n".to_vec()),
+            successful(b"vsparallel.vsparallel-companion@0.4.2\n".to_vec()),
             successful(b"uninstalled\n".to_vec()),
             successful(b"other.extension@1.0.0\n".to_vec()),
         ]);

@@ -10,7 +10,7 @@ use serde::{de::IgnoredAny, Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 #[cfg(any(unix, windows))]
@@ -18,6 +18,12 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::Builder as TempFileBuilder;
 
+#[cfg(unix)]
+use std::io::{self, Read};
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 #[cfg(unix)]
@@ -926,11 +932,19 @@ fn request_threads(
     discovery: &DiscoveryRecord,
     now_ms: i64,
 ) -> Result<Vec<CursorBridgeThread>, BridgeFailure> {
-    let mut stream = UnixStream::connect(&discovery.socket_path)
-        .map_err(|_| BridgeFailure::new("bridge_connection_failed"))?;
-    stream
-        .set_read_timeout(Some(IO_TIMEOUT))
-        .and_then(|_| stream.set_write_timeout(Some(IO_TIMEOUT)))
+    request_threads_with_timeout(discovery, now_ms, IO_TIMEOUT)
+}
+
+#[cfg(unix)]
+fn request_threads_with_timeout(
+    discovery: &DiscoveryRecord,
+    now_ms: i64,
+    timeout: Duration,
+) -> Result<Vec<CursorBridgeThread>, BridgeFailure> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .ok_or_else(|| BridgeFailure::new("bridge_connection_failed"))?;
+    let mut stream = unix_stream_connect_with_deadline(Path::new(&discovery.socket_path), deadline)
         .map_err(|_| BridgeFailure::new("bridge_connection_failed"))?;
     let body = br#"{"type":"listThreads"}"#;
     let request = format!(
@@ -938,21 +952,237 @@ fn request_threads(
         discovery.token,
         body.len()
     );
-    stream
-        .write_all(request.as_bytes())
-        .and_then(|_| stream.write_all(body))
-        .and_then(|_| stream.flush())
+    let mut outbound = request.into_bytes();
+    outbound.extend_from_slice(body);
+    write_all_with_deadline(&mut stream, &outbound, deadline)
         .map_err(|_| BridgeFailure::new("bridge_request_failed"))?;
 
-    let mut response = Vec::new();
-    stream
-        .take((MAX_RESPONSE_BYTES + 1) as u64)
-        .read_to_end(&mut response)
-        .map_err(|_| BridgeFailure::new("bridge_response_failed"))?;
-    if response.len() > MAX_RESPONSE_BYTES {
-        return Err(BridgeFailure::new("bridge_response_too_large"));
-    }
+    let response = read_http_response_with_deadline(&mut stream, deadline)?;
     parse_threads_response(&response, now_ms, &bridge_instance_key(discovery))
+}
+
+#[cfg(unix)]
+fn unix_stream_connect_with_deadline(path: &Path, deadline: Instant) -> io::Result<UnixStream> {
+    let path_bytes = path.as_os_str().as_bytes();
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if path_bytes.is_empty()
+        || path_bytes.contains(&0)
+        || path_bytes.len() >= address.sun_path.len()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid Unix socket path",
+        ));
+    }
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (destination, source) in address.sun_path.iter_mut().zip(path_bytes) {
+        *destination = *source as libc::c_char;
+    }
+    let address_start = std::ptr::addr_of!(address) as usize;
+    let path_start = std::ptr::addr_of!(address.sun_path) as usize;
+    let address_length = path_start
+        .saturating_sub(address_start)
+        .saturating_add(path_bytes.len())
+        .saturating_add(1);
+    // Match std's pathname layout: the sun_path offset, the path bytes, and
+    // their terminating NUL. Darwin derives sockaddr.sa_len from this explicit
+    // syscall length, so its zeroed BSD-only sun_len field is intentionally
+    // left untouched, as it is by std::os::unix::net and socket2.
+    let address_length = libc::socklen_t::try_from(address_length)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Unix socket path is too long"))?;
+
+    // SAFETY: socket returns a new descriptor, which is immediately owned by
+    // OwnedFd and closed automatically along every error path.
+    let raw_fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if raw_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: raw_fd was just returned by socket and has no other owner.
+    let socket = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+    let descriptor_flags = unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_GETFD) };
+    if descriptor_flags < 0
+        || unsafe {
+            libc::fcntl(
+                socket.as_raw_fd(),
+                libc::F_SETFD,
+                descriptor_flags | libc::FD_CLOEXEC,
+            )
+        } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let status_flags = unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_GETFL) };
+    if status_flags < 0
+        || unsafe {
+            libc::fcntl(
+                socket.as_raw_fd(),
+                libc::F_SETFL,
+                status_flags | libc::O_NONBLOCK,
+            )
+        } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+
+    // SAFETY: address is initialized as sockaddr_un, address_length covers its
+    // family and NUL-terminated path, and socket remains valid for the call.
+    let connected = unsafe {
+        libc::connect(
+            socket.as_raw_fd(),
+            std::ptr::addr_of!(address).cast::<libc::sockaddr>(),
+            address_length,
+        )
+    };
+    if connected < 0 {
+        let error = io::Error::last_os_error();
+        let raw_error = error.raw_os_error();
+        if ![
+            Some(libc::EINPROGRESS),
+            Some(libc::EALREADY),
+            Some(libc::EINTR),
+            Some(libc::EAGAIN),
+            Some(libc::EWOULDBLOCK),
+        ]
+        .contains(&raw_error)
+        {
+            return Err(error);
+        }
+        wait_for_unix_connect(&socket, deadline)?;
+    }
+
+    if unsafe {
+        libc::fcntl(
+            socket.as_raw_fd(),
+            libc::F_SETFL,
+            status_flags & !libc::O_NONBLOCK,
+        )
+    } < 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(UnixStream::from(socket))
+}
+
+#[cfg(unix)]
+fn wait_for_unix_connect(socket: &OwnedFd, deadline: Instant) -> io::Result<()> {
+    loop {
+        let remaining = remaining_io_time(deadline)?;
+        let timeout_ms = remaining
+            .as_millis()
+            .saturating_add(u128::from(remaining.subsec_nanos() % 1_000_000 != 0))
+            .clamp(1, libc::c_int::MAX as u128) as libc::c_int;
+        let mut poll_descriptor = libc::pollfd {
+            fd: socket.as_raw_fd(),
+            events: libc::POLLIN | libc::POLLOUT,
+            revents: 0,
+        };
+        // SAFETY: poll_descriptor points to one initialized pollfd for the
+        // duration of the call.
+        let result = unsafe { libc::poll(&mut poll_descriptor, 1, timeout_ms) };
+        if result == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Unix socket connection timed out",
+            ));
+        }
+        if result < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+
+        let mut socket_error = 0 as libc::c_int;
+        let mut socket_error_length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: both output pointers reference initialized storage of the
+        // advertised length, and socket is a valid socket descriptor.
+        if unsafe {
+            libc::getsockopt(
+                socket.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                std::ptr::addr_of_mut!(socket_error).cast(),
+                &mut socket_error_length,
+            )
+        } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        return if socket_error == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(socket_error))
+        };
+    }
+}
+
+#[cfg(unix)]
+fn remaining_io_time(deadline: Instant) -> io::Result<Duration> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "bridge request timed out"))
+}
+
+#[cfg(unix)]
+fn write_all_with_deadline(
+    stream: &mut UnixStream,
+    mut bytes: &[u8],
+    deadline: Instant,
+) -> io::Result<()> {
+    while !bytes.is_empty() {
+        stream.set_write_timeout(Some(remaining_io_time(deadline)?))?;
+        match stream.write(bytes) {
+            Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    stream.set_write_timeout(Some(remaining_io_time(deadline)?))?;
+    stream.flush()
+}
+
+#[cfg(unix)]
+fn read_http_response_with_deadline(
+    stream: &mut UnixStream,
+    deadline: Instant,
+) -> Result<Vec<u8>, BridgeFailure> {
+    let mut response = Vec::new();
+    let mut buffer = [0u8; 8 * 1024];
+    loop {
+        let remaining = remaining_io_time(deadline)
+            .map_err(|_| BridgeFailure::new("bridge_response_failed"))?;
+        if http_response_is_complete(&response)? {
+            return Ok(response);
+        }
+        stream
+            .set_read_timeout(Some(remaining))
+            .map_err(|_| BridgeFailure::new("bridge_response_failed"))?;
+        let available = MAX_RESPONSE_BYTES
+            .saturating_add(1)
+            .saturating_sub(response.len());
+        let read_limit = available.min(buffer.len());
+        if read_limit == 0 {
+            return Err(BridgeFailure::new("bridge_response_too_large"));
+        }
+        match stream.read(&mut buffer[..read_limit]) {
+            Ok(0) => {
+                remaining_io_time(deadline)
+                    .map_err(|_| BridgeFailure::new("bridge_response_failed"))?;
+                return Ok(response);
+            }
+            Ok(read) => {
+                response.extend_from_slice(&buffer[..read]);
+                if response.len() > MAX_RESPONSE_BYTES {
+                    return Err(BridgeFailure::new("bridge_response_too_large"));
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return Err(BridgeFailure::new("bridge_response_failed")),
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -1031,7 +1261,20 @@ fn bridge_instance_key(discovery: &DiscoveryRecord) -> String {
     crate::cursor_integration::cursor_bytes_hash(&identity)
 }
 
-fn parse_http_response(response: &[u8]) -> Result<Vec<u8>, BridgeFailure> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpBodyFraming {
+    ContentLength(usize),
+    Chunked,
+    UntilEof,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HttpResponseHead {
+    header_len: usize,
+    framing: HttpBodyFraming,
+}
+
+fn parse_http_head(response: &[u8]) -> Result<Option<HttpResponseHead>, BridgeFailure> {
     let mut headers = [httparse::EMPTY_HEADER; 32];
     let mut parsed = httparse::Response::new(&mut headers);
     let header_len = match parsed
@@ -1039,12 +1282,11 @@ fn parse_http_response(response: &[u8]) -> Result<Vec<u8>, BridgeFailure> {
         .map_err(|_| BridgeFailure::new("invalid_bridge_response"))?
     {
         httparse::Status::Complete(length) => length,
-        httparse::Status::Partial => return Err(BridgeFailure::new("invalid_bridge_response")),
+        httparse::Status::Partial => return Ok(None),
     };
     if parsed.code != Some(200) {
         return Err(BridgeFailure::new("bridge_rejected_request"));
     }
-    let body = &response[header_len..];
     let mut content_length = None;
     let mut chunked = false;
     for header in parsed.headers {
@@ -1066,21 +1308,155 @@ fn parse_http_response(response: &[u8]) -> Result<Vec<u8>, BridgeFailure> {
             }
             let value = std::str::from_utf8(header.value)
                 .ok()
+                .filter(|value| {
+                    !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+                })
                 .and_then(|value| value.parse::<usize>().ok())
                 .ok_or_else(|| BridgeFailure::new("invalid_bridge_response"))?;
+            if value > MAX_RESPONSE_BYTES {
+                return Err(BridgeFailure::new("bridge_response_too_large"));
+            }
             content_length = Some(value);
         }
     }
     if chunked && content_length.is_some() {
         return Err(BridgeFailure::new("invalid_bridge_response"));
     }
-    if chunked {
-        return decode_chunked_body(body);
+    let framing = if chunked {
+        HttpBodyFraming::Chunked
+    } else if let Some(content_length) = content_length {
+        HttpBodyFraming::ContentLength(content_length)
+    } else {
+        HttpBodyFraming::UntilEof
+    };
+    Ok(Some(HttpResponseHead {
+        header_len,
+        framing,
+    }))
+}
+
+fn http_response_is_complete(response: &[u8]) -> Result<bool, BridgeFailure> {
+    if response.len() > MAX_RESPONSE_BYTES {
+        return Err(BridgeFailure::new("bridge_response_too_large"));
     }
-    if content_length.is_some_and(|length| length != body.len()) {
-        return Err(BridgeFailure::new("invalid_bridge_response"));
+    let Some(head) = parse_http_head(response)? else {
+        return Ok(false);
+    };
+    match head.framing {
+        HttpBodyFraming::ContentLength(content_length) => {
+            let expected_length = head
+                .header_len
+                .checked_add(content_length)
+                .filter(|length| *length <= MAX_RESPONSE_BYTES)
+                .ok_or_else(|| BridgeFailure::new("bridge_response_too_large"))?;
+            if response.len() > expected_length {
+                return Err(BridgeFailure::new("invalid_bridge_response"));
+            }
+            Ok(response.len() == expected_length)
+        }
+        HttpBodyFraming::Chunked => {
+            let body = &response[head.header_len..];
+            let Some(encoded_length) = chunked_body_encoded_length(body)? else {
+                return Ok(false);
+            };
+            let expected_length = head
+                .header_len
+                .checked_add(encoded_length)
+                .filter(|length| *length <= MAX_RESPONSE_BYTES)
+                .ok_or_else(|| BridgeFailure::new("bridge_response_too_large"))?;
+            if response.len() != expected_length {
+                return Err(BridgeFailure::new("invalid_bridge_response"));
+            }
+            Ok(true)
+        }
+        HttpBodyFraming::UntilEof => Ok(false),
     }
-    Ok(body.to_vec())
+}
+
+fn chunked_body_encoded_length(encoded: &[u8]) -> Result<Option<usize>, BridgeFailure> {
+    let mut offset = 0usize;
+    let mut decoded_length = 0usize;
+    loop {
+        let remaining = &encoded[offset..];
+        let Some(line_end) = remaining.windows(2).position(|window| window == b"\r\n") else {
+            if remaining.len() > 33 {
+                return Err(BridgeFailure::new("invalid_bridge_response"));
+            }
+            return Ok(None);
+        };
+        if line_end == 0 || line_end > 32 {
+            return Err(BridgeFailure::new("invalid_bridge_response"));
+        }
+        let size_token = remaining[..line_end]
+            .split(|byte| *byte == b';')
+            .next()
+            .filter(|value| !value.is_empty() && value.iter().all(|byte| byte.is_ascii_hexdigit()))
+            .ok_or_else(|| BridgeFailure::new("invalid_bridge_response"))?;
+        let size = std::str::from_utf8(size_token)
+            .ok()
+            .and_then(|value| usize::from_str_radix(value, 16).ok())
+            .ok_or_else(|| BridgeFailure::new("invalid_bridge_response"))?;
+        offset = offset
+            .checked_add(line_end)
+            .and_then(|value| value.checked_add(2))
+            .ok_or_else(|| BridgeFailure::new("bridge_response_too_large"))?;
+        if size == 0 {
+            let terminator = &encoded[offset..];
+            if terminator.len() < 2 {
+                return if b"\r\n".starts_with(terminator) {
+                    Ok(None)
+                } else {
+                    Err(BridgeFailure::new("invalid_bridge_response"))
+                };
+            }
+            if &terminator[..2] != b"\r\n" {
+                return Err(BridgeFailure::new("invalid_bridge_response"));
+            }
+            return offset
+                .checked_add(2)
+                .map(Some)
+                .ok_or_else(|| BridgeFailure::new("bridge_response_too_large"));
+        }
+        decoded_length = decoded_length
+            .checked_add(size)
+            .filter(|length| *length <= MAX_RESPONSE_BYTES)
+            .ok_or_else(|| BridgeFailure::new("bridge_response_too_large"))?;
+        let chunk_end = offset
+            .checked_add(size)
+            .and_then(|value| value.checked_add(2))
+            .ok_or_else(|| BridgeFailure::new("bridge_response_too_large"))?;
+        if encoded.len() < chunk_end {
+            return Ok(None);
+        }
+        if &encoded[chunk_end - 2..chunk_end] != b"\r\n" {
+            return Err(BridgeFailure::new("invalid_bridge_response"));
+        }
+        offset = chunk_end;
+    }
+}
+
+fn parse_http_response(response: &[u8]) -> Result<Vec<u8>, BridgeFailure> {
+    if response.len() > MAX_RESPONSE_BYTES {
+        return Err(BridgeFailure::new("bridge_response_too_large"));
+    }
+    let head =
+        parse_http_head(response)?.ok_or_else(|| BridgeFailure::new("invalid_bridge_response"))?;
+    let body = &response[head.header_len..];
+    match head.framing {
+        HttpBodyFraming::ContentLength(content_length) if content_length == body.len() => {
+            Ok(body.to_vec())
+        }
+        HttpBodyFraming::ContentLength(_) => Err(BridgeFailure::new("invalid_bridge_response")),
+        HttpBodyFraming::Chunked => {
+            let encoded_length = chunked_body_encoded_length(body)?
+                .ok_or_else(|| BridgeFailure::new("invalid_bridge_response"))?;
+            if encoded_length != body.len() {
+                return Err(BridgeFailure::new("invalid_bridge_response"));
+            }
+            decode_chunked_body(body)
+        }
+        HttpBodyFraming::UntilEof => Ok(body.to_vec()),
+    }
 }
 
 fn decode_chunked_body(mut encoded: &[u8]) -> Result<Vec<u8>, BridgeFailure> {
@@ -1162,8 +1538,39 @@ fn convert_thread(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::sync::mpsc;
     use std::thread;
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    fn bind_test_bridge() -> Option<(TempDir, std::os::unix::net::UnixListener, PathBuf)> {
+        use std::os::unix::net::UnixListener;
+
+        let temporary = TempDir::new().unwrap();
+        let socket_path = temporary.path().join("bridge.sock");
+        match UnixListener::bind(&socket_path) {
+            Ok(listener) => Some((temporary, listener, socket_path)),
+            // Some CI sandboxes deny creating even local Unix sockets. Parser
+            // tests still exercise framing where local IPC is unavailable.
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => None,
+            Err(error) => panic!("could not bind test bridge socket: {error}"),
+        }
+    }
+
+    #[cfg(unix)]
+    fn direct_test_discovery(socket_path: &Path) -> DiscoveryRecord {
+        DiscoveryRecord {
+            protocol_version: BRIDGE_PROTOCOL_VERSION,
+            pid: i64::from(std::process::id()),
+            socket_path: socket_path.to_string_lossy().into_owned(),
+            token: "a".repeat(64),
+            app_name: "Cursor".to_string(),
+            app_version: "test".to_string(),
+            user_data_dir: "/tmp/vsparallel-cursor-test".to_string(),
+            created_at: 500.0,
+        }
+    }
 
     #[test]
     fn preference_is_off_by_default_and_round_trips_privately() {
@@ -1273,6 +1680,49 @@ mod tests {
     }
 
     #[test]
+    fn incremental_http_framing_detects_completion_and_rejects_excess() {
+        assert!(
+            !http_response_is_complete(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{").unwrap()
+        );
+        assert!(
+            http_response_is_complete(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}").unwrap()
+        );
+        assert!(http_response_is_complete(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n"
+        )
+        .unwrap());
+        assert!(
+            http_response_is_complete(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}extra")
+                .is_err()
+        );
+        assert!(http_response_is_complete(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\n"
+        )
+        .is_err());
+
+        let oversized = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+            MAX_RESPONSE_BYTES + 1
+        );
+        assert_eq!(
+            http_response_is_complete(oversized.as_bytes())
+                .unwrap_err()
+                .code,
+            "bridge_response_too_large"
+        );
+        let oversized_chunk = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+            MAX_RESPONSE_BYTES + 1
+        );
+        assert_eq!(
+            http_response_is_complete(oversized_chunk.as_bytes())
+                .unwrap_err()
+                .code,
+            "bridge_response_too_large"
+        );
+    }
+
+    #[test]
     fn missing_bridge_does_not_claim_the_gated_cursor_setting_exists() {
         let poll = failed_poll(1_000, "waiting", "bridge_not_found", None);
         assert_eq!(poll.status.availability, "waiting");
@@ -1285,6 +1735,103 @@ mod tests {
             .detail
             .contains("absent from Cursor Settings > Beta"));
         assert!(poll.status.detail.contains("hook-only fallback"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_request_stops_at_a_complete_body_while_the_peer_stays_open() {
+        let Some((_temporary, listener, socket_path)) = bind_test_bridge() else {
+            return;
+        };
+        let (release_sender, release_receiver) = mpsc::channel();
+        let responder = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let read = stream.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..read]).contains("listThreads"));
+            let body = br#"{"threads":[{"id":"thread-1","title":"secret","source":"local","status":"running","lastUpdatedAt":1000,"windowId":7}]}"#;
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(header.as_bytes()).unwrap();
+            stream.write_all(body).unwrap();
+            release_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
+        });
+
+        let discovery = direct_test_discovery(&socket_path);
+        let started = Instant::now();
+        let result = request_threads_with_timeout(&discovery, 2_000, Duration::from_millis(500));
+        let elapsed = started.elapsed();
+        let _ = release_sender.send(());
+        responder.join().unwrap();
+
+        let threads = result.unwrap();
+        assert_eq!(threads.len(), 1);
+        assert!(elapsed < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_request_deadline_bounds_a_slow_trickle_response() {
+        let Some((_temporary, listener, socket_path)) = bind_test_bridge() else {
+            return;
+        };
+        let responder = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}";
+            for byte in response {
+                if stream.write_all(std::slice::from_ref(byte)).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        });
+
+        let discovery = direct_test_discovery(&socket_path);
+        let started = Instant::now();
+        let error = request_threads_with_timeout(&discovery, 2_000, Duration::from_millis(120))
+            .unwrap_err();
+        let elapsed = started.elapsed();
+        responder.join().unwrap();
+
+        assert_eq!(error.code, "bridge_response_failed");
+        assert!(elapsed >= Duration::from_millis(80));
+        assert!(elapsed < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_request_rejects_an_oversized_frame_without_waiting_for_eof() {
+        let Some((_temporary, listener, socket_path)) = bind_test_bridge() else {
+            return;
+        };
+        let (release_sender, release_receiver) = mpsc::channel();
+        let responder = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                MAX_RESPONSE_BYTES + 1
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            release_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
+        });
+
+        let discovery = direct_test_discovery(&socket_path);
+        let error = request_threads_with_timeout(&discovery, 2_000, Duration::from_millis(500))
+            .unwrap_err();
+        let _ = release_sender.send(());
+        responder.join().unwrap();
+
+        assert_eq!(error.code, "bridge_response_too_large");
     }
 
     #[cfg(unix)]

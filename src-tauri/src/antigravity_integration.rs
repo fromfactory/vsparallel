@@ -25,8 +25,13 @@ use tempfile::Builder as TempFileBuilder;
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 #[cfg(windows)]
-use std::os::windows::{ffi::OsStrExt, fs::MetadataExt};
+use std::os::windows::{
+    ffi::OsStrExt,
+    fs::{MetadataExt, OpenOptionsExt},
+};
 
 const HOOKS_FILENAME: &str = "hooks.json";
 const BACKUP_FILENAME: &str = "hooks.json.vsparallel.bak";
@@ -55,6 +60,8 @@ const MAX_WORKSPACE_PATHS: usize = 64;
 const MAX_TRANSCRIPT_PATH_BYTES: usize = 64 * 1024;
 const MAX_TERMINATION_REASON_BYTES: usize = 256;
 const MAX_FUTURE_SKEW_MS: i64 = 5 * 60 * 1_000;
+const RECORD_LOCK_ATTEMPTS: usize = 200;
+const RECORD_LOCK_RETRY: Duration = Duration::from_millis(5);
 
 const EVENTS: [AntigravityHookEvent; 3] = [
     AntigravityHookEvent::PreInvocation,
@@ -963,13 +970,18 @@ fn persist_record(
     ensure_private_directory(&directory)?;
 
     let target = directory.join(format!("{record_key}.json"));
+    let _lock = acquire_record_lock(&directory, record_key)?;
     let mut persisted = record.clone();
-    if let Some(existing) =
-        read_existing_hook_record(&target, &record.session_key, record.changed_at_ms)
+    if let Some(existing) = read_existing_hook_record(&target, &record.session_key, unix_time_ms())
     {
         // Hook commands run as separate processes. Never let a delayed older
-        // command replace a lifecycle event that has already been recorded.
-        if existing.changed_at_ms > record.changed_at_ms {
+        // command, or an equal-time lower-precedence command, replace a
+        // lifecycle event that has already been recorded.
+        if existing.changed_at_ms > record.changed_at_ms
+            || (existing.changed_at_ms == record.changed_at_ms
+                && antigravity_state_precedence(&existing.state)
+                    > antigravity_state_precedence(&record.state))
+        {
             return Ok(());
         }
 
@@ -981,6 +993,144 @@ fn persist_record(
         .map_err(|error| format!("could not serialize Antigravity state: {error}"))?;
     bytes.push(b'\n');
     atomic_write_bytes(&target, &bytes, Some(0o600))
+}
+
+fn antigravity_state_precedence(state: &str) -> u8 {
+    match state {
+        "activity_detected" => 0,
+        "turn_finished" => 1,
+        "failed_or_interrupted" | "interrupted" => 2,
+        "failed" => 3,
+        "session_ended" => 4,
+        _ => 0,
+    }
+}
+
+struct RecordLock {
+    _file: File,
+}
+
+#[cfg(unix)]
+fn acquire_record_lock(directory: &Path, record_key: &str) -> Result<RecordLock, String> {
+    if !is_sha256_key(record_key) {
+        return Err("invalid Antigravity record lock key".to_string());
+    }
+    let path = directory.join(format!(".{record_key}.lock"));
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    let file = options.open(&path).map_err(|error| {
+        format!(
+            "could not open Antigravity record lock {}: {error}",
+            path.display()
+        )
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        format!(
+            "could not inspect Antigravity record lock {}: {error}",
+            path.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(format!("{} is not a regular lock file", path.display()));
+    }
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|error| {
+            format!(
+                "could not secure Antigravity record lock {}: {error}",
+                path.display()
+            )
+        })?;
+
+    for attempt in 0..RECORD_LOCK_ATTEMPTS {
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result == 0 {
+            return Ok(RecordLock { _file: file });
+        }
+        let error = io::Error::last_os_error();
+        match error.kind() {
+            io::ErrorKind::Interrupted => continue,
+            io::ErrorKind::WouldBlock if attempt + 1 < RECORD_LOCK_ATTEMPTS => {
+                std::thread::sleep(RECORD_LOCK_RETRY);
+            }
+            io::ErrorKind::WouldBlock => break,
+            _ => {
+                return Err(format!(
+                    "could not lock Antigravity record lock {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "timed out waiting for Antigravity record lock {}",
+        path.display()
+    ))
+}
+
+#[cfg(windows)]
+fn acquire_record_lock(directory: &Path, record_key: &str) -> Result<RecordLock, String> {
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    const ERROR_LOCK_VIOLATION: i32 = 33;
+
+    if !is_sha256_key(record_key) {
+        return Err("invalid Antigravity record lock key".to_string());
+    }
+    let path = directory.join(format!(".{record_key}.lock"));
+    for attempt in 0..RECORD_LOCK_ATTEMPTS {
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .create(true)
+            .share_mode(0)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        match options.open(&path) {
+            Ok(file) => {
+                let metadata = file.metadata().map_err(|error| {
+                    format!(
+                        "could not inspect Antigravity record lock {}: {error}",
+                        path.display()
+                    )
+                })?;
+                if is_link_or_reparse_point(&metadata) || !metadata.is_file() {
+                    return Err(format!("{} is not a regular lock file", path.display()));
+                }
+                return Ok(RecordLock { _file: file });
+            }
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
+                ) && attempt + 1 < RECORD_LOCK_ATTEMPTS =>
+            {
+                std::thread::sleep(RECORD_LOCK_RETRY);
+            }
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
+                ) =>
+            {
+                break;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "could not open Antigravity record lock {}: {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "timed out waiting for Antigravity record lock {}",
+        path.display()
+    ))
 }
 
 fn apply_hook_model_update(
@@ -1080,7 +1230,7 @@ fn model_kind_from_preference(
 fn read_existing_hook_record(
     path: &Path,
     expected_session_key: &str,
-    event_time_ms: i64,
+    now_ms: i64,
 ) -> Option<ExistingHookRecord> {
     let metadata = fs::symlink_metadata(path).ok()?;
     if is_link_or_reparse_point(&metadata)
@@ -1102,7 +1252,7 @@ fn read_existing_hook_record(
     if record.schema_version != SCHEMA_VERSION
         || record.session_key != expected_session_key
         || record.changed_at_ms < 0
-        || record.changed_at_ms > event_time_ms.saturating_add(MAX_FUTURE_SKEW_MS)
+        || record.changed_at_ms > now_ms.saturating_add(MAX_FUTURE_SKEW_MS)
         || !known_antigravity_state(&record.state)
         || record
             .ide_model_revision
@@ -1145,10 +1295,33 @@ fn persist_hook_observation(
     let directory = root.join(HOOK_HEALTH_DIRECTORY);
     ensure_private_directory(&directory)?;
     let target = directory.join(surface.observation_file());
+    let lock_key = sha256_hex(surface.observation_file().as_bytes());
+    let _lock = acquire_record_lock(&directory, &lock_key)?;
+    if read_hook_observation(root, surface, unix_time_ms())
+        .ok()
+        .flatten()
+        .is_some_and(|existing| {
+            existing.observed_at_ms > observation.observed_at_ms
+                || (existing.observed_at_ms == observation.observed_at_ms
+                    && hook_observation_precedence(&existing.event)
+                        > hook_observation_precedence(&observation.event))
+        })
+    {
+        return Ok(());
+    }
     let mut bytes = serde_json::to_vec(observation)
         .map_err(|error| format!("could not serialize Antigravity hook health: {error}"))?;
     bytes.push(b'\n');
     atomic_write_bytes(&target, &bytes, Some(0o600))
+}
+
+fn hook_observation_precedence(event: &str) -> u8 {
+    match event {
+        "pre-invocation" => 0,
+        "post-tool-use" => 1,
+        "stop" => 2,
+        _ => 0,
+    }
 }
 
 pub(crate) fn antigravity_two_hook_observation(
@@ -3200,13 +3373,27 @@ mod tests {
         }
     }
 
-    fn state_records(root: &Path) -> Vec<Value> {
-        let mut paths: Vec<_> = fs::read_dir(root.join("antigravity"))
+    fn state_record_paths(root: &Path, directory: &str) -> Vec<PathBuf> {
+        let mut paths: Vec<_> = fs::read_dir(root.join(directory))
             .unwrap()
-            .map(|entry| entry.unwrap().path())
+            .filter_map(|entry| {
+                let path = entry.unwrap().path();
+                (path.extension().and_then(|extension| extension.to_str()) == Some("json"))
+                    .then_some(path)
+            })
             .collect();
         paths.sort();
         paths
+    }
+
+    fn state_record(root: &Path, directory: &str) -> Value {
+        let paths = state_record_paths(root, directory);
+        assert_eq!(paths.len(), 1);
+        serde_json::from_slice(&fs::read(&paths[0]).unwrap()).unwrap()
+    }
+
+    fn state_records(root: &Path) -> Vec<Value> {
+        state_record_paths(root, "antigravity")
             .into_iter()
             .map(|path| serde_json::from_slice(&fs::read(path).unwrap()).unwrap())
             .collect()
@@ -3221,6 +3408,232 @@ mod tests {
             );
         }
         assert_eq!(AntigravityHookEvent::from_cli_argument("unknown"), None);
+    }
+
+    #[test]
+    fn record_lock_serializes_competing_hook_writes_and_preserves_newest_state() {
+        use std::sync::mpsc;
+
+        let temp = TempDir::new().unwrap();
+        let directory = temp.path().join("antigravity");
+        ensure_private_directory(&directory).unwrap();
+        let record_key = sha256_hex(b"record");
+        let session_key = sha256_hex(b"session");
+        let held = acquire_record_lock(&directory, &record_key).unwrap();
+        let (finished_tx, finished_rx) = mpsc::channel();
+
+        let newer_root = temp.path().to_path_buf();
+        let newer_key = record_key.clone();
+        let newer_session = session_key.clone();
+        let newer_tx = finished_tx.clone();
+        let newer = std::thread::spawn(move || {
+            let record = HookRecord {
+                schema_version: SCHEMA_VERSION,
+                session_key: newer_session,
+                cwd: "/workspace".to_string(),
+                state: "turn_finished".to_string(),
+                changed_at_ms: 20,
+                model_kind: None,
+                ide_model_revision: None,
+            };
+            let result = persist_record(
+                &newer_root,
+                "antigravity",
+                &newer_key,
+                &record,
+                AntigravityHookEvent::Stop,
+                HookModelUpdate::Preserve,
+            );
+            newer_tx.send(result).unwrap();
+        });
+
+        let older_root = temp.path().to_path_buf();
+        let older_key = record_key.clone();
+        let older_tx = finished_tx.clone();
+        let older = std::thread::spawn(move || {
+            let record = HookRecord {
+                schema_version: SCHEMA_VERSION,
+                session_key,
+                cwd: "/workspace".to_string(),
+                state: "activity_detected".to_string(),
+                changed_at_ms: 10,
+                model_kind: None,
+                ide_model_revision: None,
+            };
+            let result = persist_record(
+                &older_root,
+                "antigravity",
+                &older_key,
+                &record,
+                AntigravityHookEvent::PreInvocation,
+                HookModelUpdate::Preserve,
+            );
+            older_tx.send(result).unwrap();
+        });
+        drop(finished_tx);
+
+        assert!(matches!(
+            finished_rx.recv_timeout(Duration::from_millis(25)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(held);
+        for _ in 0..2 {
+            assert!(finished_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .is_ok());
+        }
+        newer.join().unwrap();
+        older.join().unwrap();
+
+        let saved: Value = serde_json::from_slice(
+            &fs::read(directory.join(format!("{record_key}.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(saved["state"], "turn_finished");
+        assert_eq!(saved["changedAtMs"], 20);
+        assert!(directory.join(format!(".{record_key}.lock")).is_file());
+    }
+
+    #[test]
+    fn record_lock_file_persists_and_can_be_reacquired() {
+        let temp = TempDir::new().unwrap();
+        let directory = temp.path().join("antigravity");
+        ensure_private_directory(&directory).unwrap();
+        let record_key = sha256_hex(b"persistent-record-lock");
+        let lock_path = directory.join(format!(".{record_key}.lock"));
+
+        let first = acquire_record_lock(&directory, &record_key).unwrap();
+        drop(first);
+        assert!(lock_path.is_file());
+
+        let second = acquire_record_lock(&directory, &record_key).unwrap();
+        drop(second);
+        assert!(lock_path.is_file());
+
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn stale_and_equal_time_activity_cannot_regress_terminal_state() {
+        let temp = TempDir::new().unwrap();
+        let record_key = sha256_hex(b"record");
+        let session_key = sha256_hex(b"session");
+        let terminal_time = MAX_FUTURE_SKEW_MS + 20;
+        let persist = |state: &str, changed_at_ms: i64, event: AntigravityHookEvent| {
+            let record = HookRecord {
+                schema_version: SCHEMA_VERSION,
+                session_key: session_key.clone(),
+                cwd: "/workspace".to_string(),
+                state: state.to_string(),
+                changed_at_ms,
+                model_kind: None,
+                ide_model_revision: None,
+            };
+            persist_record(
+                temp.path(),
+                "antigravity",
+                &record_key,
+                &record,
+                event,
+                HookModelUpdate::Preserve,
+            )
+            .unwrap();
+        };
+
+        persist("turn_finished", terminal_time, AntigravityHookEvent::Stop);
+        // This delayed writer is older by more than the record future-skew
+        // allowance. Validation uses wall time, not the stale event's time,
+        // so the valid newer record still participates in monotonic merging.
+        persist("activity_detected", 10, AntigravityHookEvent::PreInvocation);
+        persist(
+            "activity_detected",
+            terminal_time,
+            AntigravityHookEvent::PreInvocation,
+        );
+        let path = temp
+            .path()
+            .join("antigravity")
+            .join(format!("{record_key}.json"));
+        let saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["state"], "turn_finished");
+        assert_eq!(saved["changedAtMs"], terminal_time);
+
+        // Equal-time terminal outcomes also converge deterministically: a
+        // failure may replace a clean finish, but the reverse is rejected.
+        persist("failed", terminal_time, AntigravityHookEvent::Stop);
+        persist("turn_finished", terminal_time, AntigravityHookEvent::Stop);
+        let saved: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(saved["state"], "failed");
+        assert_eq!(saved["changedAtMs"], terminal_time);
+    }
+
+    #[test]
+    fn hook_health_lock_and_event_order_prevent_receipt_regression() {
+        use std::sync::mpsc;
+
+        let temp = TempDir::new().unwrap();
+        let surface = AntigravitySurface::Two;
+        let terminal_time = MAX_FUTURE_SKEW_MS + 20;
+        let newer = AntigravityHookObservation {
+            schema_version: SCHEMA_VERSION,
+            event: "stop".to_string(),
+            surface: surface.observation_name().to_string(),
+            outcome: AntigravityHookOutcome::Recorded,
+            observed_at_ms: terminal_time,
+            workspace_count: 1,
+        };
+        persist_hook_observation(temp.path(), surface, &newer).unwrap();
+
+        let directory = temp.path().join(HOOK_HEALTH_DIRECTORY);
+        let lock_key = sha256_hex(surface.observation_file().as_bytes());
+        let held = acquire_record_lock(&directory, &lock_key).unwrap();
+        let root = temp.path().to_path_buf();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let older = AntigravityHookObservation {
+                schema_version: SCHEMA_VERSION,
+                event: "pre-invocation".to_string(),
+                surface: surface.observation_name().to_string(),
+                outcome: AntigravityHookOutcome::Recorded,
+                observed_at_ms: 10,
+                workspace_count: 1,
+            };
+            finished_tx
+                .send(persist_hook_observation(&root, surface, &older))
+                .unwrap();
+        });
+        assert!(matches!(
+            finished_rx.recv_timeout(Duration::from_millis(25)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(held);
+        assert!(finished_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .is_ok());
+        worker.join().unwrap();
+
+        let equal_time_pre_invocation = AntigravityHookObservation {
+            schema_version: SCHEMA_VERSION,
+            event: "pre-invocation".to_string(),
+            surface: surface.observation_name().to_string(),
+            outcome: AntigravityHookOutcome::Recorded,
+            observed_at_ms: terminal_time,
+            workspace_count: 1,
+        };
+        persist_hook_observation(temp.path(), surface, &equal_time_pre_invocation).unwrap();
+
+        let saved = antigravity_two_hook_observation(temp.path(), terminal_time)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.event, "stop");
+        assert_eq!(saved.observed_at_ms, terminal_time);
+        assert!(directory.join(format!(".{lock_key}.lock")).is_file());
     }
 
     #[test]
@@ -3442,10 +3855,7 @@ mod tests {
             assert_eq!(code, 0);
             assert_eq!(output, "{}\n");
             match expected_directory {
-                Some(directory) => assert_eq!(
-                    fs::read_dir(temp.path().join(directory)).unwrap().count(),
-                    1
-                ),
+                Some(directory) => assert_eq!(state_record_paths(temp.path(), directory).len(), 1),
                 None => assert!(
                     !temp.path().join("antigravity").exists()
                         && !temp.path().join("antigravity-ide").exists()
@@ -3514,18 +3924,7 @@ mod tests {
         assert_eq!(observation.surface, "antigravity_ide");
         assert_eq!(observation.outcome, AntigravityHookOutcome::Recorded);
         assert_eq!(observation.workspace_count, 1);
-        let record: Value = serde_json::from_slice(
-            &fs::read(
-                fs::read_dir(temp.path().join("antigravity-ide"))
-                    .unwrap()
-                    .next()
-                    .unwrap()
-                    .unwrap()
-                    .path(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
+        let record = state_record(temp.path(), "antigravity-ide");
         assert!(record.get("modelKind").is_none());
     }
 
@@ -3557,18 +3956,7 @@ mod tests {
 
         assert_eq!(code, 0);
         assert_eq!(output, "{}\n");
-        let record: Value = serde_json::from_slice(
-            &fs::read(
-                fs::read_dir(state_root.join("antigravity-ide"))
-                    .unwrap()
-                    .next()
-                    .unwrap()
-                    .unwrap()
-                    .path(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
+        let record = state_record(&state_root, "antigravity-ide");
         assert_eq!(record["state"], "activity_detected");
         assert_eq!(record["modelKind"], "gemini_3_6_flash_medium");
         let saved = record.to_string();
@@ -3593,18 +3981,7 @@ mod tests {
             &ide_state_database,
             15,
         );
-        let record: Value = serde_json::from_slice(
-            &fs::read(
-                fs::read_dir(state_root.join("antigravity-ide"))
-                    .unwrap()
-                    .next()
-                    .unwrap()
-                    .unwrap()
-                    .path(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
+        let record = state_record(&state_root, "antigravity-ide");
         assert_eq!(record["modelKind"], "claude_sonnet_4_6_thinking");
         assert_eq!(record["changedAtMs"], 15);
 
@@ -3618,18 +3995,7 @@ mod tests {
         );
         assert_eq!(code, 0);
         assert_eq!(output, "{}\n");
-        let record: Value = serde_json::from_slice(
-            &fs::read(
-                fs::read_dir(state_root.join("antigravity-ide"))
-                    .unwrap()
-                    .next()
-                    .unwrap()
-                    .unwrap()
-                    .path(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
+        let record = state_record(&state_root, "antigravity-ide");
         assert_eq!(record["modelKind"], "claude_sonnet_4_6_thinking");
         assert_eq!(record["state"], "activity_detected");
         assert_eq!(record["changedAtMs"], 15);
@@ -3654,18 +4020,7 @@ mod tests {
             &ide_state_database,
             30,
         );
-        let record: Value = serde_json::from_slice(
-            &fs::read(
-                fs::read_dir(state_root.join("antigravity-ide"))
-                    .unwrap()
-                    .next()
-                    .unwrap()
-                    .unwrap()
-                    .path(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
+        let record = state_record(&state_root, "antigravity-ide");
         assert_eq!(record["modelKind"], "gpt_oss_120b_medium");
         assert_eq!(record["state"], "turn_finished");
         assert_eq!(record["changedAtMs"], 30);
@@ -3678,18 +4033,7 @@ mod tests {
             &state_root,
             40,
         );
-        let record: Value = serde_json::from_slice(
-            &fs::read(
-                fs::read_dir(state_root.join("antigravity-ide"))
-                    .unwrap()
-                    .next()
-                    .unwrap()
-                    .unwrap()
-                    .path(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
+        let record = state_record(&state_root, "antigravity-ide");
         assert_eq!(record["modelKind"], "gpt_oss_120b_medium");
         assert_eq!(record["state"], "turn_finished");
         assert_eq!(record["changedAtMs"], 30);
@@ -3702,18 +4046,7 @@ mod tests {
             &state_root,
             50,
         );
-        let record: Value = serde_json::from_slice(
-            &fs::read(
-                fs::read_dir(state_root.join("antigravity-ide"))
-                    .unwrap()
-                    .next()
-                    .unwrap()
-                    .unwrap()
-                    .path(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
+        let record = state_record(&state_root, "antigravity-ide");
         assert_eq!(record["modelKind"], "gpt_oss_120b_medium");
         assert_eq!(record["state"], "activity_detected");
         assert_eq!(record["changedAtMs"], 50);
@@ -3726,18 +4059,7 @@ mod tests {
             &ide_state_database,
             45,
         );
-        let record: Value = serde_json::from_slice(
-            &fs::read(
-                fs::read_dir(state_root.join("antigravity-ide"))
-                    .unwrap()
-                    .next()
-                    .unwrap()
-                    .unwrap()
-                    .path(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
+        let record = state_record(&state_root, "antigravity-ide");
         assert_eq!(record["state"], "activity_detected");
         assert_eq!(record["changedAtMs"], 50);
 
@@ -3757,18 +4079,7 @@ mod tests {
             &ide_state_database,
             60,
         );
-        let record: Value = serde_json::from_slice(
-            &fs::read(
-                fs::read_dir(state_root.join("antigravity-ide"))
-                    .unwrap()
-                    .next()
-                    .unwrap()
-                    .unwrap()
-                    .path(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
+        let record = state_record(&state_root, "antigravity-ide");
         assert!(record.get("modelKind").is_none());
         assert!(!record.to_string().contains("private-deployment-model"));
 
@@ -3782,18 +4093,7 @@ mod tests {
             &ide_state_database,
             65,
         );
-        let record: Value = serde_json::from_slice(
-            &fs::read(
-                fs::read_dir(state_root.join("antigravity-ide"))
-                    .unwrap()
-                    .next()
-                    .unwrap()
-                    .unwrap()
-                    .path(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
+        let record = state_record(&state_root, "antigravity-ide");
         assert_eq!(record["modelKind"], "gpt_oss_120b_medium");
         write_ide_state_database(&ide_state_database, 999_999);
         let compatibility_payload = json!({
@@ -3810,18 +4110,7 @@ mod tests {
             &ide_state_database,
             70,
         );
-        let record: Value = serde_json::from_slice(
-            &fs::read(
-                fs::read_dir(state_root.join("antigravity-ide"))
-                    .unwrap()
-                    .next()
-                    .unwrap()
-                    .unwrap()
-                    .path(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
+        let record = state_record(&state_root, "antigravity-ide");
         assert!(record.get("modelKind").is_none());
     }
 
@@ -3860,18 +4149,7 @@ mod tests {
             ),
             0
         );
-        let initial: Value = serde_json::from_slice(
-            &fs::read(
-                fs::read_dir(state_root.join("antigravity-ide"))
-                    .unwrap()
-                    .next()
-                    .unwrap()
-                    .unwrap()
-                    .path(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
+        let initial = state_record(&state_root, "antigravity-ide");
         assert_eq!(initial["modelKind"], "gemini_3_6_flash_medium");
 
         // Once each new execution row appears, it is authoritative even while
@@ -3896,18 +4174,7 @@ mod tests {
                 0
             );
             assert_eq!(output, b"{}\n");
-            let record: Value = serde_json::from_slice(
-                &fs::read(
-                    fs::read_dir(state_root.join("antigravity-ide"))
-                        .unwrap()
-                        .next()
-                        .unwrap()
-                        .unwrap()
-                        .path(),
-                )
-                .unwrap(),
-            )
-            .unwrap();
+            let record = state_record(&state_root, "antigravity-ide");
             assert_eq!(record["modelKind"], expected);
         }
 
@@ -3982,18 +4249,7 @@ mod tests {
             10,
         );
 
-        let record: Value = serde_json::from_slice(
-            &fs::read(
-                fs::read_dir(state_root.join("antigravity-ide"))
-                    .unwrap()
-                    .next()
-                    .unwrap()
-                    .unwrap()
-                    .path(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
+        let record = state_record(&state_root, "antigravity-ide");
         assert_eq!(record["state"], "activity_detected");
         assert_eq!(record["modelKind"], "claude_sonnet_4_6_thinking");
         assert!(record["ideModelRevision"].as_str().is_some());
@@ -4026,20 +4282,7 @@ mod tests {
                 "/home/test/.gemini/antigravity-ide/brain/{conversation_id}/transcript.jsonl"
             )
         });
-        let read_record = || -> Value {
-            serde_json::from_slice(
-                &fs::read(
-                    fs::read_dir(state_root.join("antigravity-ide"))
-                        .unwrap()
-                        .next()
-                        .unwrap()
-                        .unwrap()
-                        .path(),
-                )
-                .unwrap(),
-            )
-            .unwrap()
-        };
+        let read_record = || state_record(&state_root, "antigravity-ide");
         let run = |event, body: &Value, now| {
             let mut output = Vec::new();
             run_antigravity_hook_with(
@@ -4144,20 +4387,7 @@ mod tests {
                 "hook output must remain fail-open"
             );
         };
-        let read_record = || -> Value {
-            serde_json::from_slice(
-                &fs::read(
-                    fs::read_dir(state_root.join("antigravity-ide"))
-                        .unwrap()
-                        .next()
-                        .unwrap()
-                        .unwrap()
-                        .path(),
-                )
-                .unwrap(),
-            )
-            .unwrap()
-        };
+        let read_record = || state_record(&state_root, "antigravity-ide");
 
         // Keep both fallback signals pinned to the first model. Only the
         // newest user-input step reflects switches made for later turns.
@@ -4319,18 +4549,7 @@ mod tests {
             10,
         );
 
-        let record: Value = serde_json::from_slice(
-            &fs::read(
-                fs::read_dir(state_root.join("antigravity-ide"))
-                    .unwrap()
-                    .next()
-                    .unwrap()
-                    .unwrap()
-                    .path(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
+        let record = state_record(&state_root, "antigravity-ide");
         assert_eq!(record["modelKind"], "gpt_oss_120b_medium");
     }
 
@@ -4368,18 +4587,7 @@ mod tests {
             10,
         );
 
-        let record: Value = serde_json::from_slice(
-            &fs::read(
-                fs::read_dir(state_root.join("antigravity-ide"))
-                    .unwrap()
-                    .next()
-                    .unwrap()
-                    .unwrap()
-                    .path(),
-            )
-            .unwrap(),
-        )
-        .unwrap();
+        let record = state_record(&state_root, "antigravity-ide");
         assert_eq!(record["state"], "activity_detected");
         assert_eq!(record["modelKind"], "claude_sonnet_4_6_thinking");
     }
@@ -4560,30 +4768,14 @@ mod tests {
             temp.path(),
             20,
         );
-        let before = fs::read(
-            fs::read_dir(temp.path().join("antigravity-ide"))
-                .unwrap()
-                .next()
-                .unwrap()
-                .unwrap()
-                .path(),
-        )
-        .unwrap();
+        let before = state_record(temp.path(), "antigravity-ide");
         hook_with_root(
             AntigravityHookEvent::PostToolUse,
             &payload.to_string(),
             temp.path(),
             30,
         );
-        let after = fs::read(
-            fs::read_dir(temp.path().join("antigravity-ide"))
-                .unwrap()
-                .next()
-                .unwrap()
-                .unwrap()
-                .path(),
-        )
-        .unwrap();
+        let after = state_record(temp.path(), "antigravity-ide");
         assert_eq!(after, before);
     }
 

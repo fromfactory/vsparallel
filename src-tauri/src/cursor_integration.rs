@@ -21,8 +21,13 @@ use tempfile::Builder as TempFileBuilder;
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 #[cfg(windows)]
-use std::os::windows::{ffi::OsStrExt, fs::MetadataExt};
+use std::os::windows::{
+    ffi::OsStrExt,
+    fs::{MetadataExt, OpenOptionsExt},
+};
 
 const HOOKS_FILENAME: &str = "hooks.json";
 const BACKUP_FILENAME: &str = "hooks.json.vsparallel.bak";
@@ -49,7 +54,6 @@ const MAX_COMPOSER_MODE_BYTES: usize = 32;
 const MAX_FUTURE_SKEW_MS: i64 = 5 * 60 * 1_000;
 const RECORD_LOCK_ATTEMPTS: usize = 200;
 const RECORD_LOCK_RETRY: Duration = Duration::from_millis(5);
-const STALE_RECORD_LOCK_AGE: Duration = Duration::from_secs(5);
 const WORKSPACE_SESSION_KEY_DOMAIN: &[u8] = b"vsparallel.cursor.workspace-open.session.v1\0";
 const WORKSPACE_RECORD_KEY_DOMAIN: &[u8] = b"vsparallel.cursor.workspace-open.record.v1\0";
 
@@ -865,71 +869,121 @@ fn cursor_state_precedence(state: &str) -> u8 {
 }
 
 struct RecordLock {
-    path: PathBuf,
+    _file: File,
 }
 
-impl Drop for RecordLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-        if let Some(parent) = self.path.parent() {
-            sync_parent(parent);
+#[cfg(unix)]
+fn acquire_record_lock(directory: &Path, record_key: &str) -> Result<RecordLock, String> {
+    if !is_sha256_key(record_key) {
+        return Err("invalid Cursor record lock key".to_string());
+    }
+    let path = directory.join(format!(".{record_key}.lock"));
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    let file = options.open(&path).map_err(|error| {
+        format!(
+            "could not open Cursor record lock {}: {error}",
+            path.display()
+        )
+    })?;
+    let metadata = file.metadata().map_err(|error| {
+        format!(
+            "could not inspect Cursor record lock {}: {error}",
+            path.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(format!("{} is not a regular lock file", path.display()));
+    }
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|error| {
+            format!(
+                "could not secure Cursor record lock {}: {error}",
+                path.display()
+            )
+        })?;
+
+    for attempt in 0..RECORD_LOCK_ATTEMPTS {
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result == 0 {
+            return Ok(RecordLock { _file: file });
+        }
+        let error = io::Error::last_os_error();
+        match error.kind() {
+            io::ErrorKind::Interrupted => continue,
+            io::ErrorKind::WouldBlock if attempt + 1 < RECORD_LOCK_ATTEMPTS => {
+                std::thread::sleep(RECORD_LOCK_RETRY);
+            }
+            io::ErrorKind::WouldBlock => break,
+            _ => {
+                return Err(format!(
+                    "could not lock Cursor record lock {}: {error}",
+                    path.display()
+                ));
+            }
         }
     }
+    Err(format!(
+        "timed out waiting for Cursor record lock {}",
+        path.display()
+    ))
 }
 
+#[cfg(windows)]
 fn acquire_record_lock(directory: &Path, record_key: &str) -> Result<RecordLock, String> {
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    const ERROR_LOCK_VIOLATION: i32 = 33;
+
     if !is_sha256_key(record_key) {
         return Err("invalid Cursor record lock key".to_string());
     }
     let path = directory.join(format!(".{record_key}.lock"));
     for attempt in 0..RECORD_LOCK_ATTEMPTS {
         let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        options.mode(0o600);
+        options
+            .read(true)
+            .write(true)
+            .create(true)
+            .share_mode(0)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
         match options.open(&path) {
             Ok(file) => {
-                file.sync_all().map_err(|error| {
-                    let _ = fs::remove_file(&path);
-                    format!("could not initialize {}: {error}", path.display())
-                })?;
-                set_private_file_permissions(&path, 0o600);
-                return Ok(RecordLock { path });
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                let metadata = fs::symlink_metadata(&path).map_err(|inspect| {
+                let metadata = file.metadata().map_err(|error| {
                     format!(
-                        "could not inspect Cursor record lock {}: {inspect}",
+                        "could not inspect Cursor record lock {}: {error}",
                         path.display()
                     )
                 })?;
                 if is_link_or_reparse_point(&metadata) || !metadata.is_file() {
                     return Err(format!("{} is not a regular lock file", path.display()));
                 }
-                let stale = metadata
-                    .modified()
-                    .ok()
-                    .and_then(|modified| modified.elapsed().ok())
-                    .is_some_and(|age| age >= STALE_RECORD_LOCK_AGE);
-                if stale {
-                    match fs::remove_file(&path) {
-                        Ok(()) => continue,
-                        Err(remove) if remove.kind() == io::ErrorKind::NotFound => continue,
-                        Err(remove) => {
-                            return Err(format!(
-                                "could not remove stale Cursor record lock {}: {remove}",
-                                path.display()
-                            ));
-                        }
-                    }
-                }
-                if attempt + 1 < RECORD_LOCK_ATTEMPTS {
-                    std::thread::sleep(RECORD_LOCK_RETRY);
-                }
+                return Ok(RecordLock { _file: file });
+            }
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
+                ) && attempt + 1 < RECORD_LOCK_ATTEMPTS =>
+            {
+                std::thread::sleep(RECORD_LOCK_RETRY);
+            }
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
+                ) =>
+            {
+                break;
             }
             Err(error) => {
                 return Err(format!(
-                    "could not create Cursor record lock {}: {error}",
+                    "could not open Cursor record lock {}: {error}",
                     path.display()
                 ));
             }
@@ -2117,10 +2171,13 @@ mod tests {
     fn records(root: &Path) -> Vec<(PathBuf, Value)> {
         let mut records: Vec<_> = fs::read_dir(root.join("cursor"))
             .unwrap()
-            .map(|entry| {
+            .filter_map(|entry| {
                 let path = entry.unwrap().path();
+                if path.extension().and_then(|value| value.to_str()) != Some("json") {
+                    return None;
+                }
                 let value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-                (path, value)
+                Some((path, value))
             })
             .collect();
         records.sort_by(|left, right| left.0.cmp(&right.0));
@@ -2835,7 +2892,47 @@ mod tests {
             .is_ok());
         worker.join().unwrap();
         assert!(directory.join(format!("{record_key}.json")).is_file());
-        assert!(!directory.join(format!(".{record_key}.lock")).exists());
+        assert!(directory.join(format!(".{record_key}.lock")).is_file());
+    }
+
+    #[test]
+    fn record_lock_is_persistent_and_reacquired_after_owner_drop() {
+        let temp = TempDir::new().unwrap();
+        let directory = temp.path().join("cursor");
+        ensure_private_directory(&directory).unwrap();
+        let record_key = sha256_hex(b"persistent-record-lock");
+        let path = directory.join(format!(".{record_key}.lock"));
+
+        let first = acquire_record_lock(&directory, &record_key).unwrap();
+        assert!(path.is_file());
+        drop(first);
+        assert!(path.is_file());
+
+        let second = acquire_record_lock(&directory, &record_key).unwrap();
+        assert!(path.is_file());
+        drop(second);
+        assert!(path.is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dropping_an_old_record_lock_never_unlinks_a_replacement() {
+        let temp = TempDir::new().unwrap();
+        let directory = temp.path().join("cursor");
+        ensure_private_directory(&directory).unwrap();
+        let record_key = sha256_hex(b"replaced-record-lock");
+        let path = directory.join(format!(".{record_key}.lock"));
+
+        let old_owner = acquire_record_lock(&directory, &record_key).unwrap();
+        fs::remove_file(&path).unwrap();
+        let replacement_owner = acquire_record_lock(&directory, &record_key).unwrap();
+        drop(old_owner);
+        assert!(path.is_file());
+
+        drop(replacement_owner);
+        let reacquired = acquire_record_lock(&directory, &record_key).unwrap();
+        drop(reacquired);
+        assert!(path.is_file());
     }
 
     #[test]

@@ -20,7 +20,11 @@ rm -f -- \
   "$INSTALL_PREFIX/share/icons/hicolor/64x64/apps/app.vsparallel.desktop.png" \
   "$INSTALL_PREFIX/share/icons/hicolor/128x128/apps/app.vsparallel.desktop.png" \
   "$INSTALL_PREFIX/share/icons/hicolor/256x256/apps/app.vsparallel.desktop.png" \
-  "$INSTALL_PREFIX/share/icons/hicolor/512x512/apps/app.vsparallel.desktop.png"
+  "$INSTALL_PREFIX/share/icons/hicolor/512x512/apps/app.vsparallel.desktop.png" \
+  "$INSTALL_PREFIX/share/doc/vsparallel/LICENSE" \
+  "$INSTALL_PREFIX/share/doc/vsparallel/PRIVACY.md" \
+  "$INSTALL_PREFIX/share/doc/vsparallel/THIRD_PARTY_LICENSES.html"
+rmdir -- "$INSTALL_PREFIX/share/doc/vsparallel" 2>/dev/null || true
 if command -v gtk-update-icon-cache >/dev/null 2>&1; then
   gtk-update-icon-cache -f -t "$INSTALL_PREFIX/share/icons/hicolor" >/dev/null 2>&1 ||
     printf '%s\n' 'Warning: could not refresh the GTK icon cache.' >&2

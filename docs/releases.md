@@ -1,9 +1,9 @@
 # Releases
 
 Pushing a version tag builds the Tauri application on native GitHub-hosted
-runners. After all checks and platform builds pass, the workflow publishes the
-packages, updater-signed artifacts, update manifest, and companion VSIX in one
-GitHub Release.
+runners. After all checks and platform builds pass, the workflow prepares a
+draft GitHub Release containing the packages, updater-signed artifacts, update
+manifest, and companion VSIX. It never makes a release public automatically.
 
 ## Updater signing
 
@@ -37,7 +37,7 @@ first release:
 The release workflow passes `src-tauri/tauri.release.conf.json` only to release
 builds. That overlay enables Tauri v2 updater artifacts without requiring every
 ordinary local bundle build to have the private signing key. The workflow signs
-the `.deb`, `.AppImage`, universal `.app.tar.gz`, and NSIS updater artifacts,
+the `.deb`, universal `.app.tar.gz`, and NSIS updater artifacts,
 rejects a private/public key mismatch, collects their `.sig` sidecars, and
 creates `latest.json` with `scripts/create-update-manifest.py`.
 
@@ -53,8 +53,18 @@ Developer ID signing/notarization and Windows Authenticode signing.
    `Cargo.lock`.
 3. If the companion changed, keep its independent version synchronized between
    `companion/package.json` and `companion/extension.vsixmanifest`.
-4. Run `npm ci` and `./scripts/check.sh`, commit the release changes, and push
-   the commit.
+4. Install the pinned notice generator if needed, refresh the dependency notice,
+   and run all checks:
+
+   ```bash
+   cargo install cargo-about --version 0.9.1 --locked --features cli
+   cargo about generate --workspace --locked --fail \
+     --output-file THIRD_PARTY_LICENSES.html about.hbs
+   npm ci
+   ./scripts/check.sh
+   ```
+
+   Commit the release changes and push the commit.
 5. Tag that commit with the application version and push the tag:
 
    ```bash
@@ -63,30 +73,31 @@ Developer ID signing/notarization and Windows Authenticode signing.
    ```
 
 The tag must be `v` followed by the exact configured application version. The
-tag push starts `.github/workflows/release.yml`; no separate release command is
-needed.
+tag push starts `.github/workflows/release.yml`. When the draft is ready,
+download and launch every native package on its target operating system, verify
+`SHA256SUMS` and the GitHub provenance attestation, exercise install, workspace
+discovery, integration setup/removal, and the updater check, then publish the
+draft manually. Do not publish if any package or signing check fails.
 
 ## Platforms and downloads
 
 | Platform | Build | Download |
 | --- | --- | --- |
-| Linux x86-64 | Built on Ubuntu 22.04 | Use `VSParallel_<version>_amd64.deb` on Debian or Ubuntu. Use `VSParallel_<version>_amd64.AppImage` on other compatible distributions. |
+| Linux x86-64 | Built on Ubuntu 22.04 | Use `VSParallel_<version>_amd64.deb` on Debian or Ubuntu. |
 | macOS 12.3+ | Universal (Apple silicon and Intel) | Use `VSParallel_<version>_universal.dmg`. |
 | Windows | x86-64 | Use the `VSParallel_<version>_x64-setup.exe` NSIS installer. |
 | VS Code-compatible editors 1.85+ | Platform independent | `vsparallel-companion-<companion-version>.vsix` is the optional standalone companion for VS Code, Cursor, and Antigravity IDE. Most users should install it from VSParallel instead. |
 
-An AppImage downloaded through a browser may need to be made executable with
-`chmod +x VSParallel_*.AppImage` before it can be launched.
-
 ## In-app updater assets
 
-The release also contains updater-compatible `.deb`, `.AppImage`, universal
+The release also contains updater-compatible `.deb`, universal
 macOS `.app.tar.gz`, and NSIS assets, each with a Tauri `.sig` sidecar, plus
-`latest.json`. The manifest uses installer-aware Tauri 2.10+ platform keys so
-Debian installations keep using Debian packages, AppImage installations keep
-using AppImages, and the universal macOS archive serves both Apple silicon and
-Intel clients. It embeds each `.sig` file's content and points downloads at the
-tagged GitHub Release.
+`latest.json` and `SHA256SUMS`. GitHub records a signed build-provenance
+attestation for every file listed in the checksum manifest. The updater manifest
+uses installer-aware Tauri 2.10+ platform keys so Debian installations keep
+using Debian packages and the universal macOS archive serves both Apple silicon
+and Intel clients. It embeds each `.sig` file's content and points downloads at
+the tagged GitHub Release.
 
 The configured endpoint is:
 
@@ -106,11 +117,14 @@ an installed signed release and a second, strictly newer SemVer release.
   **System Settings > Privacy & Security**.
 - The Windows installer is not code signed, so Microsoft Defender SmartScreen
   may show an unknown-publisher warning.
-- The Debian package, AppImage, and VSIX are not signed in their native package
-  formats, and separate release checksums are not currently generated. Tauri
-  `.sig` sidecars authenticate updater downloads only; they do not replace
-  notarization, platform code signing, or package-manager signing.
+- The Debian package and VSIX are not signed in their native package
+  formats. Release checksums and GitHub build-provenance attestations provide
+  verification data, while Tauri `.sig` sidecars authenticate updater downloads;
+  none of these replaces notarization, platform code signing, or package-manager
+  signing.
 - Linux and Windows packages are x86-64 only. macOS uses one universal package.
+- AppImage publication is intentionally disabled until the final native-library
+  payload has automated license, notice, and corresponding-source coverage.
 
 Native jobs and standard Tauri configuration are kept separate, so production
 macOS notarization and Windows code signing can be added later without changing

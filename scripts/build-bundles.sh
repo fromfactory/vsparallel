@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-VSPARALLEL_REPOSITORY_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+VSPARALLEL_REPOSITORY_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$VSPARALLEL_REPOSITORY_DIR"
 
 # Host bundle tools must not load GTK/GIO modules injected by VS Code's Snap.

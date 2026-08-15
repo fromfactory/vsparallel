@@ -44,14 +44,10 @@ def platform_entry(repository: str, tag: str, artifact: Path) -> dict[str, str]:
 def main() -> None:
     args = parse_args()
     version = args.tag.removeprefix("v")
-    if not re.fullmatch(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?", version):
-        raise SystemExit(f"release tag is not a supported semantic version: {args.tag}")
+    stable_identifier = r"(?:0|[1-9]\d*)"
+    if not re.fullmatch(rf"{stable_identifier}(?:\.{stable_identifier}){{2}}", version):
+        raise SystemExit(f"release tag is not a stable semantic version: {args.tag}")
 
-    appimage = platform_entry(
-        args.repository,
-        args.tag,
-        one_asset(args.assets, "*.AppImage"),
-    )
     deb = platform_entry(args.repository, args.tag, one_asset(args.assets, "*.deb"))
     macos = platform_entry(
         args.repository,
@@ -68,14 +64,12 @@ def main() -> None:
         "version": version,
         "notes": "See the GitHub Release for release notes.",
         "platforms": {
-            "linux-x86_64-appimage": appimage,
             "linux-x86_64-deb": deb,
             "windows-x86_64-nsis": nsis,
             "darwin-aarch64-app": macos,
             "darwin-x86_64-app": macos,
-            # Generic keys retain compatibility with updater clients that do not report
-            # their installer type. Installer-aware clients prefer the entries above.
-            "linux-x86_64": appimage,
+            # Generic keys retain compatibility where their fallback package format is
+            # safe. Untyped Linux clients default to AppImage and must not receive a .deb.
             "windows-x86_64": nsis,
             "darwin-aarch64": macos,
             "darwin-x86_64": macos,

@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-REPOSITORY_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+REPOSITORY_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 INSTALL_PREFIX=${VSPARALLEL_INSTALL_PREFIX:-"${HOME}/.local"}
 
 cd "$REPOSITORY_DIR"
@@ -21,8 +21,14 @@ install -d \
   "$INSTALL_PREFIX/share/icons/hicolor/64x64/apps" \
   "$INSTALL_PREFIX/share/icons/hicolor/128x128/apps" \
   "$INSTALL_PREFIX/share/icons/hicolor/256x256/apps" \
-  "$INSTALL_PREFIX/share/icons/hicolor/512x512/apps"
+  "$INSTALL_PREFIX/share/icons/hicolor/512x512/apps" \
+  "$INSTALL_PREFIX/share/doc/vsparallel"
 install -m 0755 target/release/vsparallel "$INSTALL_PREFIX/bin/vsparallel"
+install -m 0644 \
+  LICENSE \
+  PRIVACY.md \
+  THIRD_PARTY_LICENSES.html \
+  "$INSTALL_PREFIX/share/doc/vsparallel/"
 install -m 0644 \
   src-tauri/icons/16x16.png \
   "$INSTALL_PREFIX/share/icons/hicolor/16x16/apps/app.vsparallel.png"

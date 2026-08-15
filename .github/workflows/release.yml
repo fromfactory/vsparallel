@@ -20,9 +20,10 @@ jobs:
   validate:
     name: Validate release
     runs-on: ubuntu-22.04
+    timeout-minutes: 30
     steps:
       - name: Check out source
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Verify tag and application versions
         shell: bash
@@ -39,13 +40,17 @@ jobs:
             echo "::error::src-tauri/Cargo.toml ($cargo_version) and tauri.conf.json ($config_version) disagree"
             exit 1
           fi
+          if [[ ! "$config_version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "::error::The stable release workflow does not publish prerelease or build-metadata versions"
+            exit 1
+          fi
           if [[ -z "$updater_pubkey" ]]; then
             echo "::error::Configure plugins.updater.pubkey before creating the first release"
             exit 1
           fi
 
       - name: Install Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: "24"
 
@@ -53,7 +58,16 @@ jobs:
         run: npm ci
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.97.1
+          components: clippy, rustfmt
+
+      - name: Install pinned license-notice generator
+        run: cargo install cargo-about --version 0.9.1 --locked --features cli
+
+      - name: Install pinned Rust advisory scanner
+        run: cargo install cargo-audit --version 0.22.2 --locked
 
       - name: Install Linux dependencies
         run: |
@@ -63,16 +77,23 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev \
             patchelf \
+            shellcheck \
             xdg-utils
 
       - name: Run repository checks
         run: ./scripts/check.sh
 
+      - name: Audit locked dependencies
+        run: |
+          cargo audit
+          npm audit --audit-level=high
+          npm --prefix website audit --audit-level=high
+
       - name: Package VS Code companion
         run: python3 companion/package_vsix.py
 
       - name: Stage companion package
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: release-companion
           path: dist/*.vsix
@@ -96,12 +117,13 @@ jobs:
             os: windows-latest
             artifact: windows-x86_64
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     steps:
       - name: Check out source
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Install Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: "24"
 
@@ -109,7 +131,9 @@ jobs:
         run: npm ci
 
       - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.97.1
 
       - name: Add macOS Rust targets
         if: runner.os == 'macOS'
@@ -124,14 +148,33 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev \
             patchelf \
+            shellcheck \
             xdg-utils
+
+      - name: Run native Rust tests
+        if: runner.os != 'Linux'
+        shell: bash
+        run: |
+          npm run build:ui
+          cargo test --workspace --locked
 
       - name: Install pinned Tauri CLI
         shell: bash
         run: cargo install tauri-cli --version "$TAURI_CLI_VERSION" --locked
 
-      - name: Build release packages
-        if: runner.os != 'macOS'
+      - name: Build Linux release package
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -o pipefail
+          ./scripts/build-bundles.sh --config src-tauri/tauri.release.conf.json --bundles deb \
+            2>&1 | tee "$RUNNER_TEMP/tauri-build.log"
+
+      - name: Build Windows release package
+        if: runner.os == 'Windows'
         shell: bash
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -170,8 +213,6 @@ jobs:
           mkdir -p dist/release
           cp target/release/bundle/deb/*.deb dist/release/
           cp target/release/bundle/deb/*.deb.sig dist/release/
-          cp target/release/bundle/appimage/*.AppImage dist/release/
-          cp target/release/bundle/appimage/*.AppImage.sig dist/release/
 
       - name: Collect macOS package
         if: runner.os == 'macOS'
@@ -191,7 +232,7 @@ jobs:
           cp target/release/bundle/nsis/*-setup.exe.sig dist/release/
 
       - name: Stage release packages
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: release-${{ matrix.artifact }}
           path: dist/release/*
@@ -199,19 +240,23 @@ jobs:
           overwrite: true
 
   publish:
-    name: Publish GitHub Release
+    name: Prepare draft GitHub Release
     needs:
       - validate
       - build
     runs-on: ubuntu-22.04
+    timeout-minutes: 15
     permissions:
       contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
     steps:
       - name: Check out source
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Download release packages
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           pattern: release-*
           path: release-assets
@@ -226,20 +271,30 @@ jobs:
             --tag "$GITHUB_REF_NAME" \
             --output release-assets/latest.json
 
+      - name: Create release checksums
+        shell: bash
+        run: |
+          cd release-assets
+          sha256sum -- * > SHA256SUMS
+
       - name: Verify release packages
         shell: bash
         run: |
           for pattern in \
             '*.deb' '*.deb.sig' \
-            '*.AppImage' '*.AppImage.sig' \
             '*.dmg' '*.app.tar.gz' '*.app.tar.gz.sig' \
             '*-setup.exe' '*-setup.exe.sig' \
-            '*.vsix' 'latest.json'; do
+            '*.vsix' 'latest.json' 'SHA256SUMS'; do
             if ! compgen -G "release-assets/$pattern" > /dev/null; then
               echo "::error::Missing release asset matching $pattern"
               exit 1
             fi
           done
+
+      - name: Attest release provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-checksums: release-assets/SHA256SUMS
 
       - name: Create or update GitHub Release
         env:
@@ -251,8 +306,8 @@ jobs:
             --json isDraft \
             --jq .isDraft 2> /dev/null); then
             if [[ "$release_is_draft" == "false" ]]; then
-              echo "Release $GITHUB_REF_NAME is already published; leaving it unchanged."
-              exit 0
+              echo "::error::Release $GITHUB_REF_NAME is already published; use a new version and tag"
+              exit 1
             fi
             if [[ "$release_is_draft" != "true" ]]; then
               echo "::error::Unexpected draft state: $release_is_draft"
@@ -268,9 +323,37 @@ jobs:
               --notes "These initial packages are not production code signed or notarized. macOS Gatekeeper and Windows SmartScreen warnings are expected; see docs/releases.md for details."
           fi
 
+          # A rerun must not retain obsolete assets from an earlier draft.
+          gh release view "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json assets \
+            --jq '.assets[].name' > "$RUNNER_TEMP/existing-release-assets"
+          while IFS= read -r asset_name; do
+            if [[ -n "$asset_name" ]]; then
+              gh release delete-asset "$GITHUB_REF_NAME" "$asset_name" \
+                --repo "$GITHUB_REPOSITORY" \
+                --yes
+            fi
+          done < "$RUNNER_TEMP/existing-release-assets"
+
           gh release upload "$GITHUB_REF_NAME" release-assets/* \
             --repo "$GITHUB_REPOSITORY" \
             --clobber
-          gh release edit "$GITHUB_REF_NAME" \
+
+          find release-assets -maxdepth 1 -type f -printf '%f\n' \
+            | LC_ALL=C sort > "$RUNNER_TEMP/expected-release-assets"
+          gh release view "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
-            --draft=false
+            --json assets \
+            --jq '.assets[].name' \
+            | LC_ALL=C sort > "$RUNNER_TEMP/actual-release-assets"
+          if ! cmp -s \
+            "$RUNNER_TEMP/expected-release-assets" \
+            "$RUNNER_TEMP/actual-release-assets"; then
+            echo "::error::Draft release assets do not exactly match the verified build output"
+            diff -u \
+              "$RUNNER_TEMP/expected-release-assets" \
+              "$RUNNER_TEMP/actual-release-assets" || true
+            exit 1
+          fi
+          echo "Draft release $GITHUB_REF_NAME is ready for package smoke tests and manual publication."

@@ -133,6 +133,7 @@ test("the production frontend contains only explicit runtime assets", () => {
   assert.deepEqual(config.bundle.resources, {
     "../LICENSE": "LICENSE",
     "../PRIVACY.md": "PRIVACY.md",
+    "../THIRD_PARTY_LICENSES.html": "THIRD_PARTY_LICENSES.html",
   });
 });
 

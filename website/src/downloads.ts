@@ -4,7 +4,6 @@ const LATEST_RELEASE_API_URL =
 const INSTALLER_KINDS = [
   "macos-dmg",
   "windows-installer",
-  "linux-appimage",
   "linux-deb",
 ] as const;
 
@@ -45,10 +44,6 @@ const DOWNLOAD_SPECS: Record<InstallerKind, DownloadSpec> = {
     label: "Download installer",
     ariaLabel: "Download VSParallel for Windows",
   },
-  "linux-appimage": {
-    label: "Download AppImage",
-    ariaLabel: "Download the VSParallel AppImage for Linux",
-  },
   "linux-deb": {
     label: "Download DEB",
     ariaLabel: "Download the VSParallel Debian package for Linux",
@@ -58,7 +53,7 @@ const DOWNLOAD_SPECS: Record<InstallerKind, DownloadSpec> = {
 const PREFERRED_DOWNLOADS: Record<DesktopPlatform, InstallerKind[]> = {
   macos: ["macos-dmg"],
   windows: ["windows-installer"],
-  linux: ["linux-appimage", "linux-deb"],
+  linux: ["linux-deb"],
 };
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -174,12 +169,6 @@ export const resolveInstallerAssets = (assets: ReleaseAsset[]): InstallerAssets 
       (/-setup\.exe$/i.test(name) ? 6 : /installer[^/]*\.exe$/i.test(name) ? 4 : 2),
   );
 
-  const linuxAppImage = selectBestAsset(
-    assets,
-    (name) => hasProjectName(name) && !isArm(name) && /\.appimage$/i.test(name),
-    (name) => (isX64(name) ? 5 : 0),
-  );
-
   const linuxDeb = selectBestAsset(
     assets,
     (name) => hasProjectName(name) && !isArm(name) && /\.deb$/i.test(name),
@@ -189,7 +178,6 @@ export const resolveInstallerAssets = (assets: ReleaseAsset[]): InstallerAssets 
   return {
     ...(macosDmg ? { "macos-dmg": macosDmg } : {}),
     ...(windowsInstaller ? { "windows-installer": windowsInstaller } : {}),
-    ...(linuxAppImage ? { "linux-appimage": linuxAppImage } : {}),
     ...(linuxDeb ? { "linux-deb": linuxDeb } : {}),
   };
 };

@@ -320,7 +320,7 @@ pub(crate) fn setup(app: &mut App) -> Result<(), String> {
     let menu =
         Menu::new(app).map_err(|error| format!("could not create the tray menu: {error}"))?;
     let controller = TrayMenuController::new(menu.clone());
-    controller.apply_update(app.handle(), load_update())?;
+    controller.apply_update(app.handle(), load_update(app.handle()))?;
     app.manage(controller);
 
     let icon_variant = TrayIconVariant::current();
@@ -378,15 +378,15 @@ impl TrayMenuController {
     }
 }
 
-fn load_update() -> TrayUpdate {
-    match crate::current_snapshot() {
+fn load_update(app: &AppHandle) -> TrayUpdate {
+    match crate::current_snapshot(&app.state::<crate::SnapshotCache>(), false) {
         Ok(snapshot) => TrayUpdate::Entries(tray_workspace_entries(&snapshot)),
         Err(_) => TrayUpdate::Failed,
     }
 }
 
 fn schedule_refresh(app: &AppHandle) {
-    let update = load_update();
+    let update = load_update(app);
     let app_handle = app.clone();
     let _ = app.run_on_main_thread(move || {
         let controller = app_handle.state::<TrayMenuController>();

@@ -129,8 +129,12 @@ test("only explicit dashboard refreshes animate the titlebar control", () => {
     "dashboard refresh coordinator",
   );
   assert.match(refreshAll, /state\.manualRefreshPending = true/);
-  assert.match(refreshAll, /await Promise\.allSettled\(\[refreshSnapshot\(\), refreshUsage\(\)\]\)/);
+  assert.match(refreshAll, /await Promise\.allSettled\(\[refreshSnapshot\(manual\), refreshUsage\(\)\]\)/);
   assert.match(refreshAll, /finally[\s\S]*state\.manualRefreshPending = false/);
+  assert.match(
+    javascript,
+    /invoke\("get_snapshot", \{ force: forceAfterPending \}\)/,
+  );
   assert.match(
     javascript,
     /refreshButton\.addEventListener\("click",\s*\(\) => \{\s*void refreshAll\(true\)/,
@@ -1518,7 +1522,7 @@ test("Cursor bridge status is closed, bounded, and rendered independently", () =
   assert.match(setter, /const status = normalizeCursorAgentsBridgeStatus\(raw\)/);
   assert.match(setter, /renderCursorAgentsBridgeStatus\(status\)/);
   assert.match(setter, /status\.enabled/);
-  assert.match(setter, /await refreshSnapshot\(\)/);
+  assert.match(setter, /await refreshSnapshot\(true\)/);
   assert.match(setter, /renderCursorAgentsBridgeStatus\(previous\)/);
 
   const refreshSetup = sliceBetween(
@@ -1819,7 +1823,7 @@ test("settings keep integration summaries compact and expose details through acc
     "uninstall-all action",
   );
   const uninstallRefreshes = uninstallAll.match(
-    /Promise\.all\(\[[\s\S]*?refreshSnapshot\(\),[\s\S]*?refreshUsage\(true\),[\s\S]*?refreshCursorAgentsBridgeStatus\(\),?[\s\S]*?\]\)/g,
+    /Promise\.all\(\[[\s\S]*?refreshSnapshot\(true\),[\s\S]*?refreshUsage\(true\),[\s\S]*?refreshCursorAgentsBridgeStatus\(\),?[\s\S]*?\]\)/g,
   ) ?? [];
   assert.equal(
     uninstallRefreshes.length,
@@ -1828,7 +1832,7 @@ test("settings keep integration summaries compact and expose details through acc
   );
   assert.match(
     uninstallAll,
-    /catch \(error\)[\s\S]*?setIntegrationMessage\(message, "error"\);[\s\S]*?Promise\.all\(\[[\s\S]*?refreshSnapshot\(\),[\s\S]*?refreshUsage\(true\),[\s\S]*?refreshCursorAgentsBridgeStatus\(\),?[\s\S]*?\]\)/,
+    /catch \(error\)[\s\S]*?setIntegrationMessage\(message, "error"\);[\s\S]*?Promise\.all\(\[[\s\S]*?refreshSnapshot\(true\),[\s\S]*?refreshUsage\(true\),[\s\S]*?refreshCursorAgentsBridgeStatus\(\),?[\s\S]*?\]\)/,
   );
   const individualUninstall = sliceBetween(
     javascript,
@@ -1838,7 +1842,7 @@ test("settings keep integration summaries compact and expose details through acc
   );
   assert.equal(
     individualUninstall.match(
-      /operation === "uninstall"[\s\S]*?Promise\.all\(\[refreshSnapshot\(\), refreshUsage\(true\)\]\)/g,
+      /operation === "uninstall"[\s\S]*?Promise\.all\(\[refreshSnapshot\(true\), refreshUsage\(true\)\]\)/g,
     )?.length,
     2,
     "both successful and partial/error individual uninstalls should force a fresh usage snapshot",

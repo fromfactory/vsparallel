@@ -57,7 +57,7 @@ Download the latest package from [GitHub Releases](https://github.com/fromfactor
 
 | Platform | Package |
 | --- | --- |
-| Linux x86-64 | Debian package for Debian/Ubuntu, or AppImage |
+| Linux x86-64 | Debian package for Debian/Ubuntu |
 | macOS 12.3+ | Universal DMG for Apple silicon and Intel |
 | Windows x86-64 | NSIS installer |
 
@@ -175,8 +175,10 @@ every companion or hook. Zed has its own data root and uses
 
 Prerequisites:
 
-- Rust stable with Cargo
+- Rust 1.97.1 with Cargo (the repository toolchain file selects it automatically)
 - Node.js 24 with npm
+- `cargo-about` 0.9.1 with its `cli` feature (for license verification)
+- ShellCheck (for release and installation script validation)
 - [Tauri 2 platform prerequisites](https://v2.tauri.app/start/prerequisites/)
 - VS Code 1.85 or newer for companion development
 
@@ -229,10 +231,13 @@ For a local Linux developer installation, run:
 - [Privacy and local data](PRIVACY.md)
 - [Metadata protocol](docs/protocol.md)
 - [Release and download guide](docs/releases.md)
+- [Security policy](SECURITY.md)
 - [Companion extension](companion/README.md)
 - [Codex integration](integrations/codex/README.md)
 - [Claude Code integration](integrations/claude/README.md)
 
 ## License
 
-VSParallel is available under the [MIT License](LICENSE).
+VSParallel is available under the [MIT License](LICENSE). Licenses and source
+links for the packaged Rust dependencies are included in
+[Third-party licenses](THIRD_PARTY_LICENSES.html).
