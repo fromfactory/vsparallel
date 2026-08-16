@@ -88,6 +88,7 @@ const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_THREAD_DATABASE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_THREAD_BLOB_BYTES: usize = 8 * 1024 * 1024;
 const MAX_MODEL_ROWS_PER_REFRESH: usize = 4;
+const MAX_USAGE_CANDIDATE_ROWS_PER_REFRESH: usize = 32;
 const MAX_MODEL_DECOMPRESSED_BYTES_PER_REFRESH: usize = 16 * 1024 * 1024;
 #[cfg(target_os = "linux")]
 const MAX_PROCESS_ENTRIES: usize = 65_536;
@@ -362,9 +363,14 @@ fn load_zed_usage_from_data_roots(
         },
     );
 
-    // The blob-read limit is global, so choose candidates globally before any
-    // channel can consume the four-row budget merely because it sorts first.
-    let mut budget = ModelReadBudget::default();
+    // Usage may need to pass recent empty drafts before reaching the newest
+    // thread with cumulative counters. Keep that search separately bounded
+    // from workspace-model enrichment while retaining the same global decoded
+    // byte ceiling.
+    let mut budget = ModelReadBudget {
+        rows_remaining: MAX_USAGE_CANDIDATE_ROWS_PER_REFRESH,
+        ..ModelReadBudget::default()
+    };
     let mut newest = None;
     for ((thread_database, join_id), sidebar_updated_at_ms) in candidates {
         if budget.rows_remaining == 0 || budget.decompressed_bytes_remaining == 0 {
@@ -1059,7 +1065,7 @@ fn read_native_thread_join_ids(
         .query(rusqlite::params![
             MAX_THREAD_JOIN_ID_BYTES as i64,
             MAX_TIMESTAMP_BYTES as i64,
-            MAX_MODEL_ROWS_PER_REFRESH as i64,
+            MAX_USAGE_CANDIDATE_ROWS_PER_REFRESH as i64,
         ])
         .map_err(|error| format!("could not query Zed native usage metadata: {error}"))?;
     let mut newest_by_join_id = BTreeMap::new();
@@ -2934,6 +2940,75 @@ mod tests {
         assert!(!serialized.contains("totalTokens"));
         assert!(!serialized.contains(private_content));
         assert!(!serialized.contains("private-request-id"));
+    }
+
+    #[test]
+    fn cumulative_usage_skips_recent_empty_drafts_before_valid_thread() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = create_channel_database(temp.path(), "0-stable");
+        let workspace = temp.path().join("project");
+        let (paths, order) = encoded_paths(&[workspace.as_path()]);
+
+        insert_thread(
+            &database,
+            ThreadFixture {
+                id: 1,
+                paths: &paths,
+                order: &order,
+                agent_id: None,
+                updated_at: "2026-01-02 05:00:00",
+                archived: false,
+                remote: None,
+                title: "private valid title",
+                session: "valid-usage",
+                main_paths: None,
+                main_order: None,
+            },
+        );
+        for index in 1..=MAX_MODEL_ROWS_PER_REFRESH {
+            let session = format!("empty-draft-{index}");
+            let updated_at = format!("2026-01-02 05:00:{index:02}");
+            insert_thread(
+                &database,
+                ThreadFixture {
+                    id: (index + 1) as u8,
+                    paths: &paths,
+                    order: &order,
+                    agent_id: None,
+                    updated_at: &updated_at,
+                    archived: false,
+                    remote: None,
+                    title: "private empty title",
+                    session: &session,
+                    main_paths: None,
+                    main_order: None,
+                },
+            );
+        }
+
+        let threads = create_threads_database(temp.path());
+        let body = serde_json::to_vec(&serde_json::json!({
+            "cumulative_token_usage": {
+                "input_tokens": 125,
+                "output_tokens": 25
+            }
+        }))
+        .unwrap();
+        insert_thread_blob_at(
+            &threads,
+            "valid-usage",
+            "2026-01-02T05:00:00Z",
+            "json",
+            &body,
+        );
+
+        assert_eq!(
+            load_zed_usage_from_data_roots(&[temp.path().to_path_buf()], NOW_MS),
+            Some(ZedUsageObservation {
+                total_tokens: 150,
+                updated_at_ms: 1_767_330_000_000,
+            })
+        );
     }
 
     #[test]

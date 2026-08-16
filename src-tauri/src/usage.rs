@@ -198,12 +198,22 @@ pub fn codex_command() -> ProviderCommand {
 
 /// Resolve the Claude Code executable without splitting or interpreting shell syntax.
 pub fn claude_command() -> ProviderCommand {
-    claude_command_from(env::var_os("VSPARALLEL_CLAUDE_COMMAND"))
+    automatic_provider_command_from(
+        env::var_os("VSPARALLEL_CLAUDE_COMMAND"),
+        "claude",
+        env::consts::OS,
+        platform_home_directory().as_deref(),
+    )
 }
 
 /// Resolve the official Antigravity CLI without interpreting shell syntax.
 pub fn antigravity_command() -> ProviderCommand {
-    provider_command_from(env::var_os("VSPARALLEL_ANTIGRAVITY_COMMAND"), "agy")
+    automatic_provider_command_from(
+        env::var_os("VSPARALLEL_ANTIGRAVITY_COMMAND"),
+        "agy",
+        env::consts::OS,
+        platform_home_directory().as_deref(),
+    )
 }
 
 /// Collect a fresh snapshot using the current clock and environment.
@@ -512,15 +522,12 @@ pub(crate) fn codex_app_server_request_resolved(
 
 impl ClaudeUsageRunner for ProcessClaudeUsageRunner {
     fn read_rate_limits(&self, executable: &OsStr) -> Result<Value, String> {
-        let result = if self.allow_extension_fallback {
-            claude_request_with_extension_fallback(
-                executable,
-                claude_control_usage_request,
-                cached_claude_extension_executable,
-            )
-        } else {
-            claude_control_usage_request(executable)
-        };
+        let result = claude_request_with_extension_fallback(
+            executable,
+            self.allow_extension_fallback,
+            claude_control_usage_request,
+            cached_claude_extension_executable,
+        );
         result.map_err(|error| tag_provider_failure(error, self.allow_extension_fallback))
     }
 }
@@ -730,10 +737,11 @@ fn tag_provider_failure(error: String, automatic: bool) -> String {
 
 fn claude_request_with_extension_fallback(
     executable: &OsStr,
+    allow_extension_fallback: bool,
     mut request: impl FnMut(&OsStr) -> Result<Value, String>,
     mut bundled_executable: impl FnMut(bool) -> Option<PathBuf>,
 ) -> Result<Value, String> {
-    if executable != OsStr::new("claude") {
+    if !allow_extension_fallback {
         return request(executable);
     }
     if let Some(bundled) = bundled_executable(false) {
@@ -1936,18 +1944,76 @@ fn codex_command_from(value: Option<OsString>) -> ProviderCommand {
     provider_command_from(value, "codex")
 }
 
+#[cfg(test)]
 fn claude_command_from(value: Option<OsString>) -> ProviderCommand {
     provider_command_from(value, "claude")
 }
 
-fn provider_command_from(value: Option<OsString>, default: &str) -> ProviderCommand {
+fn automatic_provider_command_from(
+    value: Option<OsString>,
+    default: &str,
+    platform: &str,
+    home: Option<&Path>,
+) -> ProviderCommand {
+    provider_command_from(
+        value,
+        automatic_provider_executable_from(default, platform, home),
+    )
+}
+
+fn automatic_provider_executable_from(
+    default: &str,
+    platform: &str,
+    home: Option<&Path>,
+) -> OsString {
+    if platform != "macos" {
+        return OsString::from(default);
+    }
+
+    // Apps opened through Finder/LaunchServices do not inherit an interactive
+    // shell's PATH. Both native installers place their launchers in this
+    // per-user directory, so resolve it directly without invoking a shell or
+    // reading startup files. Conventional package-manager locations cover
+    // installations that intentionally did not use the native installer.
+    let mut candidates = Vec::with_capacity(3);
+    if let Some(home) = home.filter(|path| path.is_absolute()) {
+        candidates.push(home.join(".local").join("bin").join(default));
+    }
+    candidates.push(PathBuf::from("/opt/homebrew/bin").join(default));
+    candidates.push(PathBuf::from("/usr/local/bin").join(default));
+
+    candidates
+        .into_iter()
+        .find(|candidate| provider_executable_is_usable(candidate))
+        .map(PathBuf::into_os_string)
+        .unwrap_or_else(|| OsString::from(default))
+}
+
+fn provider_executable_is_usable(path: &Path) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn provider_command_from(value: Option<OsString>, default: impl Into<OsString>) -> ProviderCommand {
     match value.filter(|command| !command.is_empty()) {
         Some(executable) => ProviderCommand {
             executable,
             allow_extension_fallback: false,
         },
         None => ProviderCommand {
-            executable: OsString::from(default),
+            executable: default.into(),
             allow_extension_fallback: true,
         },
     }
@@ -3499,6 +3565,47 @@ mod tests {
     }
 
     #[test]
+    fn macos_automatic_provider_commands_find_native_user_installations() {
+        let temp = TempDir::new().unwrap();
+        let home = temp.path().join("Home With Spaces");
+        let local_bin = home.join(".local").join("bin");
+        fs::create_dir_all(&local_bin).unwrap();
+
+        for command_name in ["claude", "agy"] {
+            let executable = local_bin.join(command_name);
+            fs::write(&executable, b"test executable").unwrap();
+            #[cfg(unix)]
+            {
+                let mut permissions = fs::metadata(&executable).unwrap().permissions();
+                permissions.set_mode(0o700);
+                fs::set_permissions(&executable, permissions).unwrap();
+            }
+
+            let automatic =
+                automatic_provider_command_from(None, command_name, "macos", Some(home.as_path()));
+            assert_eq!(automatic.executable, executable.into_os_string());
+            assert!(automatic.allow_extension_fallback);
+        }
+
+        let configured = automatic_provider_command_from(
+            Some(OsString::from("/Applications/Claude Preview/claude")),
+            "claude",
+            "macos",
+            Some(home.as_path()),
+        );
+        assert_eq!(
+            configured.executable,
+            OsString::from("/Applications/Claude Preview/claude")
+        );
+        assert!(!configured.allow_extension_fallback);
+
+        assert_eq!(
+            automatic_provider_executable_from("claude", "linux", Some(home.as_path())),
+            OsString::from("claude")
+        );
+    }
+
+    #[test]
     fn default_codex_command_retries_bundled_extension_but_nondefault_is_literal() {
         let bundled = PathBuf::from("/test/extensions/openai.chatgpt/bin/codex");
         let mut requests = Vec::new();
@@ -3562,6 +3669,7 @@ mod tests {
         let mut requests = Vec::new();
         let result = claude_request_with_extension_fallback(
             OsStr::new("claude"),
+            true,
             |executable| {
                 requests.push(executable.to_owned());
                 if executable == bundled.as_os_str() {
@@ -3581,6 +3689,7 @@ mod tests {
 
         let error = claude_request_with_extension_fallback(
             OsStr::new("claude"),
+            true,
             |executable| {
                 if executable == OsStr::new("claude") {
                     Err("not on the desktop PATH".to_string())
@@ -3597,6 +3706,7 @@ mod tests {
         let mut override_requests = Vec::new();
         let override_result = claude_request_with_extension_fallback(
             override_path,
+            false,
             |executable| {
                 override_requests.push(executable.to_owned());
                 Err("configured command failed".to_string())
@@ -3605,6 +3715,34 @@ mod tests {
         );
         assert!(override_result.is_err());
         assert_eq!(override_requests, [override_path.to_owned()]);
+    }
+
+    #[test]
+    fn auto_resolved_claude_path_keeps_extension_fallback() {
+        let native = PathBuf::from("/Users/test/.local/bin/claude");
+        let bundled = PathBuf::from("/test/extensions/anthropic.claude-code/claude");
+        let mut requests = Vec::new();
+
+        let result = claude_request_with_extension_fallback(
+            native.as_os_str(),
+            true,
+            |executable| {
+                requests.push(executable.to_owned());
+                if executable == bundled.as_os_str() {
+                    Ok(json!({"limits": {}}))
+                } else {
+                    Err("native Claude could not start".to_string())
+                }
+            },
+            |allow_lookup| allow_lookup.then(|| bundled.clone()),
+        )
+        .unwrap();
+
+        assert!(result["limits"].is_object());
+        assert_eq!(
+            requests,
+            [native.into_os_string(), bundled.into_os_string()]
+        );
     }
 
     #[test]
