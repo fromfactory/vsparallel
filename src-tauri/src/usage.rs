@@ -802,17 +802,46 @@ fn cached_provider_extension_executable(
 }
 
 fn locate_codex_extension_executable() -> Option<PathBuf> {
-    choose_newest_extension_executable(
-        locate_codex_extension_with_cli(),
-        locate_codex_extension_from_registry(),
+    locate_provider_extension_executable(
+        automatic_extension_cli_lookup_enabled_for_platform(env::consts::OS),
+        locate_codex_extension_with_cli,
+        locate_codex_extension_from_registry,
     )
 }
 
 fn locate_claude_extension_executable() -> Option<PathBuf> {
-    choose_newest_extension_executable(
-        locate_claude_extension_with_cli(),
-        locate_claude_extension_from_registry(),
+    locate_provider_extension_executable(
+        automatic_extension_cli_lookup_enabled_for_platform(env::consts::OS),
+        locate_claude_extension_with_cli,
+        locate_claude_extension_from_registry,
     )
+}
+
+fn automatic_extension_cli_lookup_enabled_for_platform(platform: &str) -> bool {
+    // The bundled launchers for VS Code-compatible macOS applications are shell
+    // scripts that start the application's Electron binary as a short-lived Node
+    // process. Some editor builds can abort that helper during teardown and make
+    // macOS present a native crash report even though VSParallel only requested
+    // extension metadata. The bounded local registries below contain the same
+    // installed-extension location needed by this automatic fallback, so avoid
+    // starting those editor-owned helpers on macOS.
+    platform != "macos"
+}
+
+fn locate_provider_extension_executable<C, R>(
+    allow_cli_lookup: bool,
+    locate_with_cli: C,
+    locate_from_registry: R,
+) -> Option<PathBuf>
+where
+    C: FnOnce() -> Option<PathBuf>,
+    R: FnOnce() -> Option<PathBuf>,
+{
+    if allow_cli_lookup {
+        choose_newest_extension_executable(locate_with_cli(), locate_from_registry())
+    } else {
+        locate_from_registry()
+    }
 }
 
 fn choose_newest_extension_executable(
@@ -3677,6 +3706,40 @@ mod tests {
             choose_newest_extension_executable(Some(older), Some(newer.clone())),
             Some(newer)
         );
+    }
+
+    #[test]
+    fn automatic_provider_extension_cli_lookup_is_disabled_only_on_macos() {
+        assert!(!automatic_extension_cli_lookup_enabled_for_platform(
+            "macos"
+        ));
+        assert!(automatic_extension_cli_lookup_enabled_for_platform("linux"));
+        assert!(automatic_extension_cli_lookup_enabled_for_platform(
+            "windows"
+        ));
+    }
+
+    #[test]
+    fn registry_only_provider_discovery_does_not_invoke_the_editor_cli() {
+        let expected = PathBuf::from("/bounded/registry/provider");
+        let cli_called = std::cell::Cell::new(false);
+        let registry_called = std::cell::Cell::new(false);
+
+        let located = locate_provider_extension_executable(
+            false,
+            || {
+                cli_called.set(true);
+                Some(PathBuf::from("/unexpected/cli/provider"))
+            },
+            || {
+                registry_called.set(true);
+                Some(expected.clone())
+            },
+        );
+
+        assert_eq!(located, Some(expected));
+        assert!(!cli_called.get());
+        assert!(registry_called.get());
     }
 
     #[test]

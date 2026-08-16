@@ -107,9 +107,13 @@ from UI-supplied path or command data. `vscode` selects
 `VSPARALLEL_ANTIGRAVITY_IDE_COMMAND`. An active heartbeat asks that editor to
 prefer an existing exact-target window. A retained but inactive heartbeat uses
 `--new-window` for the exact target. The target must still be an existing local
-absolute path. Hook-only Cursor workspace, Cursor Agent, Antigravity 2.0, and
-Antigravity IDE rows never produce an open target. Experimental bridge-refined
-Cursor Agent rows are also non-openable.
+absolute path. On macOS, a standard launcher inside an application bundle is
+resolved to its native GUI executable and started through LaunchServices; this
+preserves the arguments and single-instance handoff without running the
+editor's short-lived Electron-as-Node CLI shim. Custom and non-bundle launchers
+are invoked literally. Hook-only Cursor workspace, Cursor Agent, Antigravity
+2.0, and Antigravity IDE rows never produce an open target. Experimental
+bridge-refined Cursor Agent rows are also non-openable.
 
 Zed targets never come from this heartbeat protocol. The native adapter
 validates a local path directly from Zed's read-only workspace database, and
@@ -888,11 +892,13 @@ reported as unavailable rather than replaced with inferred quota.
 otherwise `agy` is resolved from `PATH`. The override is invoked literally and
 does not enable shell syntax.
 
-For bundled-provider discovery, VSParallel first invokes the configured
+For bundled-provider discovery on Linux and Windows, VSParallel compares the
+supported extension-location result from the configured
 `VSPARALLEL_CODE_COMMAND`, `VSPARALLEL_CURSOR_COMMAND`, and
-`VSPARALLEL_ANTIGRAVITY_IDE_COMMAND` launchers with the supported
-extension-location argument. If that fails, it reads only
-the exact provider entries in these local registry files:
+`VSPARALLEL_ANTIGRAVITY_IDE_COMMAND` launchers with a bounded local-registry
+lookup. On macOS it uses only the registry lookup, avoiding short-lived
+Electron-as-Node editor helpers during automatic refresh. Only the exact
+provider entries in these files are read:
 
 - `~/.vscode/extensions/extensions.json`
 - `~/.vscode-insiders/extensions/extensions.json`
@@ -916,6 +922,14 @@ hooks remain separate optional rows. The opt-in Gemini usage hook has its own
 row because token capture is not required for workspace or lifecycle
 monitoring. Zed has no installable integration because its adapter is read-only
 and automatic.
+
+For standard, unprofiled macOS editor installations, setup status reads the
+same bounded extension registries instead of starting each editor CLI with
+`--list-extensions`. Automatic status is unavailable for an explicit editor
+command or profile override because its extension location or membership may
+differ; this avoids launching an editor helper during routine refresh. Explicit
+install and uninstall actions still use the editor's supported CLI and verify
+their result.
 
 The experimental Cursor Desktop Bridge remains a separate, default-off option.
 Core setup and per-editor uninstall do not change that preference. The global

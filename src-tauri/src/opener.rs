@@ -2,7 +2,7 @@ use serde::Serialize;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::io;
-#[cfg(any(test, target_os = "windows"))]
+#[cfg(any(test, target_os = "windows", target_os = "macos"))]
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -74,7 +74,8 @@ impl WorkspaceLauncher for ProcessWorkspaceLauncher {
         mode: WorkspaceLaunchMode,
         editor: Option<EditorKind>,
     ) -> io::Result<()> {
-        let mut child = Command::new(executable)
+        let mut command = workspace_launch_command(executable, editor);
+        let mut child = command
             .args(launch_arguments(editor, mode, targets))
             .spawn()?;
         thread::spawn(move || {
@@ -82,6 +83,76 @@ impl WorkspaceLauncher for ProcessWorkspaceLauncher {
         });
         Ok(())
     }
+}
+
+#[cfg(target_os = "macos")]
+fn workspace_launch_command(executable: &OsStr, editor: Option<EditorKind>) -> Command {
+    if let Some(gui_executable) = standard_macos_editor_gui_executable(executable, editor)
+        .filter(|candidate| candidate.is_file())
+    {
+        // The standard shell launchers run the bundle executable with
+        // ELECTRON_RUN_AS_NODE to execute the editor CLI. Opening a workspace
+        // does not need that short-lived Node process, and older Electron
+        // builds can abort while its ESM worker is shutting down. Ask Launch
+        // Services to start the bundle's normal GUI entry point instead.
+        return macos_gui_launch_command(&gui_executable);
+    }
+
+    Command::new(executable)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn workspace_launch_command(executable: &OsStr, _editor: Option<EditorKind>) -> Command {
+    Command::new(executable)
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn macos_gui_launch_command(gui_executable: &Path) -> Command {
+    let mut command = Command::new("/usr/bin/open");
+    command
+        // `-n` makes LaunchServices deliver these arguments even when another
+        // instance owns Electron's single-instance lock. Omitting `-g` lets
+        // the selected editor remain the final focus-affecting action.
+        .args(["-n", "-a"])
+        .arg(gui_executable)
+        .arg("--args")
+        // Preserve the caller's normal environment while ensuring neither
+        // `open` nor the editor bundle starts in Electron's Node mode.
+        .env_remove("ELECTRON_RUN_AS_NODE");
+    command
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn standard_macos_editor_gui_executable(
+    executable: &OsStr,
+    editor: Option<EditorKind>,
+) -> Option<PathBuf> {
+    let (cli_name, gui_name) = match editor {
+        Some(EditorKind::Cursor) => ("cursor", "Cursor"),
+        Some(EditorKind::AntigravityIde) => ("antigravity-ide", "Electron"),
+        Some(EditorKind::VsCode) | None => ("code", "Electron"),
+        Some(EditorKind::Antigravity2 | EditorKind::Zed) => return None,
+    };
+    let executable = Path::new(executable);
+    if executable.file_name()? != OsStr::new(cli_name) {
+        return None;
+    }
+
+    let bin = executable.parent()?;
+    let app_resources = bin.parent()?;
+    let resources = app_resources.parent()?;
+    let contents = resources.parent()?;
+    let app_bundle = contents.parent()?;
+    if bin.file_name()? != OsStr::new("bin")
+        || app_resources.file_name()? != OsStr::new("app")
+        || resources.file_name()? != OsStr::new("Resources")
+        || contents.file_name()? != OsStr::new("Contents")
+        || app_bundle.extension()? != OsStr::new("app")
+    {
+        return None;
+    }
+
+    Some(app_bundle.join("Contents").join("MacOS").join(gui_name))
 }
 
 fn launch_arguments(
@@ -778,6 +849,93 @@ mod tests {
         );
         assert_eq!(command_for_editor(None), Some(code_command()));
         assert_eq!(command_for_editor(Some(EditorKind::Antigravity2)), None);
+    }
+
+    #[test]
+    fn standard_macos_bundle_clis_resolve_to_gui_entry_points() {
+        let cases = [
+            (
+                Some(EditorKind::VsCode),
+                "/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code",
+                "/Applications/Visual Studio Code.app/Contents/MacOS/Electron",
+            ),
+            (
+                None,
+                "/Users/example/Applications/Visual Studio Code.app/Contents/Resources/app/bin/code",
+                "/Users/example/Applications/Visual Studio Code.app/Contents/MacOS/Electron",
+            ),
+            (
+                Some(EditorKind::Cursor),
+                "/Applications/Cursor.app/Contents/Resources/app/bin/cursor",
+                "/Applications/Cursor.app/Contents/MacOS/Cursor",
+            ),
+            (
+                Some(EditorKind::AntigravityIde),
+                "/Applications/Antigravity IDE.app/Contents/Resources/app/bin/antigravity-ide",
+                "/Applications/Antigravity IDE.app/Contents/MacOS/Electron",
+            ),
+        ];
+
+        for (editor, cli, expected) in cases {
+            assert_eq!(
+                standard_macos_editor_gui_executable(OsStr::new(cli), editor),
+                Some(PathBuf::from(expected))
+            );
+        }
+    }
+
+    #[test]
+    fn macos_gui_launch_uses_launch_services_without_node_mode() {
+        let gui = Path::new("/Applications/Antigravity IDE.app/Contents/MacOS/Electron");
+        let command = macos_gui_launch_command(gui);
+
+        assert_eq!(command.get_program(), OsStr::new("/usr/bin/open"));
+        assert_eq!(
+            command.get_args().map(OsStr::to_owned).collect::<Vec<_>>(),
+            vec![
+                OsString::from("-n"),
+                OsString::from("-a"),
+                gui.as_os_str().to_owned(),
+                OsString::from("--args"),
+            ]
+        );
+        assert!(command.get_envs().any(|(name, value)| {
+            name == OsStr::new("ELECTRON_RUN_AS_NODE") && value.is_none()
+        }));
+    }
+
+    #[test]
+    fn macos_gui_resolution_preserves_nonstandard_and_non_gui_launchers() {
+        assert_eq!(
+            standard_macos_editor_gui_executable(
+                OsStr::new("/usr/local/bin/antigravity-ide"),
+                Some(EditorKind::AntigravityIde),
+            ),
+            None
+        );
+        assert_eq!(
+            standard_macos_editor_gui_executable(
+                OsStr::new(
+                    "/Applications/Custom.app/Contents/Resources/app/bin/custom-antigravity"
+                ),
+                Some(EditorKind::AntigravityIde),
+            ),
+            None
+        );
+        assert_eq!(
+            standard_macos_editor_gui_executable(
+                OsStr::new("/Applications/Cursor.app/Contents/Resources/app/bin/cursor"),
+                Some(EditorKind::VsCode),
+            ),
+            None
+        );
+        assert_eq!(
+            standard_macos_editor_gui_executable(
+                OsStr::new("/Applications/Zed.app/Contents/MacOS/cli"),
+                Some(EditorKind::Zed),
+            ),
+            None
+        );
     }
 
     #[test]

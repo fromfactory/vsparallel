@@ -5,6 +5,8 @@
 //! so installing the production application does not require Python, Node, npm,
 //! or a checked-in generated VSIX.
 
+#[cfg(any(test, target_os = "macos"))]
+use serde::Deserialize;
 use serde::Serialize;
 use std::collections::HashSet;
 use std::env;
@@ -55,6 +57,8 @@ const CLI_POLL_INTERVAL: Duration = Duration::from_millis(25);
 #[cfg(unix)]
 const POST_EXIT_PIPE_DRAIN_GRACE: Duration = Duration::from_millis(100);
 const CLI_CAPTURE_LIMIT: usize = 256 * 1024;
+#[cfg(any(test, target_os = "macos"))]
+const EXTENSION_REGISTRY_LIMIT: u64 = 4 * 1024 * 1024;
 
 #[cfg(unix)]
 unsafe extern "C" {
@@ -101,6 +105,29 @@ pub struct CompanionOperationResult {
     pub verified: bool,
     pub message: String,
     pub status: CompanionStatus,
+}
+
+#[cfg(any(test, target_os = "macos"))]
+#[derive(Debug, Deserialize)]
+struct CompanionRegistryEntry {
+    identifier: CompanionRegistryIdentifier,
+    version: Option<String>,
+    #[serde(rename = "relativeLocation")]
+    relative_location: Option<String>,
+}
+
+#[cfg(any(test, target_os = "macos"))]
+#[derive(Debug, Deserialize)]
+struct CompanionRegistryIdentifier {
+    id: String,
+}
+
+#[cfg(any(test, target_os = "macos"))]
+#[derive(Debug, Clone, Copy)]
+enum StandardExtensionRegistry {
+    VsCode,
+    Cursor,
+    AntigravityIde,
 }
 
 #[derive(Debug)]
@@ -450,11 +477,23 @@ fn command_candidates(directory: &Path, executable: &OsStr) -> bool {
     }
 }
 
-/// Queries VS Code with `--list-extensions --show-versions`.
+/// Determines VS Code companion status from its supported CLI, or from the
+/// standard bounded extension registry on macOS.
 ///
 /// Operational failures are represented as `Unavailable`, rather than making a
 /// setup screen fail to render.
 pub fn companion_status(executable: &OsStr) -> CompanionStatus {
+    #[cfg(target_os = "macos")]
+    {
+        return standard_registry_status_without_cli(
+            executable,
+            StandardExtensionRegistry::VsCode,
+            VSCODE_PROFILE_ENV,
+            crate::opener::CODE_COMMAND_ENV,
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
     companion_status_with(
         &ProcessCodeCliRunner,
         executable,
@@ -469,6 +508,40 @@ pub fn companion_status_for_editor(
     editor_name: &str,
     profile_environment: &str,
 ) -> CompanionStatus {
+    #[cfg(target_os = "macos")]
+    {
+        let standard = match editor_name {
+            "Cursor" => Some((
+                StandardExtensionRegistry::Cursor,
+                crate::opener::CURSOR_COMMAND_ENV,
+            )),
+            "Antigravity IDE" => Some((
+                StandardExtensionRegistry::AntigravityIde,
+                crate::opener::ANTIGRAVITY_IDE_COMMAND_ENV,
+            )),
+            _ => None,
+        };
+        return match standard {
+            Some((registry, command_environment)) => relabel_status(
+                standard_registry_status_without_cli(
+                    executable,
+                    registry,
+                    profile_environment,
+                    command_environment,
+                ),
+                editor_name,
+            ),
+            None => relabel_status(
+                unavailable_status(
+                    bundled_companion_version().ok().map(str::to_string),
+                    "automatic VS Code CLI status checks are disabled on macOS".to_string(),
+                ),
+                editor_name,
+            ),
+        };
+    }
+
+    #[cfg(not(target_os = "macos"))]
     relabel_status(
         companion_status_with(
             &ProcessCodeCliRunner,
@@ -477,6 +550,145 @@ pub fn companion_status_for_editor(
         ),
         editor_name,
     )
+}
+
+/// Electron 39 can abort when a short-lived `ELECTRON_RUN_AS_NODE` process exits
+/// while its ESM loader worker is still resolving package metadata. The macOS
+/// launchers bundled by VS Code-compatible editors use exactly that mode. For
+/// standard, unprofiled installations, their bounded local extension registry
+/// is authoritative and avoids starting the vulnerable CLI merely to render
+/// setup status. Automatic status is unavailable for custom commands and
+/// profiles because their extension location or membership may differ; only an
+/// explicit install or uninstall action is allowed to invoke the editor CLI.
+#[cfg(any(test, target_os = "macos"))]
+fn standard_registry_status_without_cli(
+    executable: &OsStr,
+    registry: StandardExtensionRegistry,
+    profile_environment: &str,
+    command_environment: &str,
+) -> CompanionStatus {
+    let bundled_version = match bundled_companion_version() {
+        Ok(version) => version.to_string(),
+        Err(error) => return unavailable_status(None, error),
+    };
+    let command_overridden = env::var(command_environment)
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty());
+    if profile_from_environment(profile_environment).is_some() || command_overridden {
+        return unavailable_status(
+            Some(bundled_version),
+            "automatic VS Code CLI status checks are disabled for custom commands or profiles on macOS"
+                .to_string(),
+        );
+    }
+    if !command_is_available(executable) {
+        return unavailable_status(
+            Some(bundled_version),
+            "the VS Code command is unavailable".to_string(),
+        );
+    }
+    let Some(home) = env::var_os("HOME").filter(|value| !value.is_empty()) else {
+        return unavailable_status(
+            Some(bundled_version),
+            "the home directory is unavailable, so the extension registry could not be checked"
+                .to_string(),
+        );
+    };
+    companion_status_from_registry(
+        &standard_registry_path(Path::new(&home), registry),
+        bundled_version,
+    )
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn standard_registry_path(home: &Path, registry: StandardExtensionRegistry) -> PathBuf {
+    let directory = match registry {
+        StandardExtensionRegistry::VsCode => ".vscode",
+        StandardExtensionRegistry::Cursor => ".cursor",
+        StandardExtensionRegistry::AntigravityIde => ".antigravity-ide",
+    };
+    home.join(directory)
+        .join("extensions")
+        .join("extensions.json")
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn companion_status_from_registry(registry: &Path, bundled_version: String) -> CompanionStatus {
+    let metadata = match fs::metadata(registry) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return status_from_installed_versions(Vec::new(), bundled_version)
+        }
+        Err(error) => {
+            return unavailable_status(
+                Some(bundled_version),
+                format!("could not inspect the local extension registry: {error}"),
+            )
+        }
+    };
+    if !metadata.is_file() || metadata.len() > EXTENSION_REGISTRY_LIMIT {
+        return unavailable_status(
+            Some(bundled_version),
+            "the local extension registry is not a bounded regular file".to_string(),
+        );
+    }
+
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    let read_result = fs::File::open(registry).and_then(|file| {
+        file.take(EXTENSION_REGISTRY_LIMIT + 1)
+            .read_to_end(&mut bytes)
+    });
+    if let Err(error) = read_result {
+        return unavailable_status(
+            Some(bundled_version),
+            format!("could not read the local extension registry: {error}"),
+        );
+    }
+    if bytes.len() as u64 > EXTENSION_REGISTRY_LIMIT {
+        return unavailable_status(
+            Some(bundled_version),
+            "the local extension registry exceeds its size limit".to_string(),
+        );
+    }
+
+    let entries: Vec<CompanionRegistryEntry> = match serde_json::from_slice(&bytes) {
+        Ok(entries) => entries,
+        Err(error) => {
+            return unavailable_status(
+                Some(bundled_version),
+                format!("the local extension registry is invalid: {error}"),
+            )
+        }
+    };
+    let Some(extensions) = registry.parent() else {
+        return unavailable_status(
+            Some(bundled_version),
+            "the local extension registry has no extensions directory".to_string(),
+        );
+    };
+    let versions = entries
+        .into_iter()
+        .filter(|entry| entry.identifier.id.eq_ignore_ascii_case(EXTENSION_ID))
+        .filter_map(|entry| {
+            let relative = PathBuf::from(entry.relative_location?);
+            let mut components = relative.components();
+            let root = match (components.next(), components.next()) {
+                (Some(std::path::Component::Normal(name)), None) => extensions.join(name),
+                _ => return None,
+            };
+            if !root.is_dir() || !root.join("package.json").is_file() {
+                return None;
+            }
+            Some(entry.version.and_then(|version| {
+                let version = version.trim();
+                (!version.is_empty()
+                    && version.len() <= 128
+                    && !version.chars().any(char::is_control))
+                .then(|| version.to_string())
+            }))
+        })
+        .collect();
+    status_from_installed_versions(versions, bundled_version)
 }
 
 /// Installs (or updates) the embedded companion using VS Code's supported CLI.
@@ -754,10 +966,21 @@ fn status_from_extension_list(output: &[u8], bundled_version: String) -> Compani
                 (identifier, Some(version.trim()))
             });
         if identifier.trim().eq_ignore_ascii_case(EXTENSION_ID) {
-            versions.push(version.filter(|version| !version.is_empty()));
+            versions.push(
+                version
+                    .filter(|version| !version.is_empty())
+                    .map(str::to_string),
+            );
         }
     }
 
+    status_from_installed_versions(versions, bundled_version)
+}
+
+fn status_from_installed_versions(
+    versions: Vec<Option<String>>,
+    bundled_version: String,
+) -> CompanionStatus {
     if versions.is_empty() {
         return CompanionStatus {
             state: CompanionStatusState::NotInstalled,
@@ -768,7 +991,7 @@ fn status_from_extension_list(output: &[u8], bundled_version: String) -> Compani
         };
     }
 
-    let known: HashSet<&str> = versions.iter().filter_map(|version| *version).collect();
+    let known: HashSet<&str> = versions.iter().filter_map(Option::as_deref).collect();
     if versions.iter().any(|version| version.is_none()) || known.len() != 1 {
         return CompanionStatus {
             state: CompanionStatusState::VersionUnknown,
@@ -1402,6 +1625,106 @@ mod tests {
                     OsString::from("--show-versions")
                 ],
             }]
+        );
+    }
+
+    #[test]
+    fn standard_macos_registry_paths_are_editor_specific() {
+        let home = Path::new("/Users/example");
+        assert_eq!(
+            standard_registry_path(home, StandardExtensionRegistry::VsCode),
+            home.join(".vscode/extensions/extensions.json")
+        );
+        assert_eq!(
+            standard_registry_path(home, StandardExtensionRegistry::Cursor),
+            home.join(".cursor/extensions/extensions.json")
+        );
+        assert_eq!(
+            standard_registry_path(home, StandardExtensionRegistry::AntigravityIde),
+            home.join(".antigravity-ide/extensions/extensions.json")
+        );
+    }
+
+    #[test]
+    fn macos_automatic_status_path_fails_closed_without_an_editor_command() {
+        let status = standard_registry_status_without_cli(
+            OsStr::new(""),
+            StandardExtensionRegistry::VsCode,
+            "VSPARALLEL_TEST_PROFILE_MUST_REMAIN_UNSET",
+            "VSPARALLEL_TEST_COMMAND_MUST_REMAIN_UNSET",
+        );
+
+        assert_eq!(status.state, CompanionStatusState::Unavailable);
+    }
+
+    #[test]
+    fn local_registry_reports_companion_version_without_an_editor_cli() {
+        let temporary_directory = TempDir::new().unwrap();
+        let registry = standard_registry_path(
+            temporary_directory.path(),
+            StandardExtensionRegistry::AntigravityIde,
+        );
+        fs::create_dir_all(registry.parent().unwrap()).unwrap();
+        let companion_directory = registry
+            .parent()
+            .unwrap()
+            .join("vsparallel.vsparallel-companion-0.4.2");
+        fs::create_dir(&companion_directory).unwrap();
+        fs::write(companion_directory.join("package.json"), b"{}").unwrap();
+        fs::write(
+            &registry,
+            serde_json::to_vec(&serde_json::json!([
+                {
+                    "identifier": {"id": "unrelated.extension"},
+                    "version": "9.0.0"
+                },
+                {
+                    "identifier": {"id": "VSPARALLEL.VSPARALLEL-COMPANION"},
+                    "version": "0.4.2",
+                    "relativeLocation": "vsparallel.vsparallel-companion-0.4.2"
+                }
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let current = companion_status_from_registry(&registry, "0.4.2".to_string());
+        assert_eq!(current.state, CompanionStatusState::Current);
+        assert_eq!(current.installed_version.as_deref(), Some("0.4.2"));
+
+        let different = companion_status_from_registry(&registry, "0.5.0".to_string());
+        assert_eq!(different.state, CompanionStatusState::DifferentVersion);
+        assert_eq!(different.installed_version.as_deref(), Some("0.4.2"));
+    }
+
+    #[test]
+    fn local_registry_handles_absent_and_invalid_metadata_without_a_cli_fallback() {
+        let temporary_directory = TempDir::new().unwrap();
+        let missing = temporary_directory.path().join("missing/extensions.json");
+        assert_eq!(
+            companion_status_from_registry(&missing, "0.4.2".to_string()).state,
+            CompanionStatusState::NotInstalled
+        );
+
+        let registry = temporary_directory.path().join("extensions.json");
+        fs::write(&registry, b"{not json").unwrap();
+        let invalid = companion_status_from_registry(&registry, "0.4.2".to_string());
+        assert_eq!(invalid.state, CompanionStatusState::Unavailable);
+        assert!(invalid.detail.unwrap().contains("registry is invalid"));
+
+        fs::write(
+            &registry,
+            serde_json::to_vec(&serde_json::json!([{
+                "identifier": {"id": "vsparallel.vsparallel-companion"},
+                "version": "0.4.2",
+                "relativeLocation": "missing-companion-directory"
+            }]))
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            companion_status_from_registry(&registry, "0.4.2".to_string()).state,
+            CompanionStatusState::NotInstalled
         );
     }
 
