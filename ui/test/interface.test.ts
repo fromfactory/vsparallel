@@ -232,6 +232,25 @@ test("the six-provider dashboard renders quota, context, and token usage", () =>
   assert.match(javascript, /removeAttribute\("aria-valuenow"\)/);
   assert.match(javascript, /remaining\$\{stale \? " \(last known\)" : ""\}/);
   assert.match(javascript, /USAGE_REFRESH_INTERVAL_MS\s*=\s*60_000/);
+  assert.match(javascript, /actionLabel:\s*asString\(raw\.actionLabel\)/);
+  assert.match(javascript, /target\.value\.textContent = actionLabel \|\| "Unavailable"/);
+  assert.match(
+    javascript,
+    /target\.stateLabel\.textContent = stale \? "Stale" : "To enable"/,
+  );
+  assert.match(javascript, /target\.card\.dataset\.actionRequired = actionLabel \? "true" : "false"/);
+  assert.match(
+    css,
+    /\.usage-card\[data-state="unavailable"\]\[data-action-required="true"\][^{}]*\.usage-card__value\s*\{[^}]*white-space:\s*normal/s,
+  );
+  assert.match(
+    css,
+    /\.usage-card\[data-state="unavailable"\][^{}]*\.usage-card__detail\s*\{[^}]*-webkit-line-clamp:\s*2[^}]*white-space:\s*normal/s,
+  );
+  assert.match(
+    css,
+    /:root\[data-window-mode="floating"\][^{}]*\.usage-card\[data-state="stale"\]\[data-action-required="true"\][^{}]*\.usage-card__detail\s*\{[^}]*position:\s*static[^}]*font-size:\s*7px[^}]*white-space:\s*nowrap/s,
+  );
 
   const asFiniteNumber = javascript.match(
     /^([ \t]+)function asFiniteNumber\(value, fallback = null\) \{[\s\S]*?^\1\}/m,
@@ -249,6 +268,104 @@ test("the six-provider dashboard renders quota, context, and token usage", () =>
   assert.equal(context.asPercentage(-8), 0);
   assert.equal(context.asPercentage(108), 100);
   assert.equal(context.asPercentage(42.5), 42.5);
+});
+
+test("unavailable usage cards surface a compact provider next step", () => {
+  const javascript = read("ui/generated/app.js");
+  const target = {
+    card: {
+      dataset: {} as Record<string, string>,
+      style: { setProperty() {} },
+      title: "",
+    },
+    value: { textContent: "" },
+    stateLabel: { hidden: true, textContent: "Stale" },
+    meter: {},
+    detail: { textContent: "" },
+  };
+  const context = {
+    usageElements() {
+      return target;
+    },
+    usageProviderHasMetric() {
+      return false;
+    },
+    resetUsageMeter() {},
+  } as unknown as {
+    renderUsageProvider(kind: string, provider: unknown): string;
+  };
+  vm.runInNewContext(appFunction(javascript, "renderUsageProvider"), context);
+
+  const summary = context.renderUsageProvider("cursor", {
+    providerName: "Cursor",
+    state: "unavailable",
+    metricKind: "none",
+    remainingPercent: null,
+    tokenCount: null,
+    actionLabel: "Launch & chat",
+    detail: "Launch or reload Cursor and complete one local chat. Usage appears when supported fields are available.",
+  });
+
+  assert.equal(target.card.dataset.state, "unavailable");
+  assert.equal(target.card.dataset.actionRequired, "true");
+  assert.equal(target.value.textContent, "Launch & chat");
+  assert.equal(target.stateLabel.hidden, false);
+  assert.equal(target.stateLabel.textContent, "To enable");
+  assert.match(target.detail.textContent, /complete one local chat/i);
+  assert.match(summary, /next step: Launch & chat/i);
+});
+
+test("stale usage cards keep the metric visible and surface its recovery action", () => {
+  const javascript = read("ui/generated/app.js");
+  const target = {
+    card: {
+      dataset: {} as Record<string, string>,
+      style: { setProperty() {} },
+      title: "",
+    },
+    value: { textContent: "" },
+    stateLabel: { hidden: true, textContent: "" },
+    meter: {},
+    detail: { textContent: "" },
+  };
+  const context = {
+    usageElements() {
+      return target;
+    },
+    usageProviderHasMetric() {
+      return true;
+    },
+    formatTokenCount(value: number) {
+      return String(value);
+    },
+    formatRelativeTime() {
+      return "20 minutes ago";
+    },
+    resetUsageMeter() {},
+  } as unknown as {
+    renderUsageProvider(kind: string, provider: unknown): string;
+  };
+  vm.runInNewContext(appFunction(javascript, "renderUsageProvider"), context);
+
+  const summary = context.renderUsageProvider("gemini", {
+    providerName: "Gemini",
+    state: "stale",
+    metricKind: "tokens",
+    remainingPercent: null,
+    tokenCount: 42,
+    metricLabel: "Latest model call",
+    updatedAtMs: 1_000,
+    actionLabel: "Start a turn",
+    detail: "Complete a new turn to refresh usage.",
+  });
+
+  assert.equal(target.card.dataset.state, "stale");
+  assert.equal(target.card.dataset.actionRequired, "true");
+  assert.equal(target.value.textContent, "42 tokens");
+  assert.equal(target.stateLabel.hidden, false);
+  assert.equal(target.stateLabel.textContent, "Stale");
+  assert.match(target.detail.textContent, /^Next: Start a turn/);
+  assert.match(summary, /next step: Start a turn/i);
 });
 
 test("visibility settings default every editor and provider usage card on", () => {
@@ -353,6 +470,7 @@ test("usage normalization selects the limiting window and bounds last-known fall
     "usageProviderWithFallback",
   ].map((name) => appFunction(javascript, name)).join("\n");
   interface UsageProvider {
+    actionLabel: string;
     detail: string;
     metricLabel: string;
     metricKind: string;
@@ -403,11 +521,14 @@ test("usage normalization selects the limiting window and bounds last-known fall
 
   const unavailable = context.normalizeUsageProvider({
     state: "unavailable",
+    actionLabel: "Sign in",
     detail: "Open Codex and sign in to view limits.",
   }, "Codex");
+  assert.equal(unavailable.actionLabel, "Sign in");
   const fallback = context.usageProviderWithFallback(unavailable, previous, 2_000);
   assert.equal(fallback.state, "stale");
   assert.equal(fallback.remainingPercent, 18);
+  assert.equal(fallback.actionLabel, "Sign in");
   assert.equal(fallback.detail, "Open Codex and sign in to view limits.");
 
   const partiallyExpired = context.usageProviderWithFallback(unavailable, previous, 250_000);
@@ -1697,6 +1818,10 @@ test("setup-all skips each editor whose CLI is unavailable", () => {
   );
   assert.match(
     setupAll,
+    /Codex, Claude, and Antigravity quota checks require compatible, signed-in provider installations\./,
+  );
+  assert.match(
+    setupAll,
     /resultComponent\.token === ["']manual_action_required["'][\s\S]*manualActions\.push/,
   );
   assert.match(
@@ -1705,6 +1830,7 @@ test("setup-all skips each editor whose CLI is unavailable", () => {
     "the all-installed success banner must exclude unresolved manual actions",
   );
   assert.match(setupAll, /Setup needs attention\.[\s\S]*Manual action remains:/);
+  assert.match(setupAll, /void refreshUsage\(true\)/);
 });
 
 test("settings keep integration summaries compact and expose details through accessible help", () => {
@@ -1752,10 +1878,10 @@ test("settings keep integration summaries compact and expose details through acc
   assert.deepEqual(visibleDescriptions, [
     "Live workspace detection",
     "Live workspaces and agent activity",
-    "Live workspaces and agent activity",
+    "Workspaces and activity · quota is separate",
     "Local model-call token totals",
-    "Agent activity hooks",
-    "Agent activity hooks",
+    "Activity hooks · usage detected separately",
+    "Activity hooks · live usage detected separately",
   ]);
 
   const helpTriggers = Array.from(normalMarkup.matchAll(
@@ -1802,10 +1928,20 @@ test("settings keep integration summaries compact and expose details through acc
     integrationText,
     /compatible, signed-in Claude Code CLI available to VSParallel, either standalone or from a local Claude Code extension in VS Code, Cursor, or Antigravity IDE/i,
   );
+  assert.match(
+    integrationText,
+    /Model quota is detected separately through a compatible, signed-in\s+Antigravity CLI \(version 1\.1\.11 or newer\)/i,
+  );
   assert.match(integrationText, /recent terminal status-line capture can provide fallback usage/i);
   assert.match(integrationText, /Gemini CLI AfterModel hook/i);
   assert.match(integrationText, /discards prompt and response content/i);
   assert.match(integrationText, /not Gemini subscription quota/i);
+  assert.match(html, /Codex usage[\s\S]*signed-in Codex installation; activity hooks are separate/i);
+  assert.match(html, /Claude usage[\s\S]*signed-in Claude Code[\s\S]*activity-hook setup also adds a terminal fallback/i);
+  assert.match(html, /Gemini usage[\s\S]*new CLI session, and complete one turn/i);
+  assert.match(html, /Antigravity usage[\s\S]*CLI 1\.1\.11\+; activity hooks are separate/i);
+  assert.match(html, /Zed Agent usage[\s\S]*Try one Zed Agent chat[\s\S]*check diagnostics[\s\S]*No setup is needed/i);
+  assert.match(html, /Cursor usage[\s\S]*reload Cursor, then complete one chat[\s\S]*supported fields/i);
   assert.doesNotMatch(integrationSection, /integration-usage-requirement|integration-activity-limitation/i);
   assert.match(css, /\.help-popover__trigger\s*\{[\s\S]*?width:\s*24px/i);
   assert.match(css, /\.help-popover__trigger:focus-visible\s*\{[\s\S]*?outline:/i);
@@ -1848,6 +1984,11 @@ test("settings keep integration summaries compact and expose details through acc
     "both successful and partial/error individual uninstalls should force a fresh usage snapshot",
   );
   assert.match(
+    individualUninstall,
+    /operation === "install"[\s\S]*?void refreshUsage\(true\)/,
+    "an install should refresh first-use guidance without keeping settings controls busy",
+  );
+  assert.match(
     uninstallAll,
     /Integration-backed editor monitoring was disabled[\s\S]*Automatic Zed discovery and supported provider quota checks remain available\./,
   );
@@ -1878,15 +2019,21 @@ test("settings keep integration summaries compact and expose details through acc
   assert.match(javascript, /\.showPopover\(\)/);
   assert.match(javascript, /\.hidePopover\(\)/);
   assert.match(javascript, /closeActiveHelpPopover\(\)/);
-  assert.match(javascript, /Codex hooks installed\. Review \/hooks in Codex\./);
-  assert.match(javascript, /Claude Code hooks installed\. Restart active sessions\./);
+  assert.match(
+    javascript,
+    /Codex activity hooks installed\. Review \/hooks in Codex\. Usage detection is separate and requires a compatible, signed-in Codex installation\./,
+  );
+  assert.match(
+    javascript,
+    /Claude Code activity hooks installed\. Restart active sessions\. Live usage requires a compatible, signed-in Claude Code installation; open or restart a terminal session to initialize the optional fallback\./,
+  );
   assert.match(
     integrationText,
     /Gemini card has no capture[\s\S]*Install or Repair[\s\S]*new Gemini CLI session/i,
   );
   assert.match(
     javascript,
-    /Gemini usage hook installed\. Open a new Gemini CLI session and start a turn\./,
+    /Gemini usage hook installed\. Open a new Gemini CLI session and complete one turn\./,
   );
   assert.match(javascript, /install:\s*"install_gemini_usage"/);
   assert.match(javascript, /uninstall:\s*"uninstall_gemini_usage"/);
@@ -1894,9 +2041,9 @@ test("settings keep integration summaries compact and expose details through acc
   assert.match(javascript, /renderIntegrationComponent\(status\.gemini\)/);
   assert.match(
     javascript,
-    /Cursor monitoring installed\. Reload open Cursor IDE windows or open a new Cursor Agent CLI session, then start a turn\./,
+    /Cursor monitoring installed\. Reload open Cursor IDE windows or open a new Cursor Agent CLI session, then complete one local chat\. Usage appears when the active Cursor version and surface expose supported fields\./,
   );
-  assert.match(javascript, /Antigravity integration installed\. Reload open Antigravity IDE windows/);
+  assert.match(javascript, /Antigravity monitoring installed\. Reload open Antigravity IDE windows/);
   assert.match(javascript, /Antigravity 2\.0 hook execution/);
   assert.match(javascript, /Antigravity IDE hook execution/);
   assert.match(javascript, /Cursor live heartbeat/);

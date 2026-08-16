@@ -522,7 +522,7 @@
               <label class="settings-row settings-row--separated">
                 <span>
                   <strong>Codex usage</strong>
-                  <small>Show Codex quota and reset information.</small>
+                  <small>Requires a compatible, signed-in Codex installation; activity hooks are separate.</small>
                 </span>
                 <span class="setting-switch">
                   <input type="checkbox" role="switch" data-usage-visibility="codex" checked />
@@ -534,7 +534,7 @@
               <label class="settings-row">
                 <span>
                   <strong>Claude usage</strong>
-                  <small>Show Claude quota and reset information.</small>
+                  <small>Live usage requires signed-in Claude Code; activity-hook setup also adds a terminal fallback.</small>
                 </span>
                 <span class="setting-switch">
                   <input type="checkbox" role="switch" data-usage-visibility="claude" checked />
@@ -546,7 +546,7 @@
               <label class="settings-row">
                 <span>
                   <strong>Gemini usage</strong>
-                  <small>Show the latest Gemini model-call token count.</small>
+                  <small>Set up the hook, open a new CLI session, and complete one turn.</small>
                 </span>
                 <span class="setting-switch">
                   <input type="checkbox" role="switch" data-usage-visibility="gemini" checked />
@@ -558,7 +558,7 @@
               <label class="settings-row">
                 <span>
                   <strong>Antigravity usage</strong>
-                  <small>Show Antigravity model quota information.</small>
+                  <small>Requires signed-in Antigravity CLI 1.1.11+; activity hooks are separate.</small>
                 </span>
                 <span class="setting-switch">
                   <input type="checkbox" role="switch" data-usage-visibility="antigravity" checked />
@@ -570,7 +570,7 @@
               <label class="settings-row">
                 <span>
                   <strong>Zed Agent usage</strong>
-                  <small>Show the latest native-thread token count.</small>
+                  <small>Try one Zed Agent chat; if usage stays unavailable, check diagnostics. No setup is needed.</small>
                 </span>
                 <span class="setting-switch">
                   <input type="checkbox" role="switch" data-usage-visibility="zed" checked />
@@ -582,7 +582,7 @@
               <label class="settings-row">
                 <span>
                   <strong>Cursor usage</strong>
-                  <small>Show CLI context or the latest turn's token count.</small>
+                  <small>Set up or reload Cursor, then complete one chat; capture depends on supported fields.</small>
                 </span>
                 <span class="setting-switch">
                   <input type="checkbox" role="switch" data-usage-visibility="cursor" checked />
@@ -739,9 +739,10 @@
                             >
                               Installs and removes the Cursor companion and activity hooks together.
                               After setup, reload Cursor IDE or open a new Cursor Agent CLI session,
-                              then start a local Cursor agent turn in IDE Composer or the CLI to
-                              capture that turn's input and output token total. Cursor Agent CLI can
-                              additionally report its richer
+                              then start a local Cursor agent turn in IDE Composer or the CLI.
+                              VSParallel captures the turn's token total when that Cursor version
+                              and surface include supported token fields. Cursor Agent CLI can also
+                              report its richer
                               context-left percentage when no custom CLI status line is in use.
                               VSParallel never reads Cursor plan or billing quota.
                               <span class="help-popover__status" id="cursorCompanionHelpStatus">
@@ -892,6 +893,8 @@
                             >
                               Installs and removes the Antigravity IDE companion and activity hooks
                               together. Reload open windows and start a new turn after installation.
+                              Model quota is detected separately through a compatible, signed-in
+                              Antigravity CLI (version 1.1.11 or newer).
                               <span class="help-popover__status" id="antigravityIdeHelpStatus">
                                 Checking current status…
                               </span>
@@ -899,7 +902,7 @@
                           </span>
                         </div>
                         <p class="integration-detail" id="antigravityIdeDetail">
-                          Live workspaces and agent activity
+                          Workspaces and activity · quota is separate
                         </p>
                       </div>
                     </div>
@@ -1030,7 +1033,7 @@
                           </span>
                         </div>
                         <p class="integration-detail" id="codexDetail">
-                          Agent activity hooks
+                          Activity hooks · usage detected separately
                         </p>
                       </div>
                     </div>
@@ -1098,7 +1101,7 @@
                           </span>
                         </div>
                         <p class="integration-detail" id="claudeDetail">
-                          Agent activity hooks
+                          Activity hooks · live usage detected separately
                         </p>
                       </div>
                     </div>

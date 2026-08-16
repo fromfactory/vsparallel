@@ -102,6 +102,12 @@ Additional notes:
   Add the VSParallel handler there or remove the override if activity is missing.
 - Extension activation is not treated as agent activity. A new prompt must
   trigger a lifecycle hook before VSParallel shows an activity state.
+- Gemini needs its usage hook, a new CLI session, and one completed turn. Zed
+  needs an eligible local Agent chat but no integration setup. Cursor needs its
+  monitoring setup, a reload, and a completed chat; capture is best-effort
+  because supported token and context fields vary by Cursor version and surface.
+- Codex, Claude live usage, and Antigravity quota are separate from activity
+  hooks and instead require their own compatible, signed-in provider installation.
 - Use **Setup & diagnostics** to repair an integration or inspect why a source is
   unavailable.
 

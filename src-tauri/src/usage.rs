@@ -67,6 +67,17 @@ const PROVIDER_EXTENSION_RETRY_AFTER: Duration = Duration::from_secs(5 * 60);
 const MAX_FUTURE_SKEW_MS: i64 = 5 * 60 * 1_000;
 const AUTOMATIC_SOURCE_PREFIX: &str = "vsparallel-source=automatic;";
 const CONFIGURED_SOURCE_PREFIX: &str = "vsparallel-source=configured;";
+const CHECK_SETUP_ACTION: &str = "Check setup";
+const CHECK_APP_STATE_ACTION: &str = "Check app state";
+const CURSOR_FIRST_USAGE_DETAIL: &str =
+    "Launch or reload Cursor and complete one local chat. Usage appears when the active Cursor version and chat surface expose supported token or context data.";
+const GEMINI_FIRST_USAGE_DETAIL: &str =
+    "Open a new Gemini CLI session and complete one turn to record fresh usage.";
+const ZED_FIRST_USAGE_DETAIL: &str =
+    "No recent supported Zed usage record is available. Complete one Zed Agent chat, then check Setup & diagnostics if usage still does not appear.";
+const CLAUDE_FALLBACK_FIRST_USAGE_DETAIL: &str =
+    "Open or restart Claude Code in a terminal to initialize the optional usage fallback.";
+const LOCAL_USAGE_STATE_UNAVAILABLE_DETAIL: &str = "VSParallel's local usage state is unavailable. Restart VSParallel, then check Setup & diagnostics if the problem continues.";
 
 static CODEX_EXTENSION_CACHE: OnceLock<Mutex<ProviderExtensionCache>> = OnceLock::new();
 static CLAUDE_EXTENSION_CACHE: OnceLock<Mutex<ProviderExtensionCache>> = OnceLock::new();
@@ -121,6 +132,8 @@ pub struct ProviderUsageView {
     pub metric_label: String,
     pub windows: Vec<UsageWindowView>,
     pub updated_at_ms: Option<i64>,
+    /// Compact recovery action shown when a metric is unavailable or stale.
+    pub action_label: String,
     pub detail: String,
 }
 
@@ -239,7 +252,7 @@ pub fn build_usage_snapshot(now_ms: i64) -> UsageSnapshot {
     };
     let antigravity_runner = ProcessAntigravityUsageRunner;
 
-    let (mut snapshot, antigravity_result, zed_usage) = thread::scope(|scope| {
+    let (mut snapshot, antigravity_result, zed_result) = thread::scope(|scope| {
         let base = scope.spawn(|| {
             build_usage_snapshot_with(
                 &codex_runner,
@@ -260,37 +273,74 @@ pub fn build_usage_snapshot(now_ms: i64) -> UsageSnapshot {
             antigravity.join().unwrap_or_else(|_| {
                 Err("Antigravity usage worker stopped unexpectedly".to_string())
             }),
-            zed.join().ok().flatten(),
+            zed.join()
+                .map_err(|_| "Zed usage worker stopped unexpectedly".to_string()),
         )
     });
 
     snapshot.antigravity = match antigravity_result {
         Ok(result) => antigravity_provider_view(&result, now_ms).unwrap_or_else(|| {
-            unavailable_provider(
-                "Antigravity returned no compatible quota buckets. Update Antigravity CLI, then refresh usage.",
+            unavailable_provider_with_action(
+                "Open / sign in",
+                "Antigravity returned no model quota buckets. Open Antigravity and confirm CLI sign-in; if usage stays unavailable, update Antigravity CLI.",
             )
         }),
-        Err(error) => unavailable_provider(&antigravity_failure_detail(&error)),
+        Err(error) => unavailable_provider_with_action(
+            antigravity_failure_action_label(&error),
+            &antigravity_failure_detail(&error),
+        ),
     };
-    snapshot.zed = zed_usage
-        .map(|usage| {
+    snapshot.zed = match zed_result {
+        Ok(Some(usage)) => replace_unavailable_guidance(
             token_provider(
                 usage.total_tokens,
                 usage.updated_at_ms,
                 "Latest native thread",
                 "Local tokens recorded by Zed; this is not plan or billing quota.",
                 now_ms,
-            )
-        })
-        .unwrap_or_else(|| {
-            unavailable_provider(
-                "No native Zed Agent token record is available yet. Start a Zed Agent turn, then refresh.",
-            )
-        });
-    snapshot.gemini = reconcile_gemini_integration_status(
-        snapshot.gemini,
-        current_gemini_integration_status().ok().as_ref(),
-    );
+            ),
+            "Try a chat",
+            ZED_FIRST_USAGE_DETAIL,
+        ),
+        Ok(None) => unavailable_provider_with_action("Try a chat", ZED_FIRST_USAGE_DETAIL),
+        Err(error) => unavailable_provider_with_action(
+            "Restart VSParallel",
+            &format!("{error}. Restart VSParallel, then refresh usage."),
+        ),
+    };
+    if state_root.as_deref().is_some_and(|root| {
+        crate::state::integration_source_is_enabled_at(
+            root,
+            crate::state::IntegrationSource::CursorHooks,
+        )
+    }) {
+        snapshot.cursor = reconcile_cursor_integration_status(
+            snapshot.cursor,
+            current_cursor_integration_status().ok().as_ref(),
+        );
+    }
+    if state_root.as_deref().is_some_and(|root| {
+        crate::state::integration_source_is_enabled_at(
+            root,
+            crate::state::IntegrationSource::ClaudeHooks,
+        )
+    }) {
+        snapshot.claude = reconcile_claude_integration_status(
+            snapshot.claude,
+            current_claude_integration_status().ok().as_ref(),
+        );
+    }
+    if state_root.as_deref().is_some_and(|root| {
+        crate::state::integration_source_is_enabled_at(
+            root,
+            crate::state::IntegrationSource::GeminiUsage,
+        )
+    }) {
+        snapshot.gemini = reconcile_gemini_integration_status(
+            snapshot.gemini,
+            current_gemini_integration_status().ok().as_ref(),
+        );
+    }
     snapshot
 }
 
@@ -301,41 +351,132 @@ fn current_gemini_integration_status(
     crate::gemini_integration::gemini_integration_status(&config_dir, &executable)
 }
 
-fn reconcile_gemini_integration_status(
+fn current_cursor_integration_status(
+) -> Result<crate::cursor_integration::CursorIntegrationStatus, String> {
+    let config_dir = crate::cursor_integration::cursor_config_dir_from_environment()?;
+    let executable = crate::integration_executable()?;
+    crate::cursor_integration::cursor_integration_status(&config_dir, &executable)
+}
+
+fn current_claude_integration_status(
+) -> Result<crate::claude_integration::ClaudeIntegrationStatus, String> {
+    let config_dir = crate::claude_integration::claude_config_dir_from_environment()?;
+    let executable = crate::integration_executable()?;
+    crate::claude_integration::claude_integration_status(&config_dir, &executable)
+}
+
+fn usage_with_integration_guidance(
     mut usage: ProviderUsageView,
+    action_label: &str,
+    detail: &str,
+) -> ProviderUsageView {
+    if usage.remaining_percent.is_none() && usage.token_count.is_none() {
+        return unavailable_provider_with_action(action_label, detail);
+    }
+
+    // Keep a last known metric visible, but make it clear that its source
+    // cannot refresh until the integration state is resolved.
+    usage.state = "stale".to_string();
+    usage.action_label = action_label.to_string();
+    usage.detail = detail.to_string();
+    usage
+}
+
+fn reconcile_cursor_integration_status(
+    usage: ProviderUsageView,
+    status: Option<&crate::cursor_integration::CursorIntegrationStatus>,
+) -> ProviderUsageView {
+    let Some(status) = status else {
+        return usage;
+    };
+
+    let awaiting_first_capture =
+        usage.state == "unavailable" && usage.action_label == CHECK_SETUP_ACTION;
+    match (status.state.as_str(), status.usage_capture_state.as_str()) {
+        ("installed", "conflict") if awaiting_first_capture => {
+            unavailable_provider_with_action(
+                "Start a chat",
+                "Reload Cursor and complete one local chat to try turn-token capture. A custom Cursor Agent CLI status line keeps context-left detection disabled.",
+            )
+        }
+        ("installed", _) if awaiting_first_capture => {
+            unavailable_provider_with_action("Launch & chat", CURSOR_FIRST_USAGE_DETAIL)
+        }
+        ("not_installed", _) => usage_with_integration_guidance(
+            usage,
+            "Open setup",
+            "Cursor monitoring is not installed. Set it up in Setup & diagnostics, reload Cursor, then complete one local chat. Capture depends on supported token or context fields.",
+        ),
+        ("stale" | "partial", _) => usage_with_integration_guidance(
+            usage,
+            "Repair setup",
+            "Cursor monitoring needs repair. Repair it in Setup & diagnostics, reload Cursor, then complete one local chat. Capture depends on supported token or context fields.",
+        ),
+        _ => usage,
+    }
+}
+
+fn reconcile_claude_integration_status(
+    mut usage: ProviderUsageView,
+    status: Option<&crate::claude_integration::ClaudeIntegrationStatus>,
+) -> ProviderUsageView {
+    let Some(status) = status else {
+        return usage;
+    };
+
+    if usage.remaining_percent.is_none()
+        && usage.token_count.is_none()
+        && status.usage_capture_state == "current"
+        && usage.action_label != CHECK_APP_STATE_ACTION
+    {
+        if usage.detail.is_empty() {
+            usage.detail = CLAUDE_FALLBACK_FIRST_USAGE_DETAIL.to_string();
+        } else if !usage.detail.contains(CLAUDE_FALLBACK_FIRST_USAGE_DETAIL) {
+            usage.detail = format!("{} {}", CLAUDE_FALLBACK_FIRST_USAGE_DETAIL, usage.detail);
+        }
+    }
+
+    usage
+}
+
+fn reconcile_gemini_integration_status(
+    usage: ProviderUsageView,
     status: Option<&crate::gemini_integration::GeminiIntegrationStatus>,
 ) -> ProviderUsageView {
     let Some(status) = status else {
         return usage;
     };
-    let lifecycle_detail = match status.state.as_str() {
-        "not_installed" => Some(
-            "Gemini usage capture is not installed. Install it in Setup & diagnostics, restart Gemini CLI, then start a new turn.",
-        ),
-        "disabled" => Some(
-            "Gemini usage capture is installed, but Gemini CLI settings disable hooks. Enable hooks in Gemini CLI settings, restart Gemini CLI, then start a new turn.",
-        ),
-        "stale" => Some(
-            "The Gemini usage hook needs repair. Repair it in Setup & diagnostics, restart Gemini CLI, then start a new turn.",
-        ),
-        "conflict" => Some(
-            "The Gemini usage hook name conflicts with another command. Resolve the conflict shown in Setup & diagnostics before starting a new turn.",
-        ),
+    if status.state == "installed"
+        && usage.state == "unavailable"
+        && usage.action_label == CHECK_SETUP_ACTION
+    {
+        return unavailable_provider_with_action("Start a turn", GEMINI_FIRST_USAGE_DETAIL);
+    }
+
+    let guidance = match status.state.as_str() {
+        "not_installed" => Some((
+            "Open setup",
+            "Gemini usage capture is not installed. Install it in Setup & diagnostics, open a new Gemini CLI session, then complete one turn.",
+        )),
+        "disabled" => Some((
+            "Enable hooks",
+            "Gemini usage capture is installed, but Gemini CLI settings disable hooks. Enable hooks, open a new Gemini CLI session, then complete one turn.",
+        )),
+        "stale" => Some((
+            "Repair hook",
+            "The Gemini usage hook needs repair. Repair it in Setup & diagnostics, open a new Gemini CLI session, then complete one turn.",
+        )),
+        "conflict" => Some((
+            "Resolve conflict",
+            "The Gemini usage hook conflicts with another command. Resolve the conflict in Setup & diagnostics before starting a new turn.",
+        )),
         _ => None,
     };
-    let Some(lifecycle_detail) = lifecycle_detail else {
+    let Some((action_label, detail)) = guidance else {
         return usage;
     };
 
-    if usage.token_count.is_none() {
-        return unavailable_provider(lifecycle_detail);
-    }
-
-    // Preserve the last privacy-filtered token count, but do not present it as
-    // current when the hook that refreshes it cannot run.
-    usage.state = "stale".to_string();
-    usage.detail = lifecycle_detail.to_string();
-    usage
+    usage_with_integration_guidance(usage, action_label, detail)
 }
 
 /// Testable snapshot builder with injected process and state boundaries.
@@ -364,73 +505,96 @@ pub fn build_usage_snapshot_with<
     });
     let codex = match codex_result {
         Ok(result) => codex_provider_view(&result, now_ms).unwrap_or_else(|| {
-            unavailable_provider(
+            unavailable_provider_with_action(
+                "Update Codex",
                 "Codex returned no compatible usage windows. Update Codex, then refresh usage.",
             )
         }),
-        Err(error) => unavailable_provider(&provider_failure_detail(
-            "Codex",
-            "VSPARALLEL_CODEX_COMMAND",
-            &error,
-            "Install or sign in to Codex to view usage limits.",
-        )),
+        Err(error) => unavailable_provider_with_action(
+            &provider_failure_action_label(&error, "Codex", "Install / sign in"),
+            &provider_failure_detail(
+                "Codex",
+                "VSPARALLEL_CODEX_COMMAND",
+                &error,
+                "Install or sign in to Codex to view usage limits. Activity hooks do not enable usage detection.",
+            ),
+        ),
     };
-    let (claude_live, claude_error) = match claude_result {
+    let (claude_live, claude_action, claude_error) = match claude_result {
         Ok(result) => (
             claude_provider_view(&result, now_ms),
+            "Update Claude".to_string(),
             "Claude Code returned no compatible usage windows. Update Claude Code, then refresh usage."
                 .to_string(),
         ),
         Err(error) => (
             None,
+            provider_failure_action_label(&error, "Claude", "Sign in / update"),
             provider_failure_detail(
                 "Claude Code",
                 "VSPARALLEL_CLAUDE_COMMAND",
                 &error,
-                "Update or sign in to Claude Code, then refresh usage.",
+                "Update or sign in to Claude Code, then refresh usage. Activity hooks do not enable live usage detection.",
             ),
         ),
     };
-    let claude = claude_live
-        .or_else(|| {
-            state_root
-                .filter(|root| {
-                    crate::state::integration_source_is_enabled_at(
-                        root,
-                        crate::state::IntegrationSource::ClaudeHooks,
-                    )
-                })
-                .map(|root| load_claude_usage(root, now_ms))
-                .filter(|view| view.remaining_percent.is_some())
-        })
-        .unwrap_or_else(|| unavailable_provider(&claude_error));
-
-    let gemini = state_root
+    let claude_fallback = state_root
         .filter(|root| {
             crate::state::integration_source_is_enabled_at(
+                root,
+                crate::state::IntegrationSource::ClaudeHooks,
+            )
+        })
+        .map(|root| load_claude_usage(root, now_ms));
+    let claude = if let Some(live) = claude_live {
+        live
+    } else if let Some(mut fallback) = claude_fallback {
+        if fallback.remaining_percent.is_some() {
+            fallback
+        } else if fallback.action_label == CHECK_APP_STATE_ACTION {
+            fallback.detail = format!("{} {}", fallback.detail, claude_error);
+            fallback
+        } else {
+            unavailable_provider_with_action(&claude_action, &claude_error)
+        }
+    } else {
+        unavailable_provider_with_action(&claude_action, &claude_error)
+    };
+
+    let gemini = match state_root {
+        Some(root)
+            if crate::state::integration_source_is_enabled_at(
                 root,
                 crate::state::IntegrationSource::GeminiUsage,
+            ) => load_gemini_usage(root, now_ms),
+        Some(_) => {
+            unavailable_provider_with_action(
+                "Open setup",
+                "Gemini usage capture is disabled. Enable it in Setup & diagnostics, open a new Gemini CLI session, then complete one turn.",
             )
-        })
-        .map(|root| load_gemini_usage(root, now_ms))
-        .unwrap_or_else(|| {
-            unavailable_provider(
-                "Gemini token capture is disabled. Enable it in Setup & diagnostics.",
-            )
-        });
-    let cursor = state_root
-        .filter(|root| {
-            crate::state::integration_source_is_enabled_at(
+        }
+        None => unavailable_provider_with_action(
+            CHECK_APP_STATE_ACTION,
+            LOCAL_USAGE_STATE_UNAVAILABLE_DETAIL,
+        ),
+    };
+    let cursor = match state_root {
+        Some(root)
+            if crate::state::integration_source_is_enabled_at(
                 root,
                 crate::state::IntegrationSource::CursorHooks,
+            ) => load_cursor_usage(root, now_ms),
+        Some(_) => {
+            unavailable_provider_with_action(
+                "Open setup",
+                "Cursor usage capture is disabled. Enable Cursor monitoring in Setup & diagnostics, reload Cursor, then complete one local chat. Capture depends on supported token or context fields.",
             )
-        })
-        .map(|root| load_cursor_usage(root, now_ms))
-        .unwrap_or_else(|| {
-            unavailable_provider(
-                "Cursor Agent context capture is disabled. Enable Cursor monitoring in Setup & diagnostics.",
-            )
-        });
+        }
+        None => unavailable_provider_with_action(
+            CHECK_APP_STATE_ACTION,
+            LOCAL_USAGE_STATE_UNAVAILABLE_DETAIL,
+        ),
+    };
 
     UsageSnapshot {
         schema_version: USAGE_SCHEMA_VERSION,
@@ -438,18 +602,22 @@ pub fn build_usage_snapshot_with<
         codex,
         claude,
         gemini,
-        antigravity: unavailable_provider(
+        antigravity: unavailable_provider_with_action(
+            "Install / sign in",
             "Install Antigravity CLI 1.1.11 or newer to view model quota.",
         ),
-        zed: unavailable_provider(
-            "No native Zed Agent token record is available yet. Start a Zed Agent turn, then refresh.",
-        ),
+        zed: unavailable_provider_with_action("Try a chat", ZED_FIRST_USAGE_DETAIL),
         cursor,
     }
 }
 
 fn unavailable_usage_snapshot(now_ms: i64) -> UsageSnapshot {
-    let unavailable = || unavailable_provider("Usage collection stopped unexpectedly.");
+    let unavailable = || {
+        unavailable_provider_with_action(
+            "Restart VSParallel",
+            "Usage collection stopped unexpectedly. Restart VSParallel, then refresh usage.",
+        )
+    };
     UsageSnapshot {
         schema_version: USAGE_SCHEMA_VERSION,
         generated_at_ms: now_ms,
@@ -1790,6 +1958,7 @@ fn provider_from_windows(
         metric_label,
         windows,
         updated_at_ms: Some(updated_at_ms),
+        action_label: String::new(),
         detail: detail.to_string(),
     })
 }
@@ -1803,8 +1972,29 @@ fn unavailable_provider(detail: &str) -> ProviderUsageView {
         metric_label: String::new(),
         windows: Vec::new(),
         updated_at_ms: None,
+        action_label: String::new(),
         detail: detail.to_string(),
     }
+}
+
+fn unavailable_provider_with_action(action_label: &str, detail: &str) -> ProviderUsageView {
+    let mut usage = unavailable_provider(detail);
+    usage.action_label = action_label.to_string();
+    usage
+}
+
+fn replace_unavailable_guidance(
+    mut usage: ProviderUsageView,
+    action_label: &str,
+    detail: &str,
+) -> ProviderUsageView {
+    if usage.state == "unavailable" {
+        usage.action_label = action_label.to_string();
+        usage.detail = detail.to_string();
+    } else if usage.state == "stale" {
+        usage.action_label = action_label.to_string();
+    }
+    usage
 }
 
 fn token_provider(
@@ -1833,6 +2023,7 @@ fn token_provider(
         metric_label: metric_label.to_string(),
         windows: Vec::new(),
         updated_at_ms: Some(updated_at_ms),
+        action_label: String::new(),
         detail: detail.to_string(),
     }
 }
@@ -1872,6 +2063,7 @@ fn context_provider(
             None,
         )],
         updated_at_ms: Some(updated_at_ms),
+        action_label: String::new(),
         detail: detail.to_string(),
     }
 }
@@ -1900,6 +2092,12 @@ fn provider_failure_detail(
         _ => provider.to_string(),
     };
 
+    if normalized.contains("usage worker stopped unexpectedly") {
+        return format!(
+            "VSParallel's {provider} usage collector stopped unexpectedly. Restart VSParallel, then refresh usage."
+        );
+    }
+
     if normalized.contains("could not start") {
         return if source == "unknown" {
             fallback.to_string()
@@ -1912,7 +2110,7 @@ fn provider_failure_detail(
             "{subject} started but did not answer the usage request. Restart or update it, then refresh usage."
         );
     }
-    if normalized.contains("rejected") || normalized.contains("no result") {
+    if normalized.contains("rejected") {
         return format!(
             "{subject} rejected the usage request. Sign in to the same local account used by VS Code, Cursor, or Antigravity IDE, or update it, then refresh usage."
         );
@@ -1920,6 +2118,7 @@ fn provider_failure_detail(
     if normalized.contains("malformed")
         || normalized.contains("exceeded its safety limit")
         || normalized.contains("output limit")
+        || normalized.contains("no result")
     {
         return format!(
             "{subject} returned an incompatible usage response. Update it, then refresh usage."
@@ -1928,16 +2127,92 @@ fn provider_failure_detail(
     fallback.to_string()
 }
 
+fn provider_failure_action_label(
+    tagged_error: &str,
+    provider: &str,
+    fallback_action: &str,
+) -> String {
+    let (source, error) = if let Some(error) = tagged_error.strip_prefix(AUTOMATIC_SOURCE_PREFIX) {
+        ("automatic", error)
+    } else if let Some(error) = tagged_error.strip_prefix(CONFIGURED_SOURCE_PREFIX) {
+        ("configured", error)
+    } else {
+        ("unknown", tagged_error)
+    };
+    let normalized = error.to_ascii_lowercase();
+    if normalized.contains("usage worker stopped unexpectedly") {
+        return "Restart VSParallel".to_string();
+    }
+    if normalized.contains("malformed")
+        || normalized.contains("exceeded its safety limit")
+        || normalized.contains("output limit")
+        || normalized.contains("no result")
+    {
+        return format!("Update {provider}");
+    }
+    if normalized.contains("timed out") || normalized.contains("stopped before responding") {
+        return "Restart / update".to_string();
+    }
+    if normalized.contains("rejected") {
+        return "Sign in / update".to_string();
+    }
+    if normalized.contains("could not start") && source == "configured" {
+        return "Check command".to_string();
+    }
+    fallback_action.to_string()
+}
+
 fn antigravity_failure_detail(error: &str) -> String {
     let normalized = error.to_ascii_lowercase();
+    if normalized.contains("usage worker stopped unexpectedly")
+        || normalized.contains("reader stopped unexpectedly")
+    {
+        return "VSParallel's Antigravity usage collector stopped unexpectedly. Restart VSParallel, then refresh usage.".to_string();
+    }
     if normalized.contains("timed out") || normalized.contains("stopped") {
         return "Antigravity CLI did not answer the read-only usage request. Try again after opening or signing in to Antigravity.".to_string();
     }
-    if normalized.contains("malformed") || normalized.contains("different command") {
+    if normalized.contains("rejected")
+        || normalized.contains("successful usage result")
+        || normalized.contains("no quota data")
+    {
+        return "Antigravity CLI could not provide model quota. Open Antigravity, confirm CLI sign-in, then refresh usage.".to_string();
+    }
+    if normalized.contains("malformed")
+        || normalized.contains("different command")
+        || normalized.contains("safety limit")
+        || normalized.contains("output limit")
+    {
         return "Antigravity CLI returned incompatible usage data. Update Antigravity CLI, then refresh usage.".to_string();
     }
     "Install or update Antigravity CLI to 1.1.11 or newer and sign in to view model quota."
         .to_string()
+}
+
+fn antigravity_failure_action_label(error: &str) -> &'static str {
+    let normalized = error.to_ascii_lowercase();
+    if normalized.contains("usage worker stopped unexpectedly")
+        || normalized.contains("reader stopped unexpectedly")
+    {
+        return "Restart VSParallel";
+    }
+    if normalized.contains("malformed")
+        || normalized.contains("different command")
+        || normalized.contains("safety limit")
+        || normalized.contains("output limit")
+    {
+        return "Update CLI";
+    }
+    if normalized.contains("timed out") || normalized.contains("stopped") {
+        return "Open / sign in";
+    }
+    if normalized.contains("rejected")
+        || normalized.contains("successful usage result")
+        || normalized.contains("no quota data")
+    {
+        return "Open / sign in";
+    }
+    "Install / sign in"
 }
 
 fn codex_command_from(value: Option<OsString>) -> ProviderCommand {
@@ -2146,12 +2421,51 @@ fn claude_record_path(state_root: &Path) -> PathBuf {
 
 /// Load the most recent privacy-minimal Claude status-line capture.
 pub fn load_claude_usage(state_root: &Path, now_ms: i64) -> ProviderUsageView {
-    load_claude_record(state_root, now_ms)
-        .unwrap_or_else(|| unavailable_provider("No capture yet. Check Setup & diagnostics."))
+    let path = claude_record_path(state_root);
+    if let Some(usage) = load_claude_record(state_root, now_ms) {
+        return usage;
+    }
+    if claude_record_requires_diagnostics(&path, now_ms) {
+        return unavailable_provider_with_action(
+            CHECK_APP_STATE_ACTION,
+            "The local Claude fallback record is unreadable, unsafe, or incompatible. Check VSParallel's state directory in Setup & diagnostics before restarting Claude Code.",
+        );
+    }
+    unavailable_provider_with_action("Restart Claude", CLAUDE_FALLBACK_FIRST_USAGE_DETAIL)
+}
+
+fn claude_record_requires_diagnostics(path: &Path, now_ms: i64) -> bool {
+    if local_usage_record_parent_requires_diagnostics(path) {
+        return true;
+    }
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) => return error.kind() != io::ErrorKind::NotFound,
+    };
+    if is_link_or_reparse_point(&metadata)
+        || !metadata.is_file()
+        || metadata.len() > CLAUDE_RECORD_LIMIT
+    {
+        return true;
+    }
+    let bytes = match fs::read(path) {
+        Ok(bytes) if bytes.len() as u64 <= CLAUDE_RECORD_LIMIT => bytes,
+        Ok(_) | Err(_) => return true,
+    };
+    let record: ClaudeUsageRecord = match serde_json::from_slice(&bytes) {
+        Ok(record) => record,
+        Err(_) => return true,
+    };
+    record.schema_version != CLAUDE_RECORD_SCHEMA_VERSION
+        || record.captured_at_ms < 0
+        || record.captured_at_ms > now_ms.saturating_add(MAX_FUTURE_SKEW_MS)
 }
 
 fn load_claude_record(state_root: &Path, now_ms: i64) -> Option<ProviderUsageView> {
     let path = claude_record_path(state_root);
+    if local_usage_record_parent_requires_diagnostics(&path) {
+        return None;
+    }
     let metadata = fs::symlink_metadata(&path).ok()?;
     if is_link_or_reparse_point(&metadata)
         || !metadata.is_file()
@@ -2181,11 +2495,15 @@ fn load_claude_record(state_root: &Path, now_ms: i64) -> Option<ProviderUsageVie
     let stale = now_ms.saturating_sub(record.captured_at_ms) > CLAUDE_STALE_AFTER_MS;
     let state = if stale { "stale" } else { "available" };
     let detail = if stale {
-        "Claude usage was captured earlier and may no longer be current."
+        "Claude fallback usage was captured earlier. Open or restart Claude Code in a terminal to refresh it."
     } else {
         "Usage limits captured by Claude Code."
     };
-    provider_from_windows(windows, record.captured_at_ms, detail, state)
+    let mut usage = provider_from_windows(windows, record.captured_at_ms, detail, state)?;
+    if stale {
+        usage.action_label = "Restart Claude".to_string();
+    }
+    Some(usage)
 }
 
 fn stored_window_view(
@@ -2321,24 +2639,35 @@ fn gemini_record_path(state_root: &Path) -> PathBuf {
 
 fn load_gemini_usage(state_root: &Path, now_ms: i64) -> ProviderUsageView {
     let detail = "Latest Gemini CLI model-call tokens; this is not subscription quota. Run /stats model in Gemini CLI for its live quota view.";
-    let Some(record) =
-        read_local_usage_record::<GeminiUsageRecord>(&gemini_record_path(state_root), now_ms)
-    else {
-        return unavailable_provider(
-            "No Gemini token capture yet. Enable the Gemini usage hook in Setup & diagnostics, then start a new turn. Gemini CLI shows live quota through /stats model.",
+    let record_path = gemini_record_path(state_root);
+    let Some(record) = read_local_usage_record::<GeminiUsageRecord>(&record_path, now_ms) else {
+        if local_usage_record_requires_diagnostics(&record_path) {
+            return unavailable_provider_with_action(
+                CHECK_APP_STATE_ACTION,
+                "The local Gemini usage record is unreadable or unsafe. Check VSParallel's state directory in Setup & diagnostics before starting another turn.",
+            );
+        }
+        return unavailable_provider_with_action(
+            "Check setup",
+            "Set up the Gemini usage hook, then open a new Gemini CLI session and complete one turn to record usage.",
         );
     };
     if record.schema_version != LOCAL_USAGE_RECORD_SCHEMA_VERSION {
-        return unavailable_provider(
-            "The Gemini usage capture is incompatible. Repair the Gemini integration in Setup & diagnostics.",
+        return unavailable_provider_with_action(
+            CHECK_APP_STATE_ACTION,
+            "The local Gemini usage record is incompatible. Check VSParallel's state directory in Setup & diagnostics before starting another turn.",
         );
     }
-    token_provider(
-        record.total_tokens,
-        record.captured_at_ms,
-        "Latest model call",
-        detail,
-        now_ms,
+    replace_unavailable_guidance(
+        token_provider(
+            record.total_tokens,
+            record.captured_at_ms,
+            "Latest model call",
+            detail,
+            now_ms,
+        ),
+        "Start a turn",
+        GEMINI_FIRST_USAGE_DETAIL,
     )
 }
 
@@ -2534,11 +2863,11 @@ fn load_cursor_usage(state_root: &Path, now_ms: i64) -> ProviderUsageView {
     let turn_path = cursor_turn_record_path(state_root);
     let parsed_context = read_local_usage_record::<CursorContextUsageRecord>(&context_path, now_ms);
     let parsed_turn = read_local_usage_record::<CursorTurnUsageRecord>(&turn_path, now_ms);
-    let incompatible_context = fs::symlink_metadata(&context_path).is_ok()
+    let incompatible_context = local_usage_record_requires_diagnostics(&context_path)
         && parsed_context
             .as_ref()
             .is_none_or(|record| !cursor_context_record_is_compatible(record, now_ms));
-    let incompatible_turn = fs::symlink_metadata(&turn_path).is_ok()
+    let incompatible_turn = local_usage_record_requires_diagnostics(&turn_path)
         && parsed_turn
             .as_ref()
             .is_none_or(|record| !cursor_turn_record_is_compatible(record, now_ms));
@@ -2562,29 +2891,39 @@ fn load_cursor_usage(state_root: &Path, now_ms: i64) -> ProviderUsageView {
 
     let Some(observation) = observation else {
         if incompatible_context || incompatible_turn {
-            return unavailable_provider(
-                "The Cursor usage capture is incompatible. Repair Cursor monitoring in Setup & diagnostics.",
+            return unavailable_provider_with_action(
+                CHECK_APP_STATE_ACTION,
+                "A local Cursor usage record is unreadable, unsafe, or incompatible. Check VSParallel's state directory in Setup & diagnostics before starting another chat.",
             );
         }
-        return unavailable_provider(
-            "No Cursor usage capture is available. Review Cursor monitoring status, then start a Cursor turn. Cursor plan quota remains available only inside Cursor.",
+        return unavailable_provider_with_action(
+            "Check setup",
+            "Set up or reload Cursor, then complete one local chat. Usage appears when the active Cursor version and chat surface expose supported token or context data.",
         );
     };
 
     match observation {
-        CursorUsageObservation::Context(record) => context_provider(
-            record.remaining_percent,
-            record.captured_at_ms,
-            "Latest CLI context",
-            "Cursor Agent CLI context capacity; this is not Composer plan quota.",
-            now_ms,
+        CursorUsageObservation::Context(record) => replace_unavailable_guidance(
+            context_provider(
+                record.remaining_percent,
+                record.captured_at_ms,
+                "Latest CLI context",
+                "Cursor Agent CLI context capacity; this is not Composer plan quota.",
+                now_ms,
+            ),
+            "Start a chat",
+            CURSOR_FIRST_USAGE_DETAIL,
         ),
-        CursorUsageObservation::Turn(record) => token_provider(
-            record.total_tokens,
-            record.captured_at_ms,
-            "Latest Cursor turn",
-            "Latest local Cursor agent-turn input and output tokens; cache-token fields are breakdowns and are not added. This is not plan or billing quota.",
-            now_ms,
+        CursorUsageObservation::Turn(record) => replace_unavailable_guidance(
+            token_provider(
+                record.total_tokens,
+                record.captured_at_ms,
+                "Latest Cursor turn",
+                "Latest local Cursor agent-turn input and output tokens; cache-token fields are breakdowns and are not added. This is not plan or billing quota.",
+                now_ms,
+            ),
+            "Start a chat",
+            CURSOR_FIRST_USAGE_DETAIL,
         ),
     }
 }
@@ -2600,6 +2939,9 @@ fn write_local_usage_record<T: Serialize>(
 }
 
 fn read_local_usage_record<T: for<'de> Deserialize<'de>>(path: &Path, now_ms: i64) -> Option<T> {
+    if local_usage_record_parent_requires_diagnostics(path) {
+        return None;
+    }
     let metadata = fs::symlink_metadata(path).ok()?;
     if is_link_or_reparse_point(&metadata)
         || !metadata.is_file()
@@ -2616,6 +2958,28 @@ fn read_local_usage_record<T: for<'de> Deserialize<'de>>(path: &Path, now_ms: i6
     // this generic helper only enforces the bounded regular-file boundary.
     let _ = now_ms;
     Some(value)
+}
+
+/// Whether a failed local-record read should be treated as an app-state problem
+/// rather than as a record that has never been created.
+fn local_usage_record_requires_diagnostics(path: &Path) -> bool {
+    if local_usage_record_parent_requires_diagnostics(path) {
+        return true;
+    }
+    match fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(error) => error.kind() != io::ErrorKind::NotFound,
+    }
+}
+
+fn local_usage_record_parent_requires_diagnostics(path: &Path) -> bool {
+    let Some(parent) = path.parent() else {
+        return true;
+    };
+    match fs::symlink_metadata(parent) {
+        Ok(metadata) => is_link_or_reparse_point(&metadata) || !metadata.is_dir(),
+        Err(error) => error.kind() != io::ErrorKind::NotFound,
+    }
 }
 
 fn atomic_write_bytes(path: &Path, content: &[u8]) -> Result<(), String> {
@@ -3086,9 +3450,12 @@ mod tests {
         assert_eq!(fresh.metric_label, "Latest model call");
         let stale = load_gemini_usage(temp.path(), 10_000 + LOCAL_USAGE_STALE_AFTER_MS + 1);
         assert_eq!(stale.state, "stale");
+        assert_eq!(stale.action_label, "Start a turn");
         let expired = load_gemini_usage(temp.path(), 10_000 + LOCAL_USAGE_EXPIRES_AFTER_MS + 1);
         assert_eq!(expired.state, "unavailable");
         assert_eq!(expired.token_count, None);
+        assert_eq!(expired.action_label, "Start a turn");
+        assert_eq!(expired.detail, GEMINI_FIRST_USAGE_DETAIL);
     }
 
     #[test]
@@ -3109,6 +3476,21 @@ mod tests {
             load_gemini_usage(temp.path(), 12_001).token_count,
             Some(987_654)
         );
+    }
+
+    #[test]
+    fn unreadable_gemini_record_requests_app_state_diagnostics() {
+        let temp = TempDir::new().unwrap();
+        let path = gemini_record_path(temp.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"not a usage record").unwrap();
+
+        let usage = load_gemini_usage(temp.path(), 12_001);
+
+        assert_eq!(usage.state, "unavailable");
+        assert_eq!(usage.action_label, CHECK_APP_STATE_ACTION);
+        assert!(usage.detail.contains("state directory"));
+        assert!(!usage.detail.contains("complete one turn"));
     }
 
     fn gemini_lifecycle_status(state: &str) -> crate::gemini_integration::GeminiIntegrationStatus {
@@ -3139,8 +3521,32 @@ mod tests {
         let reconciled = reconcile_gemini_integration_status(usage, Some(&status));
 
         assert_eq!(reconciled.state, "unavailable");
+        assert_eq!(reconciled.action_label, "Open setup");
         assert!(reconciled.detail.contains("not installed"));
         assert!(reconciled.detail.contains("Setup & diagnostics"));
+    }
+
+    #[test]
+    fn installed_gemini_hook_requests_the_first_completed_turn() {
+        let usage = unavailable_provider_with_action(CHECK_SETUP_ACTION, "No capture yet.");
+        let status = gemini_lifecycle_status("installed");
+
+        let reconciled = reconcile_gemini_integration_status(usage, Some(&status));
+
+        assert_eq!(reconciled.state, "unavailable");
+        assert_eq!(reconciled.action_label, "Start a turn");
+        assert_eq!(reconciled.detail, GEMINI_FIRST_USAGE_DETAIL);
+    }
+
+    #[test]
+    fn installed_gemini_hook_preserves_an_unexpected_collection_failure() {
+        let usage = unavailable_provider("Usage collection stopped unexpectedly.");
+        let status = gemini_lifecycle_status("installed");
+
+        let reconciled = reconcile_gemini_integration_status(usage, Some(&status));
+
+        assert!(reconciled.action_label.is_empty());
+        assert_eq!(reconciled.detail, "Usage collection stopped unexpectedly.");
     }
 
     #[test]
@@ -3153,6 +3559,109 @@ mod tests {
         assert_eq!(reconciled.state, "stale");
         assert_eq!(reconciled.token_count, Some(42));
         assert!(reconciled.detail.contains("needs repair"));
+    }
+
+    fn cursor_lifecycle_status(state: &str) -> crate::cursor_integration::CursorIntegrationStatus {
+        crate::cursor_integration::CursorIntegrationStatus {
+            state: state.to_string(),
+            installed: state == "installed",
+            config_path: "/tmp/.cursor/hooks.json".to_string(),
+            backup_path: "/tmp/.cursor/hooks.json.vsparallel.bak".to_string(),
+            event_states: std::collections::BTreeMap::new(),
+            usage_capture_state: if state == "installed" {
+                "current"
+            } else {
+                "missing"
+            }
+            .to_string(),
+            message: format!("Cursor lifecycle state: {state}"),
+        }
+    }
+
+    #[test]
+    fn installed_cursor_monitoring_requests_the_first_local_chat() {
+        let usage = unavailable_provider_with_action("Check setup", "No capture yet.");
+        let status = cursor_lifecycle_status("installed");
+
+        let reconciled = reconcile_cursor_integration_status(usage, Some(&status));
+
+        assert_eq!(reconciled.state, "unavailable");
+        assert_eq!(reconciled.action_label, "Launch & chat");
+        assert_eq!(reconciled.detail, CURSOR_FIRST_USAGE_DETAIL);
+    }
+
+    #[test]
+    fn installed_cursor_monitoring_preserves_an_unexpected_collection_failure() {
+        let usage = unavailable_provider("Usage collection stopped unexpectedly.");
+        let status = cursor_lifecycle_status("installed");
+
+        let reconciled = reconcile_cursor_integration_status(usage, Some(&status));
+
+        assert!(reconciled.action_label.is_empty());
+        assert_eq!(reconciled.detail, "Usage collection stopped unexpectedly.");
+    }
+
+    #[test]
+    fn cursor_status_line_conflict_still_offers_best_effort_turn_capture() {
+        let usage = unavailable_provider_with_action(CHECK_SETUP_ACTION, "No capture yet.");
+        let mut status = cursor_lifecycle_status("installed");
+        status.usage_capture_state = "conflict".to_string();
+
+        let reconciled = reconcile_cursor_integration_status(usage, Some(&status));
+
+        assert_eq!(reconciled.action_label, "Start a chat");
+        assert!(reconciled.detail.contains("try turn-token capture"));
+        assert!(reconciled
+            .detail
+            .contains("context-left detection disabled"));
+    }
+
+    #[test]
+    fn cursor_reconciliation_preserves_repair_guidance_for_incompatible_records() {
+        let usage = unavailable_provider_with_action(
+            "Repair setup",
+            "The Cursor usage capture is incompatible.",
+        );
+        let status = cursor_lifecycle_status("installed");
+
+        let reconciled = reconcile_cursor_integration_status(usage, Some(&status));
+
+        assert_eq!(reconciled.action_label, "Repair setup");
+        assert!(reconciled.detail.contains("incompatible"));
+    }
+
+    fn claude_fallback_status(
+        usage_capture_state: &str,
+    ) -> crate::claude_integration::ClaudeIntegrationStatus {
+        crate::claude_integration::ClaudeIntegrationStatus {
+            state: "installed".to_string(),
+            installed: true,
+            config_path: "/tmp/.claude/settings.json".to_string(),
+            backup_path: "/tmp/.claude/settings.json.vsparallel.bak".to_string(),
+            event_states: std::collections::BTreeMap::new(),
+            usage_capture_state: usage_capture_state.to_string(),
+            hooks_disabled: false,
+            message: format!("Claude fallback state: {usage_capture_state}"),
+        }
+    }
+
+    #[test]
+    fn installed_claude_fallback_explains_its_first_session_requirement() {
+        let usage =
+            unavailable_provider_with_action("Sign in", "Live Claude Code usage is unavailable.");
+        let status = claude_fallback_status("current");
+
+        let reconciled = reconcile_claude_integration_status(usage, Some(&status));
+
+        assert_eq!(reconciled.state, "unavailable");
+        assert_eq!(reconciled.action_label, "Sign in");
+        assert!(reconciled
+            .detail
+            .starts_with(CLAUDE_FALLBACK_FIRST_USAGE_DETAIL));
+        assert!(reconciled
+            .detail
+            .contains("Live Claude Code usage is unavailable."));
+        assert!(!reconciled.detail.contains("complete one"));
     }
 
     #[test]
@@ -3311,6 +3820,7 @@ mod tests {
         assert_eq!(view.metric_kind, "context");
         assert_eq!(view.remaining_percent, Some(64.5));
         assert_eq!(view.updated_at_ms, Some(10_000));
+        assert_eq!(view.action_label, "Start a chat");
     }
 
     #[test]
@@ -3346,6 +3856,25 @@ mod tests {
     }
 
     #[test]
+    fn incompatible_cursor_record_requests_app_state_diagnostics() {
+        let temp = TempDir::new().unwrap();
+        let usage_dir = temp.path().join(CLAUDE_RECORD_DIRECTORY);
+        fs::create_dir_all(&usage_dir).unwrap();
+        fs::write(
+            cursor_record_path(temp.path()),
+            br#"{"schemaVersion":999,"capturedAtMs":20000,"remainingPercent":50}"#,
+        )
+        .unwrap();
+
+        let usage = load_cursor_usage(temp.path(), 20_001);
+
+        assert_eq!(usage.state, "unavailable");
+        assert_eq!(usage.action_label, CHECK_APP_STATE_ACTION);
+        assert!(usage.detail.contains("state directory"));
+        assert!(!usage.detail.contains("complete one local chat"));
+    }
+
+    #[test]
     fn cursor_expired_records_request_a_new_turn_instead_of_repair() {
         let temp = TempDir::new().unwrap();
         cursor_input(
@@ -3357,7 +3886,8 @@ mod tests {
 
         let view = load_cursor_usage(temp.path(), 20_000 + LOCAL_USAGE_EXPIRES_AFTER_MS + 1);
         assert_eq!(view.state, "unavailable");
-        assert!(view.detail.contains("No Cursor usage capture"));
+        assert_eq!(view.action_label, "Check setup");
+        assert!(view.detail.contains("complete one local chat"));
         assert!(!view.detail.contains("incompatible"));
         assert!(!view.detail.contains("Repair"));
     }
@@ -3395,6 +3925,44 @@ mod tests {
         assert!(!gemini_record_path(temp.path()).exists());
         assert!(!cursor_record_path(temp.path()).exists());
         assert!(!cursor_turn_record_path(temp.path()).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_usage_directory_is_never_read_as_local_provider_state() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let state_root = temp.path().join("state");
+        let redirected = temp.path().join("redirected-usage");
+        fs::create_dir(&state_root).unwrap();
+        fs::create_dir(&redirected).unwrap();
+        symlink(&redirected, state_root.join(CLAUDE_RECORD_DIRECTORY)).unwrap();
+        fs::write(
+            redirected.join(CLAUDE_RECORD_FILENAME),
+            br#"{"schemaVersion":1,"capturedAtMs":1000,"fiveHour":{"usedPercent":20,"resetsAtMs":100000}}"#,
+        )
+        .unwrap();
+        fs::write(
+            redirected.join(GEMINI_RECORD_FILENAME),
+            br#"{"schemaVersion":1,"capturedAtMs":1000,"totalTokens":42}"#,
+        )
+        .unwrap();
+        fs::write(
+            redirected.join(CURSOR_RECORD_FILENAME),
+            br#"{"schemaVersion":1,"capturedAtMs":1000,"remainingPercent":70}"#,
+        )
+        .unwrap();
+
+        for usage in [
+            load_claude_usage(&state_root, 2_000),
+            load_gemini_usage(&state_root, 2_000),
+            load_cursor_usage(&state_root, 2_000),
+        ] {
+            assert_eq!(usage.state, "unavailable");
+            assert_eq!(usage.action_label, CHECK_APP_STATE_ACTION);
+            assert!(usage.detail.contains("state directory"));
+        }
     }
 
     #[test]
@@ -3473,9 +4041,80 @@ mod tests {
         assert_eq!(snapshot.claude.state, "unavailable");
         assert_eq!(
             snapshot.codex.detail,
-            "Install or sign in to Codex to view usage limits."
+            "Install or sign in to Codex to view usage limits. Activity hooks do not enable usage detection."
         );
+        assert_eq!(snapshot.codex.action_label, "Install / sign in");
+        assert_eq!(snapshot.claude.action_label, "Sign in / update");
+        assert_eq!(snapshot.gemini.action_label, "Check setup");
+        assert!(snapshot.gemini.detail.contains("complete one turn"));
+        assert_eq!(snapshot.antigravity.action_label, "Install / sign in");
+        assert_eq!(snapshot.zed.action_label, "Try a chat");
+        assert_eq!(snapshot.zed.detail, ZED_FIRST_USAGE_DETAIL);
+        assert_eq!(snapshot.cursor.action_label, "Check setup");
+        assert!(snapshot.cursor.detail.contains("complete one local chat"));
         assert!(!snapshot.codex.detail.contains("signed out"));
+    }
+
+    #[test]
+    fn top_level_collection_failure_requests_an_app_restart() {
+        let snapshot = unavailable_usage_snapshot(42_000);
+
+        for usage in [
+            &snapshot.codex,
+            &snapshot.claude,
+            &snapshot.gemini,
+            &snapshot.antigravity,
+            &snapshot.zed,
+            &snapshot.cursor,
+        ] {
+            assert_eq!(usage.action_label, "Restart VSParallel");
+            assert!(usage.detail.contains("Restart VSParallel"));
+        }
+    }
+
+    #[test]
+    fn missing_state_root_reports_app_state_instead_of_disabled_integrations() {
+        let snapshot = build_usage_snapshot_with(
+            &FakeRunner(Err("signed out".to_string())),
+            OsStr::new("fake-codex"),
+            &FakeClaudeRunner(Err("signed out".to_string())),
+            OsStr::new("fake-claude"),
+            None,
+            42_000,
+        );
+
+        for usage in [&snapshot.gemini, &snapshot.cursor] {
+            assert_eq!(usage.action_label, "Check app state");
+            assert_eq!(usage.detail, LOCAL_USAGE_STATE_UNAVAILABLE_DETAIL);
+            assert!(!usage.detail.contains("disabled"));
+        }
+    }
+
+    #[test]
+    fn unreadable_claude_fallback_is_not_mislabeled_as_first_session_setup() {
+        let temp = TempDir::new().unwrap();
+        let path = claude_record_path(temp.path());
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"not a usage record").unwrap();
+
+        let snapshot = build_usage_snapshot_with(
+            &FakeRunner(Err("signed out".to_string())),
+            OsStr::new("fake-codex"),
+            &FakeClaudeRunner(Err("signed out".to_string())),
+            OsStr::new("fake-claude"),
+            Some(temp.path()),
+            42_000,
+        );
+
+        assert_eq!(snapshot.claude.action_label, CHECK_APP_STATE_ACTION);
+        assert!(snapshot
+            .claude
+            .detail
+            .starts_with("The local Claude fallback record"));
+        assert!(!snapshot
+            .claude
+            .detail
+            .contains(CLAUDE_FALLBACK_FIRST_USAGE_DETAIL));
     }
 
     #[test]
@@ -3503,6 +4142,7 @@ mod tests {
                 "same local account",
             ),
             ("Codex app-server returned malformed output", "incompatible"),
+            ("Claude Code response had no result", "incompatible"),
         ] {
             let detail = provider_failure_detail("Provider", "OVERRIDE", error, "fallback");
             assert!(detail.contains(expected));
@@ -3518,6 +4158,109 @@ mod tests {
             "safe fallback",
         );
         assert_eq!(detail, "safe fallback");
+
+        assert_eq!(
+            provider_failure_action_label(
+                "provider returned malformed output",
+                "Codex",
+                "fallback"
+            ),
+            "Update Codex"
+        );
+        assert_eq!(
+            provider_failure_action_label("provider rejected the request", "Codex", "fallback"),
+            "Sign in / update"
+        );
+        assert_eq!(
+            provider_failure_action_label("provider usage request timed out", "Claude", "fallback"),
+            "Restart / update"
+        );
+        assert_eq!(
+            provider_failure_action_label("provider response had no result", "Claude", "fallback"),
+            "Update Claude"
+        );
+        assert_eq!(
+            provider_failure_action_label(
+                &tag_provider_failure("could not start".to_string(), false),
+                "Claude",
+                "fallback"
+            ),
+            "Check command"
+        );
+        assert_eq!(
+            provider_failure_action_label(
+                "provider usage worker stopped unexpectedly",
+                "Claude",
+                "fallback"
+            ),
+            "Restart VSParallel"
+        );
+        assert!(provider_failure_detail(
+            "Claude Code",
+            "VSPARALLEL_CLAUDE_COMMAND",
+            "provider usage worker stopped unexpectedly",
+            "fallback",
+        )
+        .contains("Restart VSParallel"));
+    }
+
+    #[test]
+    fn antigravity_failure_guidance_matches_the_recovery_step() {
+        assert_eq!(
+            antigravity_failure_action_label("usage request timed out"),
+            "Open / sign in"
+        );
+        assert!(antigravity_failure_detail("usage request timed out").contains("opening"));
+
+        assert_eq!(
+            antigravity_failure_action_label("returned malformed output"),
+            "Update CLI"
+        );
+        assert!(antigravity_failure_detail("returned malformed output").contains("Update"));
+
+        assert_eq!(
+            antigravity_failure_action_label("output exceeded its safety limit"),
+            "Update CLI"
+        );
+        assert!(antigravity_failure_detail("output exceeded its safety limit").contains("Update"));
+
+        assert_eq!(
+            antigravity_failure_action_label("diagnostics exceeded their safety limit"),
+            "Update CLI"
+        );
+        assert!(
+            antigravity_failure_detail("diagnostics exceeded their safety limit")
+                .contains("Update")
+        );
+
+        for error in [
+            "Antigravity CLI rejected the usage request",
+            "Antigravity CLI did not return a successful usage result",
+            "Antigravity CLI usage result had no quota data",
+        ] {
+            assert_eq!(antigravity_failure_action_label(error), "Open / sign in");
+            assert!(antigravity_failure_detail(error).contains("Open Antigravity"));
+        }
+
+        assert_eq!(
+            antigravity_failure_action_label("Antigravity usage worker stopped unexpectedly"),
+            "Restart VSParallel"
+        );
+        assert!(
+            antigravity_failure_detail("Antigravity usage worker stopped unexpectedly")
+                .contains("Restart VSParallel")
+        );
+
+        assert_eq!(
+            antigravity_failure_action_label("Antigravity CLI output reader stopped unexpectedly"),
+            "Restart VSParallel"
+        );
+
+        assert_eq!(
+            antigravity_failure_action_label("could not start"),
+            "Install / sign in"
+        );
+        assert!(antigravity_failure_detail("could not start").contains("1.1.11"));
     }
 
     #[test]
@@ -4139,6 +4882,8 @@ mod tests {
         let stale = load_claude_usage(temp.path(), 1_000 + CLAUDE_STALE_AFTER_MS + 1);
         assert_eq!(stale.state, "stale");
         assert_eq!(stale.updated_at_ms, Some(1_000));
+        assert_eq!(stale.action_label, "Restart Claude");
+        assert!(stale.detail.contains("terminal"));
     }
 
     #[test]
@@ -4162,6 +4907,7 @@ mod tests {
         assert_eq!(fully_expired.state, "unavailable");
         assert!(fully_expired.windows.is_empty());
         assert_eq!(fully_expired.remaining_percent, None);
+        assert_eq!(fully_expired.action_label, "Restart Claude");
     }
 
     #[test]
@@ -4197,6 +4943,9 @@ mod tests {
         assert_eq!(code, 0);
         assert!(output.is_empty());
         assert_eq!(fs::read(victim).unwrap(), b"private\n");
+        let usage = load_claude_usage(temp.path(), 2_000);
+        assert_eq!(usage.action_label, CHECK_APP_STATE_ACTION);
+        assert!(usage.detail.contains("unsafe"));
     }
 
     #[test]
@@ -4209,10 +4958,14 @@ mod tests {
             br#"{"schemaVersion":1,"capturedAtMs":1000,"fiveHour":{"usedPercent":20},"secret":"no"}"#,
         )
         .unwrap();
-        assert_eq!(load_claude_usage(temp.path(), 2_000).state, "unavailable");
+        let unknown = load_claude_usage(temp.path(), 2_000);
+        assert_eq!(unknown.state, "unavailable");
+        assert_eq!(unknown.action_label, CHECK_APP_STATE_ACTION);
 
         fs::write(&path, vec![b'x'; CLAUDE_RECORD_LIMIT as usize + 1]).unwrap();
-        assert_eq!(load_claude_usage(temp.path(), 2_000).state, "unavailable");
+        let oversized = load_claude_usage(temp.path(), 2_000);
+        assert_eq!(oversized.state, "unavailable");
+        assert_eq!(oversized.action_label, CHECK_APP_STATE_ACTION);
     }
 
     #[test]

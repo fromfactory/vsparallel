@@ -626,6 +626,7 @@ Every `ProviderUsageView` has the same additive wire shape:
 | `metricLabel` | Short qualifier such as `Latest model call`, `Latest native thread`, `Latest CLI context`, or `Latest Cursor turn`; empty when no qualifier is needed |
 | `windows` | Zero or more `UsageWindowView` objects; empty for token and unavailable metrics |
 | `updatedAtMs` | Local observation/query timestamp in Unix milliseconds, or `null` |
+| `actionLabel` | Bounded compact recovery action such as `Start a chat`, `Sign in`, or `Open setup`; shown for unavailable or stale data and empty when no specific action is known |
 | `detail` | Bounded, UI-safe explanation that contains no raw provider error or account data |
 
 Each `UsageWindowView` contains `label`, optional `durationMinutes`,
@@ -651,6 +652,15 @@ Agent CLI because it is the richer metric; without it, the card falls back to
 the latest local turn's input and output token total across IDE Composer or
 Cursor Agent CLI. An unavailable provider uses
 `metricKind: "none"` and no numeric value rather than fabricating a percentage.
+Gemini needs its managed hook, a new CLI session, and one completed turn before
+its first metric can appear. Zed needs an eligible native Agent thread but no
+integration setup. Cursor needs monitoring setup, a reload, and a completed
+chat; capture remains best-effort because supported token and context fields
+vary by Cursor version and surface. Codex, Claude live usage, and Antigravity
+quota do not depend on lifecycle-hook activity; they require their own
+compatible, signed-in provider command or extension. Claude's optional terminal
+status-line fallback is initialized separately by a new or restarted terminal
+session.
 
 ## Claude Code status-line fallback record (schema version 1)
 

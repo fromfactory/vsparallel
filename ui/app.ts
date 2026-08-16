@@ -165,6 +165,7 @@
     windowLabel: string;
     resetsAtMs: number | null;
     updatedAtMs: number | null;
+    actionLabel: string;
     detail: string;
     windows: UsageWindow[];
   }
@@ -1462,6 +1463,7 @@
         limitingWindow?.resetsAtMs ?? null,
       ),
       updatedAtMs: asTimestamp(raw.updatedAtMs ?? raw.capturedAtMs),
+      actionLabel: asString(raw.actionLabel),
       detail: asString(raw.detail),
       windows,
     };
@@ -1544,6 +1546,7 @@
         : limitingWindow?.remainingPercent ?? previous.remainingPercent,
       windowLabel: limitingWindow?.label || previous.windowLabel,
       resetsAtMs: limitingWindow ? limitingWindow.resetsAtMs : previous.resetsAtMs,
+      actionLabel: current.actionLabel,
       detail: current.detail || "Provider refresh failed; showing the last known value.",
       windows,
     };
@@ -2194,20 +2197,25 @@
     const remainingPercent = provider.remainingPercent;
     const available = usageProviderHasMetric(provider);
     const stale = available && provider.state === "stale";
+    const actionLabel = !available || stale ? provider.actionLabel : "";
     target.card.dataset.state = available ? (stale ? "stale" : "available") : "unavailable";
     target.card.dataset.metricKind = available ? provider.metricKind : "none";
-    target.stateLabel.hidden = !stale;
+    target.card.dataset.actionRequired = actionLabel ? "true" : "false";
+    target.stateLabel.textContent = stale ? "Stale" : "To enable";
+    target.stateLabel.hidden = available ? !stale : !actionLabel;
 
     if (!available) {
       delete target.card.dataset.level;
       target.card.style.setProperty("--usage-remaining", "0");
-      target.value.textContent = "—";
+      target.value.textContent = actionLabel || "Unavailable";
       target.detail.textContent = provider.detail || "Usage unavailable";
       resetUsageMeter(target.meter, false);
       target.card.title = provider.detail || `${provider.providerName} usage is unavailable.`;
-      return provider.detail
-        ? `${provider.providerName} usage unavailable: ${provider.detail}`
-        : `${provider.providerName} usage unavailable`;
+      return [
+        `${provider.providerName} usage unavailable`,
+        actionLabel ? `next step: ${actionLabel}` : "",
+        provider.detail,
+      ].filter(Boolean).join(": ");
     }
 
     if (provider.metricKind === "tokens" && provider.tokenCount !== null) {
@@ -2220,6 +2228,9 @@
         : "";
       const detailParts = [provider.metricLabel || "Local token usage", updateLabel];
       if (stale) {
+        if (actionLabel) {
+          detailParts.unshift(`Next: ${actionLabel}`);
+        }
         detailParts.push("last known value");
       }
       target.value.textContent = `${formattedTokens} tokens`;
@@ -2232,7 +2243,10 @@
         stale ? "last known value" : "",
         provider.detail,
       ].filter(Boolean).join(" · ");
-      return `${provider.providerName} ${formattedTokens} tokens${stale ? " (last known)" : ""}`;
+      return [
+        `${provider.providerName} ${formattedTokens} tokens${stale ? " (last known)" : ""}`,
+        actionLabel ? `next step: ${actionLabel}` : "",
+      ].filter(Boolean).join("; ");
     }
 
     if (remainingPercent === null) {
@@ -2251,6 +2265,9 @@
       ? [provider.metricLabel || provider.windowLabel, updateLabel]
       : [provider.windowLabel, resetLabel];
     if (stale) {
+      if (actionLabel) {
+        detailParts.unshift(`Next: ${actionLabel}`);
+      }
       detailParts.push("last known value");
     }
     target.card.dataset.level = usageLevel(remainingPercent);
@@ -2293,7 +2310,10 @@
       updateLabel,
       provider.detail,
     ].filter(Boolean).join(" · ");
-    return `${provider.providerName} ${roundedRemaining}% ${isContext ? "context " : ""}remaining${stale ? " (last known)" : ""}`;
+    return [
+      `${provider.providerName} ${roundedRemaining}% ${isContext ? "context " : ""}remaining${stale ? " (last known)" : ""}`,
+      actionLabel ? `next step: ${actionLabel}` : "",
+    ].filter(Boolean).join("; ");
   }
 
   function renderUsageSnapshot(snapshot: UsageSnapshot): void {
@@ -3363,7 +3383,7 @@
       case "cursorCompanion":
         return "Live workspaces and agent activity";
       case "antigravityIde":
-        return "Live workspaces and agent activity";
+        return "Workspaces and activity · quota is separate";
       case "cursor":
         return "Recent workspace and agent activity";
       case "antigravity":
@@ -3371,8 +3391,9 @@
       case "gemini":
         return "Local model-call token totals";
       case "codex":
+        return "Activity hooks · usage detected separately";
       case "claude":
-        return "Lifecycle hooks · CLI usage";
+        return "Activity hooks · live usage detected separately";
     }
   }
 
@@ -3825,23 +3846,23 @@
       return "VS Code companion installed. Reload open VS Code windows.";
     }
     if (kind === "cursorCompanion") {
-      return "Cursor monitoring installed. Reload open Cursor IDE windows or open a new Cursor Agent CLI session, then start a turn.";
+      return "Cursor monitoring installed. Reload open Cursor IDE windows or open a new Cursor Agent CLI session, then complete one local chat. Usage appears when the active Cursor version and surface expose supported fields.";
     }
     if (kind === "antigravityIde") {
-      return "Antigravity integration installed. Reload open Antigravity IDE windows and start a new agent turn.";
+      return "Antigravity monitoring installed. Reload open Antigravity IDE windows and start a new agent turn. Model quota is detected separately through a signed-in Antigravity CLI.";
     }
     if (kind === "antigravity") {
-      return "Antigravity hooks installed. Start a new agent turn.";
+      return "Antigravity activity hooks installed. Start a new agent turn. Model quota is detected separately through a signed-in Antigravity CLI.";
     }
     if (kind === "cursor") {
-      return "Cursor hooks installed. Open a workspace or start a new turn.";
+      return "Cursor hooks installed. Reload Cursor, then complete one local chat. Usage appears when the active Cursor version and surface expose supported fields.";
     }
     if (kind === "gemini") {
-      return "Gemini usage hook installed. Open a new Gemini CLI session and start a turn.";
+      return "Gemini usage hook installed. Open a new Gemini CLI session and complete one turn.";
     }
     return kind === "codex"
-      ? "Codex hooks installed. Review /hooks in Codex."
-      : "Claude Code hooks installed. Restart active sessions.";
+      ? "Codex activity hooks installed. Review /hooks in Codex. Usage detection is separate and requires a compatible, signed-in Codex installation."
+      : "Claude Code activity hooks installed. Restart active sessions. Live usage requires a compatible, signed-in Claude Code installation; open or restart a terminal session to initialize the optional fallback.";
   }
 
   function integrationActionComponent(
@@ -3960,6 +3981,12 @@
       state.integrationAction = null;
       updateIntegrationControls();
     }
+    if (operation === "install") {
+      // Installation changes the most useful unavailable-state guidance
+      // immediately (for example, from "Open setup" to "Launch & chat").
+      // Do not keep the settings controls busy while live provider queries run.
+      void refreshUsage(true);
+    }
   }
 
   function formatNaturalList(values: readonly string[]): string {
@@ -4077,8 +4104,8 @@
     if (unconfirmed.length === 0 && manualActions.length === 0) {
       const editorNames = editorSteps.map((step) => step.editorName);
       const successMessage = editorNames.length
-        ? "Monitoring installed. Reload affected editors, restart provider sessions, and review /hooks in Codex."
-        : "Activity hooks installed. No editor companion was available; restart provider sessions and review /hooks in Codex.";
+        ? "Monitoring installed. Reload affected editors, restart provider sessions, and review /hooks in Codex. Codex, Claude, and Antigravity quota checks require compatible, signed-in provider installations."
+        : "Activity hooks installed. No editor companion was available; restart provider sessions and review /hooks in Codex. Codex, Claude, and Antigravity quota checks require compatible, signed-in provider installations.";
       setIntegrationMessage(
         successMessage,
         "success",
@@ -4117,6 +4144,9 @@
 
     state.integrationAction = null;
     updateIntegrationControls();
+    // Surface each provider's post-install next step without waiting for the
+    // periodic usage poll. Live quota queries continue in the background.
+    void refreshUsage(true);
   }
 
   async function uninstallAllIntegrations(): Promise<void> {
