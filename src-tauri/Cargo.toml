@@ -1,6 +1,6 @@
 [package]
 name = "vsparallel"
-version = "0.4.3"
+version = "1.0.0"
 description = "A compact local monitor for VS Code, Cursor, Antigravity, and Zed workspaces and agent activity"
 authors = ["Yuki Furuta"]
 edition = "2021"
