@@ -41,7 +41,7 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSWi
 
 [target.'cfg(target_os = "windows")'.dependencies]
 tokio = { version = "1.53.1", features = ["io-util", "net", "rt", "time"] }
-windows = { version = "0.61.3", features = [
+windows = { version = "0.62.2", features = [
   "Win32_Foundation",
   "Win32_System_Com",
   "Win32_System_Threading",
