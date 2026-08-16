@@ -485,20 +485,22 @@ fn command_candidates(directory: &Path, executable: &OsStr) -> bool {
 pub fn companion_status(executable: &OsStr) -> CompanionStatus {
     #[cfg(target_os = "macos")]
     {
-        return standard_registry_status_without_cli(
+        standard_registry_status_without_cli(
             executable,
             StandardExtensionRegistry::VsCode,
             VSCODE_PROFILE_ENV,
             crate::opener::CODE_COMMAND_ENV,
-        );
+        )
     }
 
     #[cfg(not(target_os = "macos"))]
-    companion_status_with(
-        &ProcessCodeCliRunner,
-        executable,
-        profile_from_environment(VSCODE_PROFILE_ENV).as_deref(),
-    )
+    {
+        companion_status_with(
+            &ProcessCodeCliRunner,
+            executable,
+            profile_from_environment(VSCODE_PROFILE_ENV).as_deref(),
+        )
+    }
 }
 
 /// Queries a VS Code-compatible editor while keeping operational diagnostics
@@ -521,7 +523,7 @@ pub fn companion_status_for_editor(
             )),
             _ => None,
         };
-        return match standard {
+        match standard {
             Some((registry, command_environment)) => relabel_status(
                 standard_registry_status_without_cli(
                     executable,
@@ -538,18 +540,20 @@ pub fn companion_status_for_editor(
                 ),
                 editor_name,
             ),
-        };
+        }
     }
 
     #[cfg(not(target_os = "macos"))]
-    relabel_status(
-        companion_status_with(
-            &ProcessCodeCliRunner,
-            executable,
-            profile_from_environment(profile_environment).as_deref(),
-        ),
-        editor_name,
-    )
+    {
+        relabel_status(
+            companion_status_with(
+                &ProcessCodeCliRunner,
+                executable,
+                profile_from_environment(profile_environment).as_deref(),
+            ),
+            editor_name,
+        )
+    }
 }
 
 /// Electron 39 can abort when a short-lived `ELECTRON_RUN_AS_NODE` process exits
